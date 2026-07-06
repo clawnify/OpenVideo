@@ -1,6 +1,6 @@
-# Open Video
+<img src="readme-banner.png" alt="Open Video preview" width="100%" />
 
-<img width="1728" height="997" alt="Open Video Studio" src="https://github.com/user-attachments/assets/5716d33c-6d03-498e-8d09-374687c1d4de" />
+# Open Video
 
 Programmatic video creation powered by **Remotion**. Full Studio editor for humans, API for agents. Compositions are React code — agents write them, the Studio previews them, and `npx remotion render` produces pixel-perfect videos. Built with **React + Hono + D1 + R2**. Deploys to Cloudflare Workers via [Clawnify](https://clawnify.com).
 
