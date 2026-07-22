@@ -1,5 +1,5 @@
-import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
-import { initDB, query, get, run } from "./db.js";
+import { createApp, createRoute, z } from "@clawnify/app";
+import { query, get, run } from "./db.js";
 import { initUploads, putUpload, getUpload, deleteUpload } from "./uploads.js";
 import { compositions } from "./compositions.js";
 import { renderVideo } from "./renderer.js";
@@ -13,7 +13,11 @@ type Env = {
   };
 };
 
-const app = new OpenAPIHono<Env>();
+const app = createApp<Env>({
+  title: "Open Video API",
+  version: "1.0.0",
+  description: "Programmatic video creation API. Discover compositions, submit render jobs, upload rendered videos to R2, and serve them. The deployed URL doubles as a Remotion serveUrl for renderMedia().",
+});
 
 app.onError((err, c) => {
   console.error(err);
@@ -21,7 +25,6 @@ app.onError((err, c) => {
 });
 
 app.use("*", async (c, next) => {
-  initDB(c.env);
   initUploads(c.env.UPLOADS);
   await next();
 });
@@ -604,17 +607,6 @@ app.get("/api/serve-url", async (c) => {
   const host = c.req.header("host") || "localhost";
   const protocol = c.req.header("x-forwarded-proto") || "https";
   return c.json({ serveUrl: `${protocol}://${host}` }, 200);
-});
-
-// ── OpenAPI doc ──────────────────────────────────────────────────────
-
-app.doc("/openapi.json", {
-  openapi: "3.0.0",
-  info: {
-    title: "Open Video API",
-    version: "1.0.0",
-    description: "Programmatic video creation API. Discover compositions, submit render jobs, upload rendered videos to R2, and serve them. The deployed URL doubles as a Remotion serveUrl for renderMedia().",
-  },
 });
 
 export default app;
