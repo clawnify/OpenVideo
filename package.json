@@ -11,6 +11,7 @@
     "dev:studio": "npx remotion studio"
   },
   "dependencies": {
+    "@clawnify/app": "^0.1.0",
     "@clawnify/db": "^0.2.0",
     "@cloudflare/puppeteer": "^1.1.0",
     "@hono/zod-openapi": "^0.18.0",
