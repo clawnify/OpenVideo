@@ -2,6 +2,8 @@
 
 # Open Video
 
+[![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/open-video)
+
 Programmatic video creation powered by **Remotion**. Full Studio editor for humans, API for agents. Compositions are React code — agents write them, the Studio previews them, and `npx remotion render` produces pixel-perfect videos. Built with **React + Hono + D1 + R2**. Deploys to Cloudflare Workers via [Clawnify](https://clawnify.com).
 
 ## Features
