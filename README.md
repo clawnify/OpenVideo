@@ -2,7 +2,7 @@
 
 # OpenVideo
 
-[![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/open-video)
+[![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/OpenVideo)
 
 Programmatic video creation powered by **Remotion**. Full Studio editor for humans, API for agents. Compositions are React code — agents write them, the Studio previews them, and `npx remotion render` produces pixel-perfect videos. Built with **React + Hono + D1 + R2**. Deploys to Cloudflare Workers via [Clawnify](https://clawnify.com).
 
@@ -22,7 +22,7 @@ Programmatic video creation powered by **Remotion**. Full Studio editor for huma
 ## Quickstart
 
 ```bash
-git clone https://github.com/clawnify/open-video.git
+git clone https://github.com/clawnify/OpenVideo.git
 cd open-video
 pnpm install
 ```
