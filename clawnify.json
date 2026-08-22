@@ -1,7 +1,7 @@
 {
   "$schema": "https://app.clawnify.com/schema/v1/clawnify.json",
   "version": 1,
-  "name": "Video Studio",
+  "name": "OpenVideo",
   "description": "Programmatic video creation powered by Remotion. Full Studio editor for previewing and editing compositions. Agents create compositions as React code, render videos via CLI, and store results in R2. Includes title cards, kinetic typography, social posts, countdowns, logo reveals, and gradient animations.",
   "icon": "icon.svg",
   "tags": ["video", "remotion", "animation", "api", "content"],

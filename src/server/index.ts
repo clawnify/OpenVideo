@@ -14,7 +14,7 @@ type Env = {
 };
 
 const app = createApp<Env>({
-  title: "Open Video API",
+  title: "OpenVideo API",
   version: "1.0.0",
   description: "Programmatic video creation API. Discover compositions, submit render jobs, upload rendered videos to R2, and serve them. The deployed URL doubles as a Remotion serveUrl for renderMedia().",
 });
