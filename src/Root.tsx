@@ -105,7 +105,7 @@ export const Root: React.FC = () => {
         width={1920}
         height={1080}
         defaultProps={{
-          title: "Open Video Studio",
+          title: "OpenVideo Studio",
           subtitle: "Programmatic video creation powered by Remotion",
           colorFrom: "#6366f1",
           colorTo: "#ec4899",
