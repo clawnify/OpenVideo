@@ -231,7 +231,12 @@ const durCache = new Map<string, number>();
 const peaksCache = new Map<string, number[]>();
 
 function useSourceDurations(edl: Edl, assets: Asset[]) {
-  const [, bump] = useState(0);
+  // `version` is not cosmetic: it is what gives `srcDur` a new identity when a
+  // duration lands, which is what invalidates the `segments` memo downstream.
+  // Without it a project whose EDL already references an asset at mount (the
+  // "Use in an edit" flow) renders every clip at zero length forever, because
+  // the cache fills after the memo has already been computed.
+  const [version, bump] = useState(0);
   const byId = useMemo(() => new Map(assets.map((a) => [a.id, a])), [assets]);
 
   const resolve = useCallback(
@@ -270,7 +275,8 @@ function useSourceDurations(edl: Edl, assets: Asset[]) {
     }
   }, [edl, resolve]);
 
-  const srcDur = useCallback((src: string) => durCache.get(src), []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const srcDur = useCallback((src: string) => durCache.get(src), [version]);
   return { srcDur, resolveAsset: resolve };
 }
 
@@ -384,12 +390,15 @@ export function EditProjectsSection({ navigate }: { navigate: (to: string) => vo
             )}
           </h2>
           <p className="text-body-sm text-muted mt-0.5">
-            Cut and sequence real clips, overlay text, mix music, export to MP4.
+            Video you already shot: trim it, put the clips in order, add text and music, export to
+            MP4.
           </p>
         </div>
-        <button onClick={create} disabled={busy} className={`${btnSecondary} shrink-0`}>
-          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} New edit
-        </button>
+        {projects && projects.length > 0 && (
+          <button onClick={create} disabled={busy} className={`${btnSecondary} shrink-0`}>
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} New edit
+          </button>
+        )}
       </div>
       {projects === null ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -404,7 +413,7 @@ export function EditProjectsSection({ navigate }: { navigate: (to: string) => vo
         <EmptyState
           icon={<Scissors className="w-8 h-8" />}
           title="No edits yet"
-          body="An edit is your own footage cut down: trim the clips, put them in order, drop text over the top and mix music under it."
+          body="Upload a clip and cut it down."
           action={
             <button onClick={create} disabled={busy} className={btnSecondary}>
               <Plus className="w-4 h-4" /> New edit
@@ -1054,18 +1063,36 @@ function Player({
   setSel: (s: Sel) => void;
   update: (fn: (d: Edl) => void) => void;
 }) {
+  const boxRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-  const [scale, setScale] = useState(0.3);
+  // Scale to FIT, the way the composition preview's harness does: the limiting
+  // dimension wins. `aspect-ratio` alone sized the stage from the full width
+  // and let it run off the bottom of the pane (max-height never applied,
+  // because the parent's height is indefinite), so the frame was clipped.
+  const [fit, setFit] = useState({ w: 0, h: 0, scale: 1 });
+  const scale = fit.scale;
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
 
   useEffect(() => {
-    const el = stageRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(() => setScale(el.clientWidth / edl.output.width));
-    ro.observe(el);
+    const box = boxRef.current;
+    if (!box) return;
+    const measure = () => {
+      // Content box, not border box: the pane carries padding, and measuring
+      // through it puts the stage back over the edge it was meant to clear.
+      const cs = getComputedStyle(box);
+      const width = box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      const height = box.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+      const s = Math.min(width / edl.output.width, height / edl.output.height);
+      if (s > 0 && Number.isFinite(s)) {
+        setFit({ w: edl.output.width * s, h: edl.output.height * s, scale: s });
+      }
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(box);
     return () => ro.disconnect();
-  }, [edl.output.width]);
+  }, [edl.output.width, edl.output.height]);
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
 
@@ -1134,8 +1161,11 @@ function Player({
   };
 
   return (
-    <div className={`${pane === "canvas" ? "grid" : "hidden"} lg:grid flex-1 min-w-0 bg-surface-sunken place-items-center p-4 overflow-hidden`}>
-      <div className="w-full max-w-full" style={{ maxHeight: "100%", aspectRatio: `${edl.output.width}/${edl.output.height}` }}>
+    <div
+      ref={boxRef}
+      className={`${pane === "canvas" ? "grid" : "hidden"} lg:grid flex-1 min-w-0 min-h-0 bg-surface-sunken place-items-center p-4 overflow-hidden`}
+    >
+      <div style={{ width: fit.w || undefined, height: fit.h || undefined }}>
         <div
           ref={stageRef}
           className="relative w-full h-full overflow-hidden rounded-md shadow-edge"

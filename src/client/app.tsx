@@ -18,6 +18,7 @@ import {
   Type as TypeIcon,
   Music,
   AlertCircle,
+  Scissors,
   X,
 } from "lucide-react";
 import {
@@ -59,6 +60,9 @@ interface RenderJob {
   status: "rendering" | "completed" | "failed";
   output_url: string | null;
   error: string | null;
+  /** The media-library asset this render produced, so the finished
+   *  composition can be cut into an edit instead of only downloaded. */
+  asset_id: string | null;
   created_at: string;
 }
 
@@ -162,7 +166,10 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
     setCreating(true);
     try {
       const c = await api.send<Composition>("POST", "/api/compositions", {
-        name: "Untitled",
+        // Name it after what is actually on screen. Three things called
+        // "Untitled" tell you nothing; this agrees with the thumbnail and says
+        // what kind of object you just got.
+        name: "Product launch title card",
         html: STARTER_HTML,
       });
       navigate(`/${c.id}`);
@@ -174,18 +181,28 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
   return (
     <main className="flex-1 overflow-y-auto">
       <div className="max-w-6xl mx-auto px-6 py-8">
-        {/* Toolbar grammar: identity left, the one solid action right. */}
-        <div className="flex items-center justify-between gap-4 mb-6">
-          <h1 className="text-heading-1">
-            Your videos
-            {comps && comps.length > 0 && (
-              <span className="ml-2 text-data text-muted tabular-nums">{comps.length}</span>
-            )}
-          </h1>
-          <button onClick={newVideo} disabled={creating} className={btnPrimary}>
-            {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-            New video
-          </button>
+        {/* Toolbar grammar: identity left, the one solid action right. The
+            two sections carry the same anatomy and a line each saying which
+            one you want — "graphics you make" vs "footage you shot". */}
+        <div className="flex items-start justify-between gap-4 mb-6">
+          <div>
+            <h1 className="text-heading-1">
+              Your videos
+              {comps && comps.length > 0 && (
+                <span className="ml-2 text-data text-muted tabular-nums">{comps.length}</span>
+              )}
+            </h1>
+            <p className="text-body-sm text-muted mt-0.5">
+              Graphics you make from scratch: titles, intros, lower thirds. Built on a timeline,
+              rendered to MP4.
+            </p>
+          </div>
+          {comps && comps.length > 0 && (
+            <button onClick={newVideo} disabled={creating} className={`${btnPrimary} shrink-0`}>
+              {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+              New video
+            </button>
+          )}
         </div>
 
         {comps === null ? (
@@ -205,7 +222,7 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
           <EmptyState
             icon={<Video className="w-8 h-8" />}
             title="No videos yet"
-            body="A video is motion graphics you author as HTML on a timeline — a title card, a lower third, an intro. Start from a template and edit it live."
+            body="Start from a working title card and change the words."
             action={
               <button onClick={newVideo} disabled={creating} className={btnPrimary}>
                 <Plus className="w-4 h-4" /> New video
@@ -222,7 +239,7 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
               >
                 <div className="aspect-video bg-black overflow-hidden">
                   <iframe
-                    src={`/api/compositions/${c.id}/preview`}
+                    src={`/api/compositions/${c.id}/preview?seek=${posterTime(c.html)}`}
                     className="w-full h-full pointer-events-none"
                     scrolling="no"
                     tabIndex={-1}
@@ -315,6 +332,23 @@ function Editor({
   // Selected clip (by index) for the right-side inspector.
   const [selectedClip, setSelectedClip] = useState<number | null>(null);
 
+  // Open with the headline already selected, so the first thing on screen is a
+  // field holding the text you are about to change. An editor that opens on
+  // "select something to edit it" spends the user's first move on housekeeping;
+  // the measurable thing in a first run is time to first EDIT.
+  const autoSelected = useRef(false);
+  useEffect(() => {
+    if (autoSelected.current) return;
+    const { clips } = parseClips(comp.html);
+    if (!clips.length) return;
+    autoSelected.current = true;
+    const px = (v: string) => parseFloat(v) || 0;
+    const headline = clips
+      .filter((c) => c.type === "text")
+      .sort((a, b) => px(b.fontSize) - px(a.fontSize))[0];
+    setSelectedClip((headline ?? clips[0]).index);
+  }, [comp.html]);
+
   // Playhead state, kept in sync with the preview iframe's master clock.
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [playing, setPlaying] = useState(false); // default paused
@@ -370,6 +404,7 @@ function Editor({
   // a clip only sets the window — it never moves the playhead (you clicked
   // something you can already see) and never auto-plays.
   const clips = parseClips(html).clips;
+  const poster = posterTime(html);
   const selClip = selectedClip != null ? clips.find((c) => c.index === selectedClip) ?? null : null;
 
   useEffect(() => {
@@ -395,11 +430,21 @@ function Editor({
 
   const reloadTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   function updateClip(index: number, patch: ClipPatch) {
-    setHtml((h) => applyClipPatch(h, index, patch));
-    // Debounce the preview reload so typing stays smooth; restore the current
-    // playhead afterwards so an edit doesn't jump the time either.
+    const next = applyClipPatch(html, index, patch);
+    setHtml(next);
+    // The preview iframe renders the SAVED composition (the harness is served
+    // by /api/compositions/:id/preview), so reloading it without saving first
+    // just re-showed the old frame: you typed your title and the canvas never
+    // changed. Persist, THEN reload. Debounced so typing stays smooth, and the
+    // playhead is restored afterwards so an edit doesn't jump the time either.
     clearTimeout(reloadTimer.current);
-    reloadTimer.current = setTimeout(() => {
+    reloadTimer.current = setTimeout(async () => {
+      setSaving(true);
+      try {
+        await api.send("PUT", `/api/compositions/${comp.id}`, { name, html: next, fps });
+      } finally {
+        setSaving(false);
+      }
       restoreRef.current = timeRef.current;
       setPreviewKey((k) => k + 1);
     }, 350);
@@ -410,7 +455,7 @@ function Editor({
     try {
       await api.send("PUT", `/api/compositions/${comp.id}`, { name, html, fps });
       setPreviewKey((k) => k + 1); // reload iframe
-      setTime(0);
+      setTime(poster);
     } finally {
       setSaving(false);
     }
@@ -450,7 +495,7 @@ function Editor({
                 <iframe
                   ref={iframeRef}
                   key={previewKey}
-                  src={`/api/compositions/${comp.id}/preview`}
+                  src={`/api/compositions/${comp.id}/preview?seek=${poster}`}
                   className="w-full h-full"
                   title="preview"
                 />
@@ -557,7 +602,7 @@ function Editor({
           />
         )}
         {tab === "media" && <MediaPanel />}
-        {tab === "renders" && <RendersPanel comp={comp} />}
+        {tab === "renders" && <RendersPanel comp={comp} navigate={navigate} />}
           </div>
         </Panel>
       </Group>
@@ -611,6 +656,24 @@ function parseClips(html: string): { clips: Clip[]; tracks: number } {
     /* malformed HTML mid-edit — show an empty timeline */
   }
   return { clips, tracks };
+}
+
+/**
+ * A frame worth showing when nothing is playing.
+ *
+ * Compositions animate IN (`gsap.from({opacity: 0})`), so at t=0 every element
+ * is still invisible and the composition renders as an empty frame. Landing the
+ * gallery thumbnails and the editor on t=0 therefore showed a black rectangle
+ * and made the app look broken on first open — the starter composition is meant
+ * to be the thing that teaches you what this is, and it was showing nothing.
+ *
+ * Halfway through is the frame a video tool would pick for a poster: past the
+ * entrances, before any outro.
+ */
+export function posterTime(html: string): number {
+  const { clips } = parseClips(html);
+  const end = clips.reduce((max, c) => Math.max(max, c.start + c.duration), 0);
+  return end > 0 ? Math.round((end / 2) * 100) / 100 : 0;
 }
 
 export type ClipPatch = Partial<{
@@ -1083,10 +1146,37 @@ const RENDER_TONE: Record<RenderJob["status"], string> = {
   failed: "danger",
 };
 
-function RendersPanel({ comp }: { comp: Composition }) {
+function RendersPanel({ comp, navigate }: { comp: Composition; navigate: (to: string) => void }) {
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [rendering, setRendering] = useState(false);
   const [err, setErr] = useState("");
+  const [cutting, setCutting] = useState<number | null>(null);
+
+  /** Start a cut with this render at the head of the main track: the title
+   *  card first, then you add the footage after it. This is the seam between
+   *  the two halves of the app — the composition becomes a clip. */
+  async function useInEdit(job: RenderJob) {
+    if (!job.asset_id) return;
+    setCutting(job.id);
+    setErr("");
+    try {
+      const project = await api.send<{ id: string }>("POST", "/api/projects", {
+        name: `${comp.name} launch`,
+        edl: {
+          version: 1,
+          output: { width: 1280, height: 720, fps: 30, background: "#000000" },
+          main: { elements: [{ id: `c${job.id}`, type: "video", src: `asset:${job.asset_id}` }] },
+          overlays: [],
+          audio: [],
+        },
+      });
+      navigate(`/edits/${project.id}`);
+    } catch (e) {
+      setErr(String((e as Error).message || e));
+    } finally {
+      setCutting(null);
+    }
+  }
 
   async function load() {
     const all = await api.get<RenderJob[]>("/api/renders");
@@ -1143,6 +1233,21 @@ function RendersPanel({ comp }: { comp: Composition }) {
               <span>
                 #{j.id} · {new Date(j.created_at + "Z").toLocaleString()}
               </span>
+              {j.status === "completed" && j.asset_id && (
+                <button
+                  onClick={() => useInEdit(j)}
+                  disabled={cutting === j.id}
+                  className={`${btnSecondary} ml-auto`}
+                  title="Start a cut with this clip at the front"
+                >
+                  {cutting === j.id ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Scissors className="w-4 h-4" />
+                  )}
+                  Use in an edit
+                </button>
+              )}
             </div>
           </div>
         ))}
@@ -1150,7 +1255,7 @@ function RendersPanel({ comp }: { comp: Composition }) {
           <EmptyState
             icon={<Film className="w-8 h-8" />}
             title="No renders yet"
-            body="Rendering runs the composition on the managed render service and hands back an MP4. It takes about a minute."
+            body="Rendering runs the composition on the managed render service and hands back an MP4. It also lands in your media library, so you can cut it into a footage edit."
           />
         )}
       </div>

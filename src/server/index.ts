@@ -243,6 +243,7 @@ interface RenderJob {
   status: string;
   output_url: string | null;
   error: string | null;
+  asset_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -290,9 +291,19 @@ app.post("/api/renders", async (c) => {
     const key = `renders/render-${jobId}-${lower8()}.mp4`;
     await putUpload(key, mp4, "video/mp4");
     const url = `/api/uploads/${encodeURIComponent(key)}`;
+
+    // A finished composition IS footage. Register it in the media library so
+    // it can be cut into an edit as `asset:<id>` — a title card at the head of
+    // the launch video, an outro at the tail. Export staging streams straight
+    // from this app's own storage, so nothing else has to change.
+    const assetId = lower16();
     await run(
-      "UPDATE render_jobs SET status = 'completed', output_url = ?, updated_at = datetime('now') WHERE id = ?",
-      [url, jobId],
+      "INSERT INTO assets (id, key, name, content_type, size, duration) VALUES (?, ?, ?, 'video/mp4', ?, ?)",
+      [assetId, key, `${comp.name}.mp4`, mp4.byteLength, compositionSeconds(comp.html)],
+    );
+    await run(
+      "UPDATE render_jobs SET status = 'completed', output_url = ?, asset_id = ?, updated_at = datetime('now') WHERE id = ?",
+      [url, assetId, jobId],
     );
   } catch (err) {
     await run(
@@ -566,6 +577,24 @@ app.post("/api/projects/:id/export", async (c) => {
 });
 
 // ── helpers ──────────────────────────────────────────────────────────
+
+/** Output length of a composition: the last moment any clip is on screen.
+ *  The renderer produces exactly this, and the footage timeline needs a
+ *  duration synchronously to lay the clip out. */
+function compositionSeconds(html: string): number {
+  let max = 0;
+  const re = /data-start="([\d.]+)"[^>]*data-duration="([\d.]+)"|data-duration="([\d.]+)"[^>]*data-start="([\d.]+)"/g;
+  for (const m of html.matchAll(re)) {
+    const start = parseFloat(m[1] ?? m[4] ?? "0") || 0;
+    const dur = parseFloat(m[2] ?? m[3] ?? "0") || 0;
+    if (start + dur > max) max = start + dur;
+  }
+  return Math.round(max * 100) / 100;
+}
+
+function lower16(): string {
+  return lower8() + lower8();
+}
 
 function lower8(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(4)))
