@@ -1063,18 +1063,36 @@ function Player({
   setSel: (s: Sel) => void;
   update: (fn: (d: Edl) => void) => void;
 }) {
+  const boxRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-  const [scale, setScale] = useState(0.3);
+  // Scale to FIT, the way the composition preview's harness does: the limiting
+  // dimension wins. `aspect-ratio` alone sized the stage from the full width
+  // and let it run off the bottom of the pane (max-height never applied,
+  // because the parent's height is indefinite), so the frame was clipped.
+  const [fit, setFit] = useState({ w: 0, h: 0, scale: 1 });
+  const scale = fit.scale;
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
 
   useEffect(() => {
-    const el = stageRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(() => setScale(el.clientWidth / edl.output.width));
-    ro.observe(el);
+    const box = boxRef.current;
+    if (!box) return;
+    const measure = () => {
+      // Content box, not border box: the pane carries padding, and measuring
+      // through it puts the stage back over the edge it was meant to clear.
+      const cs = getComputedStyle(box);
+      const width = box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      const height = box.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+      const s = Math.min(width / edl.output.width, height / edl.output.height);
+      if (s > 0 && Number.isFinite(s)) {
+        setFit({ w: edl.output.width * s, h: edl.output.height * s, scale: s });
+      }
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(box);
     return () => ro.disconnect();
-  }, [edl.output.width]);
+  }, [edl.output.width, edl.output.height]);
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
 
@@ -1143,8 +1161,11 @@ function Player({
   };
 
   return (
-    <div className={`${pane === "canvas" ? "grid" : "hidden"} lg:grid flex-1 min-w-0 bg-surface-sunken place-items-center p-4 overflow-hidden`}>
-      <div className="w-full max-w-full" style={{ maxHeight: "100%", aspectRatio: `${edl.output.width}/${edl.output.height}` }}>
+    <div
+      ref={boxRef}
+      className={`${pane === "canvas" ? "grid" : "hidden"} lg:grid flex-1 min-w-0 min-h-0 bg-surface-sunken place-items-center p-4 overflow-hidden`}
+    >
+      <div style={{ width: fit.w || undefined, height: fit.h || undefined }}>
         <div
           ref={stageRef}
           className="relative w-full h-full overflow-hidden rounded-md shadow-edge"
