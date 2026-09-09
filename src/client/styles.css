@@ -234,11 +234,6 @@ body {
   margin: 0;
 }
 
-/* Numbers stack: tabular figures wherever digits are compared or totalled. */
-.tabular-nums {
-  font-variant-numeric: tabular-nums;
-}
-
 /* Motion is quick and functional: 0.15s on background, colour and shadow.
    No scale, no spring, no glow. */
 @media (prefers-reduced-motion: no-preference) {
@@ -311,33 +306,41 @@ body {
 }
 
 /* Inputs: an INSET ring, so focus never shifts layout by a pixel. Written as
-   a plain class because the focus recipe composes a ring and a halo in one
-   property, which a utility cannot express. */
-.field {
-  width: 100%;
-  height: 2rem;
-  padding-inline: 0.75rem;
-  background-color: var(--surface);
-  color: var(--foreground);
-  font-size: var(--text-body);
-  border-radius: var(--radius-sm);
-  box-shadow: inset 0 0 0 1px var(--border);
-  outline: none;
-}
-textarea.field,
-select.field[multiple] {
-  height: auto;
-  padding-block: 0.5rem;
-  line-height: 1.5;
-}
-.field::placeholder {
-  color: var(--faint);
-}
-.field:focus {
-  box-shadow:
-    inset 0 0 0 1px var(--ring),
-    0 0 0 3px var(--accent-tint);
-}
-.field:disabled {
-  color: var(--faint);
+   a class because the focus recipe composes a ring and a halo in one property,
+   which a utility cannot express.
+
+   It lives in @layer base ON PURPOSE. Unlayered CSS outranks everything
+   Tailwind emits, so an unlayered `.field { width: 100% }` silently beat `w-8`
+   and blew a 32px colour swatch up to the full panel width. In the base layer
+   the recipe is a DEFAULT and any utility on the element overrides it, which
+   is the precedence a component author expects. */
+@layer base {
+  .field {
+    width: 100%;
+    height: 2rem;
+    padding-inline: 0.75rem;
+    background-color: var(--surface);
+    color: var(--foreground);
+    font-size: var(--text-body);
+    border-radius: var(--radius-sm);
+    box-shadow: inset 0 0 0 1px var(--border);
+    outline: none;
+  }
+  textarea.field,
+  select.field[multiple] {
+    height: auto;
+    padding-block: 0.5rem;
+    line-height: 1.5;
+  }
+  .field::placeholder {
+    color: var(--faint);
+  }
+  .field:focus {
+    box-shadow:
+      inset 0 0 0 1px var(--ring),
+      0 0 0 3px var(--accent-tint);
+  }
+  .field:disabled {
+    color: var(--faint);
+  }
 }
