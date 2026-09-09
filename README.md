@@ -67,6 +67,10 @@ Rendering runs on Clawnify's managed render service, so deployed instances need 
 ```
 src/
   client/app.tsx     # editor UI: compositions, timeline, media, renders
+  client/edit.tsx    # footage editor: media rail, player, inspector, timeline
+  client/ui.tsx      # shared control recipes (buttons, dialog, empty state)
+  client/starter.ts  # the starter composition — video content, not app chrome
+  client/styles.css  # design tokens: palette, type scale, elevation
   server/            # REST API (compositions, assets, renders, edit projects, exports)
 agent.md             # how an AI agent authors, edits and renders videos
 ```
