@@ -222,7 +222,7 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
               >
                 <div className="aspect-video bg-black overflow-hidden">
                   <iframe
-                    src={`/api/compositions/${c.id}/preview`}
+                    src={`/api/compositions/${c.id}/preview?seek=${posterTime(c.html)}`}
                     className="w-full h-full pointer-events-none"
                     scrolling="no"
                     tabIndex={-1}
@@ -370,6 +370,7 @@ function Editor({
   // a clip only sets the window — it never moves the playhead (you clicked
   // something you can already see) and never auto-plays.
   const clips = parseClips(html).clips;
+  const poster = posterTime(html);
   const selClip = selectedClip != null ? clips.find((c) => c.index === selectedClip) ?? null : null;
 
   useEffect(() => {
@@ -410,7 +411,7 @@ function Editor({
     try {
       await api.send("PUT", `/api/compositions/${comp.id}`, { name, html, fps });
       setPreviewKey((k) => k + 1); // reload iframe
-      setTime(0);
+      setTime(poster);
     } finally {
       setSaving(false);
     }
@@ -450,7 +451,7 @@ function Editor({
                 <iframe
                   ref={iframeRef}
                   key={previewKey}
-                  src={`/api/compositions/${comp.id}/preview`}
+                  src={`/api/compositions/${comp.id}/preview?seek=${poster}`}
                   className="w-full h-full"
                   title="preview"
                 />
@@ -611,6 +612,24 @@ function parseClips(html: string): { clips: Clip[]; tracks: number } {
     /* malformed HTML mid-edit — show an empty timeline */
   }
   return { clips, tracks };
+}
+
+/**
+ * A frame worth showing when nothing is playing.
+ *
+ * Compositions animate IN (`gsap.from({opacity: 0})`), so at t=0 every element
+ * is still invisible and the composition renders as an empty frame. Landing the
+ * gallery thumbnails and the editor on t=0 therefore showed a black rectangle
+ * and made the app look broken on first open — the starter composition is meant
+ * to be the thing that teaches you what this is, and it was showing nothing.
+ *
+ * Halfway through is the frame a video tool would pick for a poster: past the
+ * entrances, before any outro.
+ */
+export function posterTime(html: string): number {
+  const { clips } = parseClips(html);
+  const end = clips.reduce((max, c) => Math.max(max, c.start + c.duration), 0);
+  return end > 0 ? Math.round((end / 2) * 100) / 100 : 0;
 }
 
 export type ClipPatch = Partial<{
