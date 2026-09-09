@@ -384,12 +384,15 @@ export function EditProjectsSection({ navigate }: { navigate: (to: string) => vo
             )}
           </h2>
           <p className="text-body-sm text-muted mt-0.5">
-            Cut and sequence real clips, overlay text, mix music, export to MP4.
+            Video you already shot: trim it, put the clips in order, add text and music, export to
+            MP4.
           </p>
         </div>
-        <button onClick={create} disabled={busy} className={`${btnSecondary} shrink-0`}>
-          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} New edit
-        </button>
+        {projects && projects.length > 0 && (
+          <button onClick={create} disabled={busy} className={`${btnSecondary} shrink-0`}>
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} New edit
+          </button>
+        )}
       </div>
       {projects === null ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -404,7 +407,7 @@ export function EditProjectsSection({ navigate }: { navigate: (to: string) => vo
         <EmptyState
           icon={<Scissors className="w-8 h-8" />}
           title="No edits yet"
-          body="An edit is your own footage cut down: trim the clips, put them in order, drop text over the top and mix music under it."
+          body="Upload a clip and cut it down."
           action={
             <button onClick={create} disabled={busy} className={btnSecondary}>
               <Plus className="w-4 h-4" /> New edit

@@ -162,7 +162,10 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
     setCreating(true);
     try {
       const c = await api.send<Composition>("POST", "/api/compositions", {
-        name: "Untitled",
+        // Name it after what is actually on screen. Three things called
+        // "Untitled" tell you nothing; this agrees with the thumbnail and says
+        // what kind of object you just got.
+        name: "Product launch title card",
         html: STARTER_HTML,
       });
       navigate(`/${c.id}`);
@@ -174,18 +177,28 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
   return (
     <main className="flex-1 overflow-y-auto">
       <div className="max-w-6xl mx-auto px-6 py-8">
-        {/* Toolbar grammar: identity left, the one solid action right. */}
-        <div className="flex items-center justify-between gap-4 mb-6">
-          <h1 className="text-heading-1">
-            Your videos
-            {comps && comps.length > 0 && (
-              <span className="ml-2 text-data text-muted tabular-nums">{comps.length}</span>
-            )}
-          </h1>
-          <button onClick={newVideo} disabled={creating} className={btnPrimary}>
-            {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-            New video
-          </button>
+        {/* Toolbar grammar: identity left, the one solid action right. The
+            two sections carry the same anatomy and a line each saying which
+            one you want — "graphics you make" vs "footage you shot". */}
+        <div className="flex items-start justify-between gap-4 mb-6">
+          <div>
+            <h1 className="text-heading-1">
+              Your videos
+              {comps && comps.length > 0 && (
+                <span className="ml-2 text-data text-muted tabular-nums">{comps.length}</span>
+              )}
+            </h1>
+            <p className="text-body-sm text-muted mt-0.5">
+              Graphics you make from scratch: titles, intros, lower thirds. Built on a timeline,
+              rendered to MP4.
+            </p>
+          </div>
+          {comps && comps.length > 0 && (
+            <button onClick={newVideo} disabled={creating} className={`${btnPrimary} shrink-0`}>
+              {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+              New video
+            </button>
+          )}
         </div>
 
         {comps === null ? (
@@ -205,7 +218,7 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
           <EmptyState
             icon={<Video className="w-8 h-8" />}
             title="No videos yet"
-            body="A video is motion graphics you author as HTML on a timeline — a title card, a lower third, an intro. Start from a template and edit it live."
+            body="Start from a working title card and change the words."
             action={
               <button onClick={newVideo} disabled={creating} className={btnPrimary}>
                 <Plus className="w-4 h-4" /> New video
@@ -315,6 +328,23 @@ function Editor({
   // Selected clip (by index) for the right-side inspector.
   const [selectedClip, setSelectedClip] = useState<number | null>(null);
 
+  // Open with the headline already selected, so the first thing on screen is a
+  // field holding the text you are about to change. An editor that opens on
+  // "select something to edit it" spends the user's first move on housekeeping;
+  // the measurable thing in a first run is time to first EDIT.
+  const autoSelected = useRef(false);
+  useEffect(() => {
+    if (autoSelected.current) return;
+    const { clips } = parseClips(comp.html);
+    if (!clips.length) return;
+    autoSelected.current = true;
+    const px = (v: string) => parseFloat(v) || 0;
+    const headline = clips
+      .filter((c) => c.type === "text")
+      .sort((a, b) => px(b.fontSize) - px(a.fontSize))[0];
+    setSelectedClip((headline ?? clips[0]).index);
+  }, [comp.html]);
+
   // Playhead state, kept in sync with the preview iframe's master clock.
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [playing, setPlaying] = useState(false); // default paused
@@ -396,11 +426,21 @@ function Editor({
 
   const reloadTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   function updateClip(index: number, patch: ClipPatch) {
-    setHtml((h) => applyClipPatch(h, index, patch));
-    // Debounce the preview reload so typing stays smooth; restore the current
-    // playhead afterwards so an edit doesn't jump the time either.
+    const next = applyClipPatch(html, index, patch);
+    setHtml(next);
+    // The preview iframe renders the SAVED composition (the harness is served
+    // by /api/compositions/:id/preview), so reloading it without saving first
+    // just re-showed the old frame: you typed your title and the canvas never
+    // changed. Persist, THEN reload. Debounced so typing stays smooth, and the
+    // playhead is restored afterwards so an edit doesn't jump the time either.
     clearTimeout(reloadTimer.current);
-    reloadTimer.current = setTimeout(() => {
+    reloadTimer.current = setTimeout(async () => {
+      setSaving(true);
+      try {
+        await api.send("PUT", `/api/compositions/${comp.id}`, { name, html: next, fps });
+      } finally {
+        setSaving(false);
+      }
       restoreRef.current = timeRef.current;
       setPreviewKey((k) => k + 1);
     }, 350);
