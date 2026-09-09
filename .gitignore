@@ -1,15 +1,18 @@
 node_modules
 dist
-build
 .wrangler
+.mf
+
+# Local secrets (CLAWNIFY_TOKEN etc.) — never commit or deploy
 .dev.vars
-*.db
-*.db-shm
-*.db-wal
+.dev.vars.*
+
+*.log
 .DS_Store
-output*.mp4
-babette.mp4
-test-*.txt
-videos/
-test-babette.mp4
-vite.config.ts
+
+# Clawnify deploy state (contains app_token) — never commit
+.clawnify
+.clawnify/
+
+# Internal design-system guidance for the builder/agent — never published
+DESIGN.md

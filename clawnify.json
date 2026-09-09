@@ -2,33 +2,41 @@
   "$schema": "https://app.clawnify.com/schema/v1/clawnify.json",
   "version": 1,
   "name": "OpenVideo",
-  "description": "Programmatic video creation powered by Remotion. Full Studio editor for previewing and editing compositions. Agents create compositions as React code, render videos via CLI, and store results in R2. Includes title cards, kinetic typography, social posts, countdowns, logo reveals, and gradient animations.",
+  "description": "Open-source, agent-friendly video editor. Compose videos as plain HTML on a timeline, drop in your own media (logos, product demos), preview with a scrubbable playhead, and render to MP4. Powered by HyperFrames.",
   "icon": "icon.svg",
-  "tags": ["video", "remotion", "animation", "api", "content"],
-
+  "tags": [
+    "video",
+    "editor",
+    "timeline",
+    "html",
+    "animation"
+  ],
   "app": {
     "framework": "react+hono",
     "database": true,
     "storage": true
   },
-
   "deploy": {
-    "title": "Deploy your Video Studio",
-    "subtitle": "Programmatic video creation — create compositions as code, render with full CSS fidelity",
+    "title": "Deploy your OpenVideo studio",
+    "subtitle": "Compose videos as HTML on a timeline, drop in your logo and product demos, and render to MP4.",
     "prompts": [
       {
         "key": "brand_name",
         "label": "Brand or company name",
-        "placeholder": "e.g. ContentForge",
+        "placeholder": "e.g. Northwind",
         "required": true
       },
       {
         "key": "use_case",
-        "label": "What kind of videos will you create?",
-        "placeholder": "e.g. Social media ads, product demos, YouTube intros"
+        "label": "What kind of videos will you make?",
+        "placeholder": "e.g. Product launch clips, feature demos, social ads"
       }
     ]
   },
-
-  "agent": "agent.md"
+  "agent": "agent.md",
+  "env": {
+    "optional": [
+      "OPENROUTER_API_KEY"
+    ]
+  }
 }
