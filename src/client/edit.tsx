@@ -231,7 +231,12 @@ const durCache = new Map<string, number>();
 const peaksCache = new Map<string, number[]>();
 
 function useSourceDurations(edl: Edl, assets: Asset[]) {
-  const [, bump] = useState(0);
+  // `version` is not cosmetic: it is what gives `srcDur` a new identity when a
+  // duration lands, which is what invalidates the `segments` memo downstream.
+  // Without it a project whose EDL already references an asset at mount (the
+  // "Use in an edit" flow) renders every clip at zero length forever, because
+  // the cache fills after the memo has already been computed.
+  const [version, bump] = useState(0);
   const byId = useMemo(() => new Map(assets.map((a) => [a.id, a])), [assets]);
 
   const resolve = useCallback(
@@ -270,7 +275,8 @@ function useSourceDurations(edl: Edl, assets: Asset[]) {
     }
   }, [edl, resolve]);
 
-  const srcDur = useCallback((src: string) => durCache.get(src), []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const srcDur = useCallback((src: string) => durCache.get(src), [version]);
   return { srcDur, resolveAsset: resolve };
 }
 

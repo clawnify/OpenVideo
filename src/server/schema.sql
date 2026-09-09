@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS render_jobs (
   status TEXT NOT NULL DEFAULT 'rendering',
   output_url TEXT,
   error TEXT,
+  -- The media-library asset this render produced. A finished composition is
+  -- footage: registering it here is what lets a title card be a clip in a cut,
+  -- instead of a dead end that only ever gets downloaded.
+  asset_id TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

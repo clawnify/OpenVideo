@@ -18,6 +18,7 @@ import {
   Type as TypeIcon,
   Music,
   AlertCircle,
+  Scissors,
   X,
 } from "lucide-react";
 import {
@@ -59,6 +60,9 @@ interface RenderJob {
   status: "rendering" | "completed" | "failed";
   output_url: string | null;
   error: string | null;
+  /** The media-library asset this render produced, so the finished
+   *  composition can be cut into an edit instead of only downloaded. */
+  asset_id: string | null;
   created_at: string;
 }
 
@@ -598,7 +602,7 @@ function Editor({
           />
         )}
         {tab === "media" && <MediaPanel />}
-        {tab === "renders" && <RendersPanel comp={comp} />}
+        {tab === "renders" && <RendersPanel comp={comp} navigate={navigate} />}
           </div>
         </Panel>
       </Group>
@@ -1142,10 +1146,37 @@ const RENDER_TONE: Record<RenderJob["status"], string> = {
   failed: "danger",
 };
 
-function RendersPanel({ comp }: { comp: Composition }) {
+function RendersPanel({ comp, navigate }: { comp: Composition; navigate: (to: string) => void }) {
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [rendering, setRendering] = useState(false);
   const [err, setErr] = useState("");
+  const [cutting, setCutting] = useState<number | null>(null);
+
+  /** Start a cut with this render at the head of the main track: the title
+   *  card first, then you add the footage after it. This is the seam between
+   *  the two halves of the app — the composition becomes a clip. */
+  async function useInEdit(job: RenderJob) {
+    if (!job.asset_id) return;
+    setCutting(job.id);
+    setErr("");
+    try {
+      const project = await api.send<{ id: string }>("POST", "/api/projects", {
+        name: `${comp.name} launch`,
+        edl: {
+          version: 1,
+          output: { width: 1280, height: 720, fps: 30, background: "#000000" },
+          main: { elements: [{ id: `c${job.id}`, type: "video", src: `asset:${job.asset_id}` }] },
+          overlays: [],
+          audio: [],
+        },
+      });
+      navigate(`/edits/${project.id}`);
+    } catch (e) {
+      setErr(String((e as Error).message || e));
+    } finally {
+      setCutting(null);
+    }
+  }
 
   async function load() {
     const all = await api.get<RenderJob[]>("/api/renders");
@@ -1202,6 +1233,21 @@ function RendersPanel({ comp }: { comp: Composition }) {
               <span>
                 #{j.id} · {new Date(j.created_at + "Z").toLocaleString()}
               </span>
+              {j.status === "completed" && j.asset_id && (
+                <button
+                  onClick={() => useInEdit(j)}
+                  disabled={cutting === j.id}
+                  className={`${btnSecondary} ml-auto`}
+                  title="Start a cut with this clip at the front"
+                >
+                  {cutting === j.id ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Scissors className="w-4 h-4" />
+                  )}
+                  Use in an edit
+                </button>
+              )}
             </div>
           </div>
         ))}
@@ -1209,7 +1255,7 @@ function RendersPanel({ comp }: { comp: Composition }) {
           <EmptyState
             icon={<Film className="w-8 h-8" />}
             title="No renders yet"
-            body="Rendering runs the composition on the managed render service and hands back an MP4. It takes about a minute."
+            body="Rendering runs the composition on the managed render service and hands back an MP4. It also lands in your media library, so you can cut it into a footage edit."
           />
         )}
       </div>
