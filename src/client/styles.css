@@ -1,0 +1,133 @@
+@import "tailwindcss";
+
+/* ── Clawnify Apps design tokens (see DESIGN.md) ──────────────────────
+   Raw values in :root, overridden under prefers-color-scheme: dark, then
+   mapped into Tailwind utilities via @theme inline so `bg-surface`,
+   `text-muted`, `bg-primary`, `rounded-md`, … all follow the active mode. */
+:root {
+  --background: #f8f9fa;
+  --surface: #ffffff;
+  --surface-sunken: #f1f5f9;
+  --foreground: #1a202c;
+  --muted: #475569;
+  --faint: #94a3b8;
+  --border: #e2e8f0;
+  --ring: #2563eb;
+  --link: #2563eb;
+  --primary: #dd5164;
+  --primary-hover: #c53a4e;
+  --on-primary: #ffffff;
+  --success: #047857;
+  --success-tint: #ecfdf5;
+  --warning: #b45309;
+  --warning-tint: #fffbeb;
+  --danger: #b91c1c;
+  --danger-hover: #991b1b;
+  --danger-tint: #fef2f2;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0d1117;
+    --surface: #161b22;
+    --surface-sunken: #1c2128;
+    --foreground: #e6edf3;
+    --muted: #9ba7b3;
+    --faint: #6e7681;
+    --border: #30363d;
+    --ring: #4493f8;
+    --link: #4493f8;
+    --primary: #dd5164;
+    --primary-hover: #c53a4e;
+    --on-primary: #ffffff;
+    --success: #3fb950;
+    --success-tint: #12261e;
+    --warning: #d29922;
+    --warning-tint: #2a2210;
+    --danger: #f85149;
+    --danger-hover: #ff6a60;
+    --danger-tint: #2d1518;
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-sunken: var(--surface-sunken);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --color-link: var(--link);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-on-primary: var(--on-primary);
+  --color-success: var(--success);
+  --color-success-tint: var(--success-tint);
+  --color-warning: var(--warning);
+  --color-warning-tint: var(--warning-tint);
+  --color-danger: var(--danger);
+  --color-danger-hover: var(--danger-hover);
+  --color-danger-tint: var(--danger-tint);
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+html,
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+body {
+  font-family: var(--font-sans);
+}
+
+/* Agent mode (data-agent on <html>): enlarge interactive targets so an agent
+   driving the browser can click reliably. */
+:root[data-agent] button,
+:root[data-agent] a[role="button"],
+:root[data-agent] input,
+:root[data-agent] select {
+  min-height: 40px;
+}
+
+/* Signature eyebrow: 11px uppercase tracked muted zone label. */
+.eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Resizable panel dividers (react-resizable-panels).
+   background-clip:content-box paints only the 1px line; the padding is a
+   transparent grab zone straddling it. */
+.ove-sep-x,
+.ove-sep-y {
+  background-color: var(--border);
+  background-clip: content-box;
+  transition: background-color 120ms ease;
+}
+.ove-sep-x:hover,
+.ove-sep-y:hover {
+  background-color: var(--faint);
+}
+.ove-sep-x {
+  /* vertical divider — drag horizontally */
+  width: 1px;
+  padding-inline: 2px;
+  cursor: col-resize;
+}
+.ove-sep-y {
+  /* horizontal divider — drag vertically */
+  height: 1px;
+  padding-block: 2px;
+  cursor: row-resize;
+}

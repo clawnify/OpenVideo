@@ -4,31 +4,35 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler d1 execute open-video-db --local --file=src/server/schema.sql && concurrently -n studio,api -c cyan,green \"npx remotion studio --port 5173\" \"wrangler dev --port 8787\"",
-    "build": "npx remotion bundle --out-dir dist",
-    "render": "npx remotion render",
-    "dev:api": "wrangler dev --port 8787",
-    "dev:studio": "npx remotion studio"
+    "dev": "wrangler d1 execute open-video-db --local --file=src/server/schema.sql && concurrently -n ui,api -c cyan,green \"vite\" \"wrangler dev --port 8787\"",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "deploy": "clawnify deploy"
   },
   "dependencies": {
-    "@clawnify/app": "^0.1.0",
-    "@clawnify/db": "^0.4.1",
-    "@cloudflare/puppeteer": "^1.1.0",
-    "@hono/zod-openapi": "^0.18.0",
-    "@remotion/cli": "4.0.448",
-    "@remotion/player": "4.0.448",
-    "@remotion/zod-types": "4.0.448",
+    "@clawnify/db": "^0.2.0",
     "hono": "^4.6.0",
+    "lucide-react": "^0.400.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "remotion": "4.0.448",
-    "zod": "^4.3.6"
+    "react-resizable-panels": "^4.12.1",
+    "tailwindcss": "^4.2.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260613.1",
+    "@tailwindcss/vite": "^4.2.0",
     "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "clawnify": "^0.1.12",
     "concurrently": "^9.0.0",
     "typescript": "^5.7.0",
+    "vite": "^6.0.0",
     "wrangler": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
