@@ -1,52 +1,103 @@
 @import "tailwindcss";
 
-/* ── Clawnify Apps design tokens (see DESIGN.md) ──────────────────────
-   Raw values in :root, overridden under prefers-color-scheme: dark, then
-   mapped into Tailwind utilities via @theme inline so `bg-surface`,
-   `text-muted`, `bg-primary`, `rounded-md`, … all follow the active mode. */
+/* ── Clawnify Apps design tokens ──────────────────────────────────────
+   Generated values, not picked: every colour is oklch(L, C% of the sRGB
+   gamut maximum at that L and hue, H), from scripts/apps-design-palette.py
+   in the platform repo. Raw values live in :root, are overridden under
+   prefers-color-scheme: dark, and are mapped into Tailwind utilities via
+   @theme inline so `bg-surface`, `text-muted`, `rounded-md` … all follow
+   the active mode.
+
+   Never nest @theme inside @media: Tailwind hoists and merges every @theme
+   block and drops the condition, so the dark values would win for everyone. */
 :root {
-  --background: #f8f9fa;
+  /* Surfaces — warm neutral (hue 85), never blue-gray. */
+  --background: #ffffff;
   --surface: #ffffff;
-  --surface-sunken: #f1f5f9;
-  --foreground: #1a202c;
-  --muted: #475569;
-  --faint: #94a3b8;
-  --border: #e2e8f0;
-  --ring: #2563eb;
-  --link: #2563eb;
-  --primary: #dd5164;
-  --primary-hover: #c53a4e;
+  --surface-sunken: #f7f7f5;
+  /* Text */
+  --foreground: #1b1a19;
+  --muted: #646360;
+  --faint: #9a9893;
+  /* Lines */
+  --border: #e5e3de;
+  --ring: #df3656; /* focus ring = accent solid */
+  --link: #1b1a19; /* inline links are ink; the underline is the affordance */
+  /* Action — the one solid button per screen is ink, not the accent. */
+  --primary: #1b1a19;
+  --primary-hover: #333130;
   --on-primary: #ffffff;
-  --success: #047857;
-  --success-tint: #ecfdf5;
-  --warning: #b45309;
-  --warning-tint: #fffbeb;
-  --danger: #b91c1c;
-  --danger-hover: #991b1b;
-  --danger-tint: #fef2f2;
+  /* Accent — identity only: the app icon, count badges, the focus ring. */
+  --accent: #df3656;
+  --accent-hover: #bd2c47;
+  --accent-tint: #f9eded;
+  --accent-text: #892f3b;
+  --on-accent: #ffffff;
+  /* Status — hue only differs; L and C% are shared across the four. */
+  --info: #173ec4;
+  --info-tint: #ecf0f9;
+  --info-solid: #4977ed;
+  --success: #2b5f3c;
+  --success-tint: #dbf9e2;
+  --success-solid: #319656;
+  --warning: #664e27;
+  --warning-tint: #f9efdf;
+  --warning-solid: #a3772b;
+  --danger: #8a2f2d;
+  --danger-tint: #f9edec;
+  --danger-solid: #e1363a;
+  /* Track categories — one hue per element kind, shared by BOTH timelines
+     (the composition timeline and the footage timeline) so a video clip is
+     the same colour wherever it appears. Category families 0/7/1/4. */
+  --track-video: #4977ed;
+  --track-video-tint: #ecf0f9;
+  --track-image: #319562;
+  --track-image-tint: #daf9e5;
+  --track-text: #9952ed;
+  --track-text-tint: #f2eef9;
+  --track-audio: #c0632a;
+  --track-audio-tint: #f9ede8;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0d1117;
-    --surface: #161b22;
-    --surface-sunken: #1c2128;
-    --foreground: #e6edf3;
-    --muted: #9ba7b3;
-    --faint: #6e7681;
-    --border: #30363d;
-    --ring: #4493f8;
-    --link: #4493f8;
-    --primary: #dd5164;
-    --primary-hover: #c53a4e;
-    --on-primary: #ffffff;
-    --success: #3fb950;
-    --success-tint: #12261e;
-    --warning: #d29922;
-    --warning-tint: #2a2210;
-    --danger: #f85149;
-    --danger-hover: #ff6a60;
-    --danger-tint: #2d1518;
+    --background: #100f0e;
+    --surface: #161615;
+    --surface-sunken: #222120;
+    --foreground: #efeeed;
+    --muted: #c0bdb9;
+    --faint: #82807c;
+    --border: #2e2e2c;
+    --ring: #e4415d;
+    --link: #efeeed;
+    --primary: #efeeed; /* the ink button inverts to a light one */
+    --primary-hover: #d6d4d1;
+    --on-primary: #100f0e;
+    --accent: #e4415d;
+    --accent-hover: #ef7d87;
+    --accent-tint: #3b1c1e;
+    --accent-text: #e6b6b8;
+    --on-accent: #ffffff;
+    --info: #b5c4e5;
+    --info-tint: #12234f;
+    --info-solid: #5580e8;
+    --success: #86da9e;
+    --success-tint: #1a2b1f;
+    --success-solid: #3c9c5d;
+    --warning: #e5bd7e;
+    --warning-tint: #2d2518;
+    --warning-solid: #a87e35;
+    --danger: #e6b7b2;
+    --danger-tint: #3b1c1a;
+    --danger-solid: #e64243;
+    --track-video: #5580e8;
+    --track-video-tint: #12234f;
+    --track-image: #3c9b69;
+    --track-image-tint: #1a2b21;
+    --track-text: #9c61e8;
+    --track-text-tint: #2c1e41;
+    --track-audio: #c56a35;
+    --track-audio-tint: #342218;
   }
 }
 
@@ -63,21 +114,114 @@
   --color-primary: var(--primary);
   --color-primary-hover: var(--primary-hover);
   --color-on-primary: var(--on-primary);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-tint: var(--accent-tint);
+  --color-accent-text: var(--accent-text);
+  --color-on-accent: var(--on-accent);
+  --color-info: var(--info);
+  --color-info-tint: var(--info-tint);
+  --color-info-solid: var(--info-solid);
   --color-success: var(--success);
   --color-success-tint: var(--success-tint);
+  --color-success-solid: var(--success-solid);
   --color-warning: var(--warning);
   --color-warning-tint: var(--warning-tint);
+  --color-warning-solid: var(--warning-solid);
   --color-danger: var(--danger);
-  --color-danger-hover: var(--danger-hover);
   --color-danger-tint: var(--danger-tint);
+  --color-danger-solid: var(--danger-solid);
+  --color-track-video: var(--track-video);
+  --color-track-video-tint: var(--track-video-tint);
+  --color-track-image: var(--track-image);
+  --color-track-image-tint: var(--track-image-tint);
+  --color-track-text: var(--track-text);
+  --color-track-text-tint: var(--track-text-tint);
+  --color-track-audio: var(--track-audio);
+  --color-track-audio-tint: var(--track-audio-tint);
 
-  --radius-sm: 6px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
+  /* Corners: 8px controls, 12px cards and popovers, 16px modals, 24px hero.
+     A component names the class, never a px value. */
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.5rem;
+
+  /* Type scale. Sizes in rem so they respect browser zoom. */
+  --text-display: 2rem;
+  --text-display--line-height: 1.2;
+  --text-display--font-weight: 600;
+  --text-display--letter-spacing: -0.02em;
+  --text-heading-1: 1.375rem;
+  --text-heading-1--line-height: 1.25;
+  --text-heading-1--font-weight: 600;
+  --text-heading-1--letter-spacing: -0.01em;
+  --text-heading-2: 1.0625rem;
+  --text-heading-2--line-height: 1.3;
+  --text-heading-2--font-weight: 600;
+  --text-heading-3: 0.9375rem;
+  --text-heading-3--line-height: 1.4;
+  --text-heading-3--font-weight: 600;
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.5;
+  --text-body-sm: 0.875rem;
+  --text-body-sm--line-height: 1.45;
+  --text-data: 0.875rem;
+  --text-data--line-height: 1.45;
+  --text-data--font-weight: 500;
+  --text-data-lg: 2rem;
+  --text-data-lg--line-height: 1.1;
+  --text-data-lg--font-weight: 600;
+  --text-data-lg--letter-spacing: -0.02em;
+  --text-micro: 0.6875rem;
+  --text-micro--line-height: 1;
+  --text-micro--font-weight: 600;
+  --text-micro--letter-spacing: 0.06em;
+  --text-label: 0.8125rem;
+  --text-label--line-height: 1.2;
+  --text-label--font-weight: 500;
+  --text-button: 0.9375rem;
+  --text-button--line-height: 1;
+  --text-button--font-weight: 500;
+  --text-fine: 0.75rem;
+  --text-fine--line-height: 1.4;
 
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
+/* Elevation: three recipes, and the difference between resting and floating
+   is WHICH recipe, not shadow-versus-border. The edge is always a shadow —
+   an inset ring costs no layout and keeps the radius exact. */
+@utility shadow-edge {
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+@utility shadow-raised {
+  box-shadow:
+    0 0 2px rgb(28 40 64 / 0.18),
+    0 1px 3px rgb(0 0 0 / 0.04);
+}
+@utility shadow-float {
+  box-shadow:
+    0 0 0 1px rgb(28 40 64 / 0.04),
+    0 4px 8px -4px rgb(28 40 64 / 0.12),
+    0 4px 12px -2px rgb(24 41 75 / 0.16);
+}
+
+/* In dark mode the drops disappear and the ring is the whole treatment; the
+   background → surface → surface-sunken ladder carries the rest. */
+@media (prefers-color-scheme: dark) {
+  .shadow-raised,
+  .shadow-float {
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+}
+
+html,
+body,
+#app {
+  height: 100dvh; /* never 100vh: mobile browser chrome makes it lie */
+}
 html,
 body {
   background: var(--background);
@@ -85,25 +229,51 @@ body {
 }
 body {
   font-family: var(--font-sans);
+  font-size: var(--text-body);
+  line-height: 1.5;
+  margin: 0;
 }
 
-/* Agent mode (data-agent on <html>): enlarge interactive targets so an agent
-   driving the browser can click reliably. */
+/* Numbers stack: tabular figures wherever digits are compared or totalled. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Motion is quick and functional: 0.15s on background, colour and shadow.
+   No scale, no spring, no glow. */
+@media (prefers-reduced-motion: no-preference) {
+  button,
+  a,
+  input,
+  select,
+  textarea {
+    transition:
+      background-color 0.15s ease,
+      color 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+}
+
+/* Agent dual-mode (data-agent on <html>): interactive targets grow to 44px so
+   an agent driving the browser clicks reliably, and hover-only affordances
+   become always-visible. */
 :root[data-agent] button,
 :root[data-agent] a[role="button"],
 :root[data-agent] input,
 :root[data-agent] select {
-  min-height: 40px;
+  min-height: 2.75rem;
+}
+:root[data-agent] [data-hover-only] {
+  opacity: 1 !important;
 }
 
-/* Signature eyebrow: 11px uppercase tracked muted zone label. */
-.eyebrow {
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
+/* iOS zooms any input under 16px on focus; hold the floor on phones. */
+@media (max-width: 767px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
 }
 
 /* Resizable panel dividers (react-resizable-panels).
@@ -130,4 +300,44 @@ body {
   height: 1px;
   padding-block: 2px;
   cursor: row-resize;
+}
+
+/* The primary button carries its own edge (a hairline plus a short drop) on
+   top of the ink fill — component-level, not a fourth elevation level. */
+@utility shadow-button {
+  box-shadow:
+    inset 0 0 0 1px rgb(0 0 0 / 0.06),
+    0 2px 4px -2px rgb(20 20 20 / 0.12);
+}
+
+/* Inputs: an INSET ring, so focus never shifts layout by a pixel. Written as
+   a plain class because the focus recipe composes a ring and a halo in one
+   property, which a utility cannot express. */
+.field {
+  width: 100%;
+  height: 2rem;
+  padding-inline: 0.75rem;
+  background-color: var(--surface);
+  color: var(--foreground);
+  font-size: var(--text-body);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 0 0 0 1px var(--border);
+  outline: none;
+}
+textarea.field,
+select.field[multiple] {
+  height: auto;
+  padding-block: 0.5rem;
+  line-height: 1.5;
+}
+.field::placeholder {
+  color: var(--faint);
+}
+.field:focus {
+  box-shadow:
+    inset 0 0 0 1px var(--ring),
+    0 0 0 3px var(--accent-tint);
+}
+.field:disabled {
+  color: var(--faint);
 }

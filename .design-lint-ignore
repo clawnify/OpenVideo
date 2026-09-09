@@ -1,0 +1,5 @@
+# Video DOCUMENT content, not app chrome. The colours and sizes in here are
+# pixels inside the user's composition, so they are literal by definition and
+# the app's design tokens do not apply — the same exemption DESIGN.md gives a
+# faithful rendering of someone else's UI.
+src/client/starter.ts

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { EditProjectsSection, EditRoute } from "./edit";
+import { STARTER_HTML } from "./starter";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
 import {
   ArrowLeft,
@@ -19,6 +20,19 @@ import {
   AlertCircle,
   X,
 } from "lucide-react";
+import {
+  Badge,
+  ConfirmDialog,
+  EmptyState,
+  btnDanger,
+  btnGhost,
+  btnIcon,
+  btnPrimary,
+  btnSecondary,
+  card,
+  chip,
+  stretch,
+} from "./ui";
 
 // ── types ────────────────────────────────────────────────────────────
 
@@ -74,35 +88,6 @@ const api = {
 
 // ── app ──────────────────────────────────────────────────────────────
 
-// Starter composition for "New" — three clips on three separate tracks with a
-// staggered GSAP timeline, so the timeline view shows real track registration.
-// Lives here as a string (not a DB seed) so it goes in via the normal
-// parameterized insert.
-const STARTER_HTML = `<div id="root" data-composition-id="untitled" data-start="0" data-width="1920" data-height="1080"
-     style="width:1920px;height:1080px;background:#0b1020;position:relative;overflow:hidden;font-family:Inter,system-ui,sans-serif">
-  <div id="kicker" class="clip" data-start="0" data-duration="5" data-track-index="2"
-       style="position:absolute;top:34%;left:50%;transform:translate(-50%,-50%);color:#7c8cff;font-size:28px;font-weight:700;letter-spacing:4px;text-transform:uppercase;white-space:nowrap">
-    Product Launch
-  </div>
-  <div id="title" class="clip" data-start="0.3" data-duration="4.7" data-track-index="1"
-       style="position:absolute;top:48%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:96px;font-weight:800;letter-spacing:-2px;text-align:center;white-space:nowrap">
-    Your Title Here
-  </div>
-  <div id="sub" class="clip" data-start="0.9" data-duration="4.1" data-track-index="0"
-       style="position:absolute;top:60%;left:50%;transform:translate(-50%,-50%);color:#9aa6d6;font-size:34px;font-weight:500;text-align:center;white-space:nowrap">
-    A subtitle that fades in
-  </div>
-  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
-  <script>
-    const tl = gsap.timeline({ paused: true });
-    tl.from("#kicker", { opacity: 0, y: -20, duration: 0.6 }, 0)
-      .from("#title", { opacity: 0, y: 50, duration: 1 }, 0.3)
-      .from("#sub", { opacity: 0, y: 30, duration: 0.8 }, 0.9);
-    window.__timelines = window.__timelines || {};
-    window.__timelines["untitled"] = tl;
-  </script>
-</div>`;
-
 type Tab = "compose" | "timeline" | "media" | "renders";
 
 // Minimal history-based router: `/` = gallery, `/<id>` = editor for that id.
@@ -128,20 +113,20 @@ export function App() {
   const editId = id.startsWith("edits/") ? id.slice(6) : id === "edits" ? "" : null;
 
   return (
-    <div className="h-screen flex flex-col text-foreground">
+    <div className="h-dvh flex flex-col text-foreground">
+      {/* Brand row: the app icon is the identity object, and the accent hue
+          lives here (plus count badges and the focus ring) and nowhere else. */}
       <header className="flex items-center gap-2 px-5 h-14 border-b border-border bg-surface shrink-0">
-        {id ? (
-          <button
-            onClick={() => navigate("/")}
-            className="flex items-center gap-1.5 -ml-1 px-2 py-1 rounded-sm text-sm text-muted hover:bg-surface-sunken"
-          >
+        {id && (
+          <button onClick={() => navigate("/")} className={`${btnGhost} -ml-2`}>
             <ArrowLeft className="w-4 h-4" /> Videos
           </button>
-        ) : (
-          <Film className="w-5 h-5 text-primary" />
         )}
-        <span className="font-semibold">OpenVideo</span>
-        <span className="text-faint text-sm ml-1">edit & render video</span>
+        <span className="grid place-items-center w-7 h-7 rounded-sm bg-accent text-on-accent shrink-0">
+          <Film className="w-4 h-4" />
+        </span>
+        <span className="text-heading-3">OpenVideo</span>
+        <span className="text-fine text-faint hidden sm:inline">edit &amp; render video</span>
       </header>
 
       {editId ? (
@@ -189,32 +174,51 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
   return (
     <main className="flex-1 overflow-y-auto">
       <div className="max-w-6xl mx-auto px-6 py-8">
-        <div className="flex items-center justify-between mb-6">
-          <h1 className="text-lg font-semibold">Your videos</h1>
-          <button
-            onClick={newVideo}
-            disabled={creating}
-            className="flex items-center gap-2 px-3 py-2 text-sm rounded-sm bg-primary text-on-primary hover:bg-primary-hover disabled:opacity-50"
-          >
+        {/* Toolbar grammar: identity left, the one solid action right. */}
+        <div className="flex items-center justify-between gap-4 mb-6">
+          <h1 className="text-heading-1">
+            Your videos
+            {comps && comps.length > 0 && (
+              <span className="ml-2 text-data text-muted tabular-nums">{comps.length}</span>
+            )}
+          </h1>
+          <button onClick={newVideo} disabled={creating} className={btnPrimary}>
             {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
             New video
           </button>
         </div>
 
         {comps === null ? (
-          <div className="grid place-items-center py-24 text-faint text-sm">Loading…</div>
-        ) : comps.length === 0 ? (
-          <div className="grid place-items-center gap-3 py-24 text-center text-muted">
-            <Video className="w-8 h-8 text-faint" />
-            <div className="text-sm">No videos yet — create your first one.</div>
+          /* Loading is the shape of the answer, never a spinner. */
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className={`${card} overflow-hidden`}>
+                <div className="aspect-video bg-surface-sunken animate-pulse" />
+                <div className="px-4 py-3 space-y-2">
+                  <div className="h-3 w-1/2 rounded-full bg-surface-sunken animate-pulse" />
+                  <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+                </div>
+              </div>
+            ))}
           </div>
+        ) : comps.length === 0 ? (
+          <EmptyState
+            icon={<Video className="w-8 h-8" />}
+            title="No videos yet"
+            body="A video is motion graphics you author as HTML on a timeline — a title card, a lower third, an intro. Start from a template and edit it live."
+            action={
+              <button onClick={newVideo} disabled={creating} className={btnPrimary}>
+                <Plus className="w-4 h-4" /> New video
+              </button>
+            }
+          />
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {comps.map((c) => (
               <button
                 key={c.id}
                 onClick={() => navigate(`/${c.id}`)}
-                className="group text-left rounded-md border border-border bg-surface overflow-hidden hover:border-faint hover:shadow-sm transition"
+                className={`${card} group text-left overflow-hidden hover:bg-surface-sunken`}
               >
                 <div className="aspect-video bg-black overflow-hidden">
                   <iframe
@@ -226,8 +230,8 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
                   />
                 </div>
                 <div className="px-4 py-3">
-                  <div className="truncate font-medium text-sm">{c.name}</div>
-                  <div className="text-xs text-faint mt-0.5">Edited {fmtDate(c.updated_at)}</div>
+                  <div className="truncate text-body-sm font-medium">{c.name}</div>
+                  <div className="text-fine text-faint mt-0.5">Edited {fmtDate(c.updated_at)}</div>
                 </div>
               </button>
             ))}
@@ -259,15 +263,21 @@ function EditorRoute({ id, navigate }: { id: string; navigate: (to: string) => v
   }, [id]);
 
   if (comp === undefined) {
-    return <div className="flex-1 grid place-items-center text-faint text-sm">Loading…</div>;
+    return <div className="flex-1 grid place-items-center text-body-sm text-faint">Loading…</div>;
   }
   if (comp === null) {
     return (
-      <div className="flex-1 grid place-items-center content-center gap-3 text-center text-muted">
-        <div className="text-sm">That video doesn’t exist.</div>
-        <button onClick={() => navigate("/")} className="text-sm text-link hover:underline">
-          Back to your videos
-        </button>
+      <div className="flex-1 grid place-items-center">
+        <EmptyState
+          icon={<AlertCircle className="w-8 h-8" />}
+          title="That video doesn’t exist"
+          body="It may have been deleted, or the link is wrong."
+          action={
+            <button onClick={() => navigate("/")} className={btnSecondary}>
+              <ArrowLeft className="w-4 h-4" /> Back to your videos
+            </button>
+          }
+        />
       </div>
     );
   }
@@ -300,6 +310,7 @@ function Editor({
     onlySaveAfterUserInteractions: true,
   });
   const [saving, setSaving] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   // Selected clip (by index) for the right-side inspector.
   const [selectedClip, setSelectedClip] = useState<number | null>(null);
@@ -406,13 +417,20 @@ function Editor({
   }
 
   async function remove() {
-    if (!confirm(`Delete "${comp.name}"?`)) return;
     await api.send("DELETE", `/api/compositions/${comp.id}`);
     navigate("/");
   }
 
   return (
     <main className="flex-1 min-h-0 min-w-0 bg-background">
+      {confirmDelete && (
+        <ConfirmDialog
+          title={`Delete “${comp.name}”?`}
+          body="The composition and its render history go with it. This cannot be undone."
+          onConfirm={remove}
+          onClose={() => setConfirmDelete(false)}
+        />
+      )}
       <Group
         orientation="vertical"
         defaultLayout={vLayout.defaultLayout}
@@ -428,7 +446,7 @@ function Editor({
             <Panel id="preview" defaultSize="74%" minSize="45%" className="min-w-0 p-5">
               {/* Preview stage: the harness scales + centers the composition,
                   letterboxing it inside this black stage (any panel shape). */}
-              <div className="h-full w-full min-h-0 min-w-0 bg-black rounded-md overflow-hidden border border-border">
+              <div className="h-full w-full min-h-0 min-w-0 bg-black rounded-md overflow-hidden shadow-edge">
                 <iframe
                   ref={iframeRef}
                   key={previewKey}
@@ -451,9 +469,9 @@ function Editor({
                 />
               ) : (
                 <div className="px-4 py-4">
-                  <div className="eyebrow mb-2">Inspector</div>
-                  <p className="text-sm text-muted">
-                    Select a clip — in the timeline or the video — to edit it.
+                  <div className="text-label text-muted mb-1">Inspector</div>
+                  <p className="text-body-sm text-muted">
+                    Select a clip, in the timeline or in the video, to edit it.
                   </p>
                 </div>
               )}
@@ -465,19 +483,22 @@ function Editor({
 
         {/* timeline + options */}
         <Panel id="dock" defaultSize="32%" minSize="16%" maxSize="60%" className="flex flex-col bg-background min-h-0">
-          {/* tabs */}
-          <div className="flex items-center gap-1 px-5 pt-3 shrink-0">
-            {(["timeline", "compose", "media", "renders"] as Tab[]).map((t) => (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                className={`px-3 py-1.5 text-sm rounded-sm capitalize ${
-                  tab === t ? "bg-surface border border-border font-medium" : "text-muted hover:text-foreground"
-                }`}
-              >
-                {t}
-              </button>
-            ))}
+          {/* view switcher: a segmented track, active segment raised white */}
+          <div className="px-5 pt-3 shrink-0">
+            <div className="inline-flex items-center gap-0.5 rounded-full bg-surface-sunken p-0.5">
+              {(["timeline", "compose", "media", "renders"] as Tab[]).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  aria-pressed={tab === t}
+                  className={`h-7 px-3 text-button capitalize rounded-sm ${
+                    tab === t ? "bg-surface text-foreground shadow-raised" : "text-muted hover:text-foreground"
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
           </div>
 
           <div className="flex-1 overflow-y-auto p-5 pt-3 min-h-0">
@@ -487,15 +508,16 @@ function Editor({
               <input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                className="flex-1 px-3 py-2 text-sm rounded-sm border border-border bg-surface"
+                className="field flex-1"
                 placeholder="Composition name"
+                aria-label="Composition name"
               />
-              <label className="flex items-center gap-2 text-sm text-muted">
+              <label className="flex items-center gap-2 text-label text-muted">
                 fps
                 <select
                   value={fps}
                   onChange={(e) => setFps(Number(e.target.value))}
-                  className="px-2 py-2 rounded-sm border border-border bg-surface"
+                  className="field w-auto"
                 >
                   <option value={24}>24</option>
                   <option value={30}>30</option>
@@ -507,21 +529,15 @@ function Editor({
               value={html}
               onChange={(e) => setHtml(e.target.value)}
               spellCheck={false}
-              className="w-full h-[40vh] px-3 py-2 font-mono text-xs rounded-sm border border-border bg-surface"
+              aria-label="Composition HTML"
+              className="field h-[40vh] font-mono text-fine"
             />
             <div className="flex items-center gap-2">
-              <button
-                onClick={save}
-                disabled={saving}
-                className="px-4 py-2 text-sm rounded-sm bg-primary text-on-primary hover:bg-primary-hover disabled:opacity-50"
-              >
+              <button onClick={save} disabled={saving} className={btnPrimary}>
                 {saving ? "Saving…" : "Save & preview"}
               </button>
-              <button
-                onClick={remove}
-                className="px-3 py-2 text-sm rounded-sm text-muted hover:text-danger"
-              >
-                Delete
+              <button onClick={() => setConfirmDelete(true)} className={btnDanger}>
+                <Trash2 className="w-4 h-4" /> Delete
               </button>
             </div>
           </div>
@@ -627,20 +643,24 @@ function applyClipPatch(html: string, index: number, patch: ClipPatch): string {
   }
 }
 
-// Clip type colours are *data* colours (sanctioned chroma). Text is the base
-// layer, so it stays neutral slate; saturated hues are reserved for media.
-const CLIP_BAR: Record<ClipType, string> = {
-  video: "bg-blue-500",
-  image: "bg-emerald-500",
-  text: "bg-slate-500",
-  audio: "bg-amber-500",
+// Category, not decoration: one hue per element kind, from the generated
+// category palette, and the SAME four the footage timeline uses, so a video
+// clip is the same colour wherever it appears in the app.
+//
+// A clip is a TINT fill with same-hue text and a solid bar at its left edge,
+// not a solid block: a timeline is mostly one kind of clip, and a wall of the
+// solid role reads as a paint chart rather than a classification.
+export const CLIP_BAR: Record<ClipType, string> = {
+  video: "bg-track-video",
+  image: "bg-track-image",
+  text: "bg-track-text",
+  audio: "bg-track-audio",
 };
-// Selection ring matches the clip's own colour (offset gives a white gap so it reads).
-const CLIP_RING: Record<ClipType, string> = {
-  video: "ring-blue-600",
-  image: "ring-emerald-600",
-  text: "ring-slate-600",
-  audio: "ring-amber-600",
+const CLIP_FILL: Record<ClipType, string> = {
+  video: "bg-track-video-tint text-track-video",
+  image: "bg-track-image-tint text-track-image",
+  text: "bg-track-text-tint text-track-text",
+  audio: "bg-track-audio-tint text-track-audio",
 };
 function clipIcon(type: ClipType) {
   const c = "w-3.5 h-3.5 shrink-0";
@@ -705,12 +725,13 @@ function Timeline({
   }
 
   return (
-    <div className="rounded-md border border-border bg-surface text-foreground overflow-hidden select-none">
-      {/* controls bar */}
-      <div className="flex items-center justify-center px-3 h-9 border-b border-border">
+    <div className={`${card} text-foreground overflow-hidden select-none`}>
+      {/* transport */}
+      <div className="flex items-center gap-2 px-3 h-9 border-b border-border">
         <button
           onClick={onTogglePlay}
-          className="grid place-items-center w-7 h-7 rounded-md bg-surface-sunken hover:bg-surface-sunken text-foreground"
+          className={btnIcon}
+          aria-label={playing ? "Pause" : "Play"}
           title={playing ? "Pause" : "Play"}
         >
           {playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
@@ -720,13 +741,13 @@ function Timeline({
       <div className="flex">
         <div className="shrink-0 border-r border-border w-28">
           {/* current-time readout in the corner (Remotion-style) */}
-          <div className="h-7 flex items-center px-3 border-b border-border font-semibold tabular-nums text-sm">
+          <div className="h-7 flex items-center px-3 border-b border-border text-data tabular-nums">
             {fmtTC(time, fps)}
           </div>
           {rows.map((tr) => (
             <div
               key={tr}
-              className="h-10 flex items-center px-3 text-xs text-muted border-b border-border"
+              className="h-10 flex items-center px-3 text-fine text-muted border-b border-border"
             >
               Track {tr + 1}
             </div>
@@ -753,12 +774,13 @@ function Timeline({
                       e.stopPropagation(); // select, don't scrub
                       onSelect(c.index);
                     }}
-                    className={`absolute top-1 bottom-1 rounded-md flex items-center gap-1.5 px-2 text-xs text-white overflow-hidden shadow-sm cursor-pointer ${CLIP_BAR[c.type]} ${
-                      c.index === selected ? `ring-2 ring-offset-1 ${CLIP_RING[c.type]}` : ""
+                    className={`absolute top-1 bottom-1 rounded-sm flex items-center gap-1.5 pl-1.5 pr-2 text-fine overflow-hidden cursor-pointer ${CLIP_FILL[c.type]} ${
+                      c.index === selected ? "ring-2 ring-offset-1 ring-ring ring-offset-surface" : ""
                     }`}
                     style={{ left: pct(c.start), width: pct(c.duration) }}
                     title={`${c.label} · ${c.start}s–${c.start + c.duration}s`}
                   >
+                    <span className={`w-0.5 self-stretch my-0.5 rounded-full shrink-0 ${CLIP_BAR[c.type]}`} />
                     {clipIcon(c.type)}
                     <span className="truncate">{c.label}</span>
                   </div>
@@ -773,7 +795,7 @@ function Timeline({
       </div>
 
       {clips.length === 0 && (
-        <div className="px-3 py-3 text-xs text-muted">
+        <div className="px-3 py-3 text-fine text-muted">
           No timed clips yet. Add elements with <code>class="clip"</code> + <code>data-start</code> /{" "}
           <code>data-duration</code> / <code>data-track-index</code> in the Compose tab.
         </div>
@@ -787,13 +809,19 @@ function Timeline({
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block">
-      <span className="block text-xs font-medium text-muted mb-1">{label}</span>
+      <span className="block text-label text-muted mb-1">{label}</span>
       {children}
     </label>
   );
 }
 
-const inputCls = "w-full px-2 py-1.5 text-sm rounded-md border border-border bg-surface";
+/** Section title inside a rail. Sentence case in `label`, never uppercase:
+ *  the 11px tracked style belongs above a KPI number and nowhere else. */
+function Zone({ children }: { children: React.ReactNode }) {
+  return <div className="text-label text-muted">{children}</div>;
+}
+
+const inputCls = "field";
 
 /** Right-side quick editor for the selected clip — fields depend on the clip type. */
 function Inspector({
@@ -812,22 +840,22 @@ function Inspector({
     <div className="overflow-hidden">
       {/* header zone */}
       <div className="flex items-center gap-2.5 px-4 h-12 border-b border-border">
+        {/* Category bar: the cheapest visible classification there is, and it
+            never competes with the text. */}
+        <span className={`w-0.5 h-6 rounded-full shrink-0 ${CLIP_BAR[clip.type]}`} />
         <span className="text-muted">{clipIcon(clip.type)}</span>
         <div className="min-w-0">
-          <div className="eyebrow">Clip</div>
-          <div className="text-sm font-medium truncate leading-tight">{typeLabel}</div>
+          <div className="text-heading-3 truncate">{typeLabel}</div>
         </div>
-        <span className="ml-auto shrink-0 inline-flex items-center rounded-sm border border-border bg-surface-sunken px-2 py-0.5 text-[11px] text-muted tabular-nums">
-          Track {clip.track + 1}
-        </span>
-        <button onClick={onClose} className="shrink-0 text-faint hover:text-foreground" aria-label="Close inspector">
+        <span className={`ml-auto shrink-0 tabular-nums ${chip}`}>Track {clip.track + 1}</span>
+        <button onClick={onClose} className={btnIcon} aria-label="Close inspector">
           <X className="w-4 h-4" />
         </button>
       </div>
 
       {/* content zone */}
       <div className="px-4 py-4 space-y-3 border-b border-border">
-        <div className="eyebrow">Content</div>
+        <Zone>Content</Zone>
         {clip.type === "text" && (
           <>
             <Field label="Text">
@@ -837,7 +865,8 @@ function Inspector({
               <div className="flex items-center gap-2">
                 <input
                   type="color"
-                  className="w-8 h-8 rounded-sm border border-border bg-surface p-0.5"
+                  aria-label="Text colour"
+                  className="field w-8 shrink-0 p-1"
                   value={toHex(clip.color)}
                   onChange={(e) => onChange({ color: e.target.value })}
                 />
@@ -874,7 +903,7 @@ function Inspector({
 
       {/* timing zone */}
       <div className="px-4 py-4 space-y-3">
-        <div className="eyebrow">Timing</div>
+        <Zone>Timing</Zone>
         <div className="grid grid-cols-3 gap-2">
           <Field label="Start (s)">
             <input
@@ -926,6 +955,7 @@ function MediaPanel() {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [copied, setCopied] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [confirmDel, setConfirmDel] = useState<Asset | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function load() {
@@ -972,7 +1002,7 @@ function MediaPanel() {
           e.preventDefault();
           upload(e.dataTransfer.files);
         }}
-        className="flex flex-col items-center gap-2 py-8 rounded-md border-2 border-dashed border-border bg-surface text-muted text-sm cursor-pointer hover:border-faint"
+        className="flex flex-col items-center gap-2 py-8 rounded-md border-2 border-dashed border-border bg-surface text-muted text-body-sm cursor-pointer hover:border-faint"
       >
         {uploading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Upload className="w-5 h-5" />}
         Drop a logo or product demo here, or click to upload
@@ -985,15 +1015,15 @@ function MediaPanel() {
         />
       </div>
 
-      <p className="text-xs text-muted">
+      <p className="text-fine text-muted">
         Reference media in your composition HTML by its path, e.g.{" "}
-        <code className="px-1 py-0.5 bg-surface-sunken rounded">&lt;img src="assets/logo.png"&gt;</code>. Only
+        <code className="px-1 py-0.5 bg-surface-sunken rounded-xs">&lt;img src="assets/logo.png"&gt;</code>. Only
         referenced assets are shipped to the renderer.
       </p>
 
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
         {assets.map((a) => (
-          <div key={a.id} className="rounded-md border border-border bg-surface overflow-hidden">
+          <div key={a.id} className={`${card} overflow-hidden`}>
             <div className="aspect-video bg-surface-sunken grid place-items-center overflow-hidden">
               {isImg(a.content_type) ? (
                 <img src={`/api/uploads/${a.key}`} alt={a.name} className="w-full h-full object-contain" />
@@ -1004,17 +1034,42 @@ function MediaPanel() {
               )}
             </div>
             <div className="p-2 flex items-center gap-1">
-              <code className="flex-1 text-[11px] truncate text-muted">assets/{a.key}</code>
-              <button onClick={() => copy(a.key)} className="p-1 text-faint hover:text-foreground" title="Copy path">
+              <code className="flex-1 text-fine truncate text-muted">assets/{a.key}</code>
+              <button onClick={() => copy(a.key)} className={btnIcon} aria-label={`Copy path for ${a.name}`} title="Copy path">
                 {copied === a.key ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
               </button>
-              <button onClick={() => del(a.id)} className="p-1 text-faint hover:text-danger" title="Delete">
+              <button
+                onClick={() => setConfirmDel(a)}
+                className={`${btnIcon} hover:text-danger`}
+                aria-label={`Delete ${a.name}`}
+                title="Delete"
+              >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
         ))}
       </div>
+
+      {assets.length === 0 && (
+        <EmptyState
+          icon={<Film className="w-8 h-8" />}
+          title="Nothing in the library yet"
+          body="Upload a logo, a product demo or a still, then reference it from your composition HTML."
+        />
+      )}
+
+      {confirmDel && (
+        <ConfirmDialog
+          title={`Delete “${confirmDel.name}”?`}
+          body="Any composition that references this file will render without it."
+          onConfirm={() => {
+            del(confirmDel.id);
+            setConfirmDel(null);
+          }}
+          onClose={() => setConfirmDel(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1022,24 +1077,16 @@ function MediaPanel() {
 // ── renders ──────────────────────────────────────────────────────────
 
 // Tinted badge = a signal that demands attention (vs a chip, which is a fact).
-function StatusBadge({ status }: { status: RenderJob["status"] }) {
-  const tone: Record<RenderJob["status"], string> = {
-    rendering: "bg-warning-tint text-warning",
-    completed: "bg-success-tint text-success",
-    failed: "bg-danger-tint text-danger",
-  };
-  return (
-    <span
-      className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone[status]}`}
-    >
-      {status}
-    </span>
-  );
-}
+const RENDER_TONE: Record<RenderJob["status"], string> = {
+  rendering: "warning",
+  completed: "success",
+  failed: "danger",
+};
 
 function RendersPanel({ comp }: { comp: Composition }) {
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [rendering, setRendering] = useState(false);
+  const [err, setErr] = useState("");
 
   async function load() {
     const all = await api.get<RenderJob[]>("/api/renders");
@@ -1051,11 +1098,12 @@ function RendersPanel({ comp }: { comp: Composition }) {
 
   async function render() {
     setRendering(true);
+    setErr("");
     try {
       await api.send("POST", "/api/renders", { composition_id: comp.id });
       await load();
     } catch (e) {
-      alert(String(e));
+      setErr(String((e as Error).message || e));
     } finally {
       setRendering(false);
     }
@@ -1063,32 +1111,35 @@ function RendersPanel({ comp }: { comp: Composition }) {
 
   return (
     <div className="max-w-3xl space-y-4">
-      <button
-        onClick={render}
-        disabled={rendering}
-        className="flex items-center gap-2 px-4 py-2 text-sm rounded-sm bg-primary text-on-primary hover:bg-primary-hover disabled:opacity-50"
-      >
+      <button onClick={render} disabled={rendering} className={btnPrimary}>
         {rendering ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
         {rendering ? "Rendering… (this can take a minute)" : "Render MP4"}
       </button>
 
+      {err && (
+        <div className="flex items-start gap-2 rounded-sm bg-danger-tint px-3 py-2 text-body-sm text-danger">
+          <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span className="break-words">{err}</span>
+        </div>
+      )}
+
       <div className="space-y-2">
         {jobs.map((j) => (
-          <div key={j.id} className="rounded-md border border-border bg-surface p-3">
+          <div key={j.id} className={`${card} p-3`}>
             {j.status === "completed" && j.output_url ? (
               <video src={j.output_url} controls className="w-full max-w-md rounded-md bg-black" />
             ) : j.status === "failed" ? (
-              <div className="flex items-start gap-2 text-sm text-danger">
+              <div className="flex items-start gap-2 text-body-sm text-danger">
                 <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
                 <span className="break-words">{j.error || "Render failed"}</span>
               </div>
             ) : (
-              <div className="flex items-center gap-2 text-sm text-muted">
+              <div className="flex items-center gap-2 text-body-sm text-muted">
                 <Loader2 className="w-4 h-4 animate-spin" /> Rendering…
               </div>
             )}
-            <div className="flex items-center gap-2 mt-2 text-[11px] text-faint tabular-nums">
-              <StatusBadge status={j.status} />
+            <div className="flex items-center gap-2 mt-2 text-fine text-faint tabular-nums">
+              <Badge tone={RENDER_TONE[j.status]}>{j.status}</Badge>
               <span>
                 #{j.id} · {new Date(j.created_at + "Z").toLocaleString()}
               </span>
@@ -1096,7 +1147,11 @@ function RendersPanel({ comp }: { comp: Composition }) {
           </div>
         ))}
         {jobs.length === 0 && (
-          <p className="text-sm text-muted">No renders yet — click Render MP4 to create your first.</p>
+          <EmptyState
+            icon={<Film className="w-8 h-8" />}
+            title="No renders yet"
+            body="Rendering runs the composition on the managed render service and hands back an MP4. It takes about a minute."
+          />
         )}
       </div>
     </div>

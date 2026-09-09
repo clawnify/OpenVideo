@@ -29,6 +29,18 @@ import {
   Volume2,
   VolumeX,
 } from "lucide-react";
+import {
+  Dialog,
+  EmptyState,
+  Kbd,
+  btnDanger,
+  btnGhost,
+  btnIcon,
+  btnPrimary,
+  btnSecondary,
+  card,
+  stretch,
+} from "./ui";
 
 // ── shared shapes (validated server-side; these are view types) ─────────────
 
@@ -171,6 +183,12 @@ const api = {
     return r.json();
   },
 };
+
+// Defaults for text the user burns INTO the video. Document content, not app
+// chrome: white on footage and a translucent black box are the legible
+// defaults for a caption, and the design tokens do not apply inside a frame.
+const DEFAULT_TEXT_COLOR = "#ffffff";
+const DEFAULT_TEXT_BOX = "#00000080";
 
 const rid = () => Math.random().toString(36).slice(2, 10);
 const assetUrl = (a: Asset) => `/api/uploads/${encodeURIComponent(a.key)}`;
@@ -354,37 +372,55 @@ export function EditProjectsSection({ navigate }: { navigate: (to: string) => vo
 
   return (
     <section className="mt-10">
-      <div className="flex items-center justify-between mb-3">
+      {/* Card title row: sentence case, a live count, and the add affordance
+          at the right. The page's ONE solid action is "New video" above; this
+          section adds with a secondary. */}
+      <div className="flex items-start justify-between gap-4 mb-3">
         <div>
-          <h2 className="font-semibold text-lg flex items-center gap-2">
-            <Scissors className="w-4 h-4 text-primary" /> Footage edits
+          <h2 className="text-heading-2 flex items-center gap-2">
+            <Scissors className="w-4 h-4 text-muted" /> Footage edits
+            {projects && projects.length > 0 && (
+              <span className="text-data text-muted tabular-nums">{projects.length}</span>
+            )}
           </h2>
-          <p className="text-sm text-muted mt-0.5">Cut and sequence real clips, overlay text, mix music — export to MP4.</p>
+          <p className="text-body-sm text-muted mt-0.5">
+            Cut and sequence real clips, overlay text, mix music, export to MP4.
+          </p>
         </div>
-        <button
-          onClick={create}
-          disabled={busy}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-sm bg-primary text-on-primary text-sm font-medium hover:bg-primary-hover disabled:opacity-60"
-        >
+        <button onClick={create} disabled={busy} className={`${btnSecondary} shrink-0`}>
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} New edit
         </button>
       </div>
       {projects === null ? (
-        <div className="text-faint text-sm py-6">Loading…</div>
-      ) : projects.length === 0 ? (
-        <div className="text-faint text-sm py-6 border border-dashed border-border rounded-md text-center">
-          No edit projects yet.
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className={`${card} p-4 space-y-2`}>
+              <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
+              <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+            </div>
+          ))}
         </div>
+      ) : projects.length === 0 ? (
+        <EmptyState
+          icon={<Scissors className="w-8 h-8" />}
+          title="No edits yet"
+          body="An edit is your own footage cut down: trim the clips, put them in order, drop text over the top and mix music under it."
+          action={
+            <button onClick={create} disabled={busy} className={btnSecondary}>
+              <Plus className="w-4 h-4" /> New edit
+            </button>
+          }
+        />
       ) : (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {projects.map((p) => (
             <button
               key={p.id}
               onClick={() => navigate(`/edits/${p.id}`)}
-              className="text-left p-4 rounded-md border border-border bg-surface hover:border-faint"
+              className={`${card} text-left p-4 hover:bg-surface-sunken`}
             >
-              <div className="font-medium truncate">{p.name}</div>
-              <div className="text-xs text-faint mt-1">{p.updated_at?.slice(0, 10)}</div>
+              <div className="text-body-sm font-medium truncate">{p.name}</div>
+              <div className="text-fine text-faint mt-1">{p.updated_at?.slice(0, 10)}</div>
             </button>
           ))}
         </div>
@@ -394,6 +430,9 @@ export function EditProjectsSection({ navigate }: { navigate: (to: string) => vo
 }
 
 // ── the editor ──────────────────────────────────────────────────────────────
+
+/** Which pane is on screen below the lg breakpoint (desktop shows all three). */
+type Pane = "library" | "canvas" | "inspector";
 
 type Sel =
   | { area: "main"; i: number }
@@ -417,8 +456,17 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
 
   if (err)
     return (
-      <div className="p-8 text-danger text-sm">
-        {err} — <button className="underline" onClick={() => navigate("/")}>back</button>
+      <div className="flex-1 grid place-items-center">
+        <EmptyState
+          icon={<Film className="w-8 h-8" />}
+          title="This edit could not be opened"
+          body={err}
+          action={
+            <button className={btnSecondary} onClick={() => navigate("/")}>
+              Back to your videos
+            </button>
+          }
+        />
       </div>
     );
   if (!project || !assets)
@@ -437,6 +485,9 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const [assets, setAssets] = useState<Asset[]>(initialAssets);
   const [sel, setSel] = useState<Sel>(null);
   const [tab, setTab] = useState<"media" | "audio" | "text">("media");
+  // Phones and tablets get ONE pane at a time; the four-region grid is a
+  // desktop layout. Selection state chooses which pane is on screen.
+  const [pane, setPane] = useState<"library" | "canvas" | "inspector">("canvas");
   const [saveState, setSaveState] = useState<"saved" | "saving" | string>("saved");
   const [playing, setPlaying] = useState(false);
   const [playhead, setPlayhead] = useState(0);
@@ -547,8 +598,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         x: 0.5,
         y: 0.42,
         align: "center",
-        color: "#ffffff",
-        background: "#00000080",
+        color: DEFAULT_TEXT_COLOR,
+        background: DEFAULT_TEXT_BOX,
       });
       setSel({ area: "ovl", ti: 0, i: d.overlays[0].elements.length - 1 });
     });
@@ -587,25 +638,55 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      {/* project bar */}
-      <div className="flex items-center gap-3 px-4 h-11 border-b border-border bg-surface shrink-0">
+      {/* Project bar. The name edits in place — there is no edit mode and no
+          pencil: the value itself is the control. */}
+      <div className="flex items-center gap-3 px-4 h-12 border-b border-border bg-surface shrink-0">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          className="bg-transparent font-medium outline-none rounded-sm px-1 -mx-1 focus:bg-surface-sunken"
+          aria-label="Project name"
+          className="min-w-24 flex-1 lg:flex-none lg:w-64 bg-transparent text-heading-3 outline-none rounded-sm h-7 px-1.5 -mx-1.5 hover:bg-surface-sunken focus:bg-surface focus:shadow-edge"
         />
-        <span className={`text-xs ${saveState === "saved" ? "text-faint" : saveState === "saving" ? "text-muted" : "text-danger"}`}>
+        <span
+          className={`text-fine shrink-0 ${
+            saveState === "saved" ? "text-faint" : saveState === "saving" ? "text-muted" : "text-danger"
+          }`}
+        >
           {saveState === "saved" ? "Saved" : saveState === "saving" ? "Saving…" : saveState}
         </span>
         <div className="flex-1" />
         <button
           onClick={() => setAutocutOpen(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-sm border border-border text-sm hover:bg-surface-sunken"
+          className={btnSecondary}
           title="Assemble a cut from several clips with AI"
         >
-          <Sparkles className="w-4 h-4 text-primary" /> Auto-cut
+          <Sparkles className="w-4 h-4" /> <span className="hidden sm:inline">Auto-cut</span>
         </button>
         <ExportControls projectId={initial.id} disabled={dirty.current || edl.main.elements.length === 0} />
+      </div>
+
+      {/* Row 2, small screens only: which pane is on screen. */}
+      <div className="lg:hidden flex items-center px-4 h-11 border-b border-border bg-surface shrink-0">
+        <div className="inline-flex items-center gap-0.5 rounded-full bg-surface-sunken p-0.5">
+          {(
+            [
+              ["library", "Library"],
+              ["canvas", "Edit"],
+              ["inspector", "Options"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setPane(key)}
+              aria-pressed={pane === key}
+              className={`h-7 px-3 text-button rounded-sm ${
+                pane === key ? "bg-surface text-foreground shadow-raised" : "text-muted"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {autocutOpen && (
@@ -627,6 +708,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       {/* three-panel middle */}
       <div className="flex-1 flex min-h-0">
         <LeftPanel
+          pane={pane}
           tab={tab}
           setTab={setTab}
           assets={assets}
@@ -635,6 +717,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           onAddText={addText}
         />
         <Player
+          pane={pane}
           edl={edl}
           segments={segments}
           total={total}
@@ -647,6 +730,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           update={update}
         />
         <Inspector
+          pane={pane}
           edl={edl}
           sel={sel}
           update={update}
@@ -661,6 +745,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
 
       {/* timeline */}
       <TimelinePanel
+        pane={pane}
         edl={edl}
         segments={segments}
         total={total}
@@ -716,19 +801,28 @@ function AutocutModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 grid place-items-center p-6" onPointerDown={onClose}>
-      <div
-        className="w-full max-w-md rounded-lg border border-border bg-surface p-5 shadow-lg"
-        onPointerDown={(e) => e.stopPropagation()}
-      >
-        <h2 className="font-semibold flex items-center gap-2 mb-1">
-          <Sparkles className="w-4 h-4 text-primary" /> Auto-cut
-        </h2>
-        <p className="text-sm text-muted mb-4">
-          One pass watches every clip on your timeline together and assembles the strongest sequence for your
-          brief — ordering, trims and captions included. The result replaces the main track, ready to adjust.
-        </p>
-
+    <Dialog
+      title="Auto-cut"
+      icon={<Sparkles className="w-4 h-4 text-muted" />}
+      description="One pass watches every clip on your timeline together and assembles the strongest sequence for your brief: ordering, trims and captions included. The result replaces the main track, ready to adjust."
+      onClose={onClose}
+      footer={
+        <>
+          <button onClick={onClose} className={btnGhost}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button
+            onClick={run}
+            data-autofocus
+            disabled={running || clips.length === 0 || clips.length > 8}
+            className={btnPrimary}
+          >
+            {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Assemble cut
+          </button>
+        </>
+      }
+    >
+      <div className="mt-4">
         <Row label="What is this video for?">
           <textarea
             className={`${inputCls} min-h-16`}
@@ -739,43 +833,35 @@ function AutocutModal({
         </Row>
 
         <Row label={`Clips on the timeline (${clips.length})`}>
-          <div className="max-h-44 overflow-y-auto space-y-1 border border-border rounded-sm p-2">
+          <div className="max-h-44 overflow-y-auto space-y-1 rounded-sm p-2 shadow-edge">
             {clips.length === 0 && (
-              <div className="text-xs text-faint py-2 text-center">
-                Add video clips to the timeline first (Media panel → click a clip).
+              <div className="text-fine text-faint py-2 text-center">
+                Add video clips to the timeline first (Media panel, then click a clip).
               </div>
             )}
             {clips.map((a, i) => (
-              <div key={a.id} className="flex items-center gap-2 text-sm py-0.5">
-                <span className="text-faint text-xs w-4">{i + 1}.</span>
+              <div key={a.id} className="flex items-center gap-2 text-body-sm py-0.5">
+                <span className="text-faint text-fine w-4 tabular-nums">{i + 1}.</span>
                 <span className="truncate">{a.name}</span>
               </div>
             ))}
           </div>
         </Row>
 
-        {clips.length > 8 && <div className="text-xs text-danger mb-2">Auto-cut handles up to 8 clips at once.</div>}
-        {msg && <div className="text-xs text-muted mb-3">{msg}</div>}
-        <div className="flex justify-end gap-2">
-          <button onClick={onClose} className="px-3 py-1.5 rounded-sm border border-border text-sm hover:bg-surface-sunken">
-            Cancel
-          </button>
-          <button
-            onClick={run}
-            disabled={running || clips.length === 0 || clips.length > 8}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-sm bg-primary text-on-primary text-sm font-medium hover:bg-primary-hover disabled:opacity-60"
-          >
-            {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Assemble cut
-          </button>
-        </div>
+        {clips.length > 8 && (
+          <div className="text-fine text-danger">Auto-cut handles up to 8 clips at once.</div>
+        )}
+        {/* Work with an unknown duration says so in place, never a bare spinner. */}
+        {msg && <div className="text-fine text-muted">{msg}</div>}
       </div>
-    </div>
+    </Dialog>
   );
 }
 
 // ── left panel ──────────────────────────────────────────────────────────────
 
 function LeftPanel({
+  pane,
   tab,
   setTab,
   assets,
@@ -783,6 +869,7 @@ function LeftPanel({
   onAdd,
   onAddText,
 }: {
+  pane: Pane;
   tab: "media" | "audio" | "text";
   setTab: (t: "media" | "audio" | "text") => void;
   assets: Asset[];
@@ -848,7 +935,9 @@ function LeftPanel({
     tab === "media" ? assets.filter((a) => isVideoAsset(a) || isImageAsset(a)) : tab === "audio" ? assets.filter(isAudioAsset) : [];
 
   return (
-    <div className="w-60 shrink-0 border-r border-border bg-surface flex min-h-0">
+    /* The rail is surface-sunken; the canvas beside it stays white. The step
+       between them is small, and the border carries the separation. */
+    <div className={`${pane === "library" ? "flex" : "hidden"} lg:flex w-full lg:w-60 shrink-0 border-r border-border bg-surface-sunken min-h-0`}>
       <div className="w-14 shrink-0 border-r border-border flex flex-col items-center py-3 gap-1">
         {(
           [
@@ -860,8 +949,9 @@ function LeftPanel({
           <button
             key={key}
             onClick={() => setTab(key)}
-            className={`w-11 py-2 rounded-sm flex flex-col items-center gap-1 text-[10px] ${
-              tab === key ? "bg-surface-sunken text-foreground" : "text-muted hover:text-foreground"
+            aria-pressed={tab === key}
+            className={`w-11 py-2 rounded-sm flex flex-col items-center gap-1 text-fine ${
+              tab === key ? "bg-surface text-foreground shadow-raised" : "text-muted hover:text-foreground"
             }`}
           >
             <Icon className="w-4 h-4" />
@@ -873,7 +963,7 @@ function LeftPanel({
         {tab === "text" ? (
           <button
             onClick={onAddText}
-            className="w-full py-2.5 rounded-sm border border-dashed border-border text-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
+            className="w-full h-8 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
           >
             <Plus className="w-4 h-4" /> Add text
           </button>
@@ -882,7 +972,7 @@ function LeftPanel({
             <button
               onClick={() => fileRef.current?.click()}
               disabled={uploading}
-              className="w-full py-2 mb-3 rounded-sm border border-dashed border-border text-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
+              className="w-full h-8 mb-3 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5 disabled:opacity-50"
             >
               {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />} Upload
             </button>
@@ -900,28 +990,35 @@ function LeftPanel({
                 for (const f of files) upload(f);
               }}
             />
-            {uploadErr && <div className="text-xs text-danger mb-2">{uploadErr}</div>}
+            {uploadErr && <div className="text-fine text-danger mb-2">{uploadErr}</div>}
             <div className="space-y-2">
               {list.map((a) => (
                 <button
                   key={a.id}
                   onClick={() => onAdd(a)}
                   title="Add to timeline"
-                  className="w-full text-left rounded-sm border border-border overflow-hidden hover:border-faint group"
+                  aria-label={`Add ${a.name} to the timeline`}
+                  className="w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group"
                 >
                   {isVideoAsset(a) ? (
                     <video src={assetUrl(a)} muted preload="metadata" className="w-full h-20 object-cover bg-black" />
                   ) : isImageAsset(a) ? (
-                    <img src={assetUrl(a)} className="w-full h-20 object-cover bg-black" />
+                    <img src={assetUrl(a)} alt="" className="w-full h-20 object-cover bg-black" />
                   ) : (
-                    <div className="w-full h-12 grid place-items-center bg-surface-sunken">
-                      <Music className="w-5 h-5 text-muted" />
+                    <div className="w-full h-12 grid place-items-center bg-track-audio-tint">
+                      <Music className="w-5 h-5 text-track-audio" />
                     </div>
                   )}
-                  <div className="px-2 py-1.5 text-xs truncate text-muted group-hover:text-foreground">{a.name}</div>
+                  <div className="px-2 py-1.5 text-fine truncate text-muted group-hover:text-foreground">{a.name}</div>
                 </button>
               ))}
-              {list.length === 0 && <div className="text-xs text-faint py-4 text-center">Nothing here yet.</div>}
+              {list.length === 0 && (
+                <p className="text-fine text-muted py-4 text-center">
+                  {tab === "audio"
+                    ? "No music or voiceover yet. Upload an audio file to mix it under the cut."
+                    : "No footage yet. Upload a clip or a still, then click it to put it on the timeline."}
+                </p>
+              )}
             </div>
           </>
         )}
@@ -933,6 +1030,7 @@ function LeftPanel({
 // ── player ──────────────────────────────────────────────────────────────────
 
 function Player({
+  pane,
   edl,
   segments,
   total,
@@ -944,6 +1042,7 @@ function Player({
   setSel,
   update,
 }: {
+  pane: Pane;
   edl: Edl;
   segments: ReturnType<typeof mainSegments>;
   total: number;
@@ -1035,11 +1134,11 @@ function Player({
   };
 
   return (
-    <div className="flex-1 min-w-0 bg-surface-sunken grid place-items-center p-4 overflow-hidden">
+    <div className={`${pane === "canvas" ? "grid" : "hidden"} lg:grid flex-1 min-w-0 bg-surface-sunken place-items-center p-4 overflow-hidden`}>
       <div className="w-full max-w-full" style={{ maxHeight: "100%", aspectRatio: `${edl.output.width}/${edl.output.height}` }}>
         <div
           ref={stageRef}
-          className="relative w-full h-full overflow-hidden rounded-md shadow-sm"
+          className="relative w-full h-full overflow-hidden rounded-md shadow-edge"
           style={{ background: edl.output.background ?? "#000" }}
           onPointerDown={() => setSel(null)}
         >
@@ -1090,7 +1189,7 @@ function Player({
                           transform: t.align === "center" ? "translateX(-50%)" : t.align === "right" ? "translateX(-100%)" : undefined,
                           fontSize: t.fontSize * scale,
                           fontFamily: t.fontFamily === "serif" ? "serif" : t.fontFamily === "mono" ? "monospace" : "Inter, sans-serif",
-                          color: t.color ?? "#fff",
+                          color: t.color ?? DEFAULT_TEXT_COLOR,
                           background: t.background,
                           padding: t.background ? `${0.3 * t.fontSize * scale}px ${0.45 * t.fontSize * scale}px` : undefined,
                           opacity: t.opacity ?? 1,
@@ -1139,7 +1238,9 @@ function Player({
           )}
 
           {total === 0 && (
-            <div className="absolute inset-0 grid place-items-center text-faint text-sm">Add clips from the Media panel</div>
+            <div className="absolute inset-0 grid place-items-center px-6 text-center text-body-sm text-faint">
+              Add clips from the Media panel to start the cut
+            </div>
           )}
         </div>
       </div>
@@ -1152,14 +1253,19 @@ function Player({
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block mb-3">
-      <span className="eyebrow block mb-1">{label}</span>
+      <span className="block text-label text-muted mb-1">{label}</span>
       {children}
     </label>
   );
 }
 
-const inputCls =
-  "w-full px-2 py-1.5 rounded-sm border border-border bg-surface text-sm outline-none focus:border-ring";
+/** Section title inside the inspector rail — sentence case in `label`, never
+ *  the 11px tracked style (that one belongs above a KPI number). */
+function Zone({ children }: { children: React.ReactNode }) {
+  return <div className="text-label text-muted mb-3">{children}</div>;
+}
+
+const inputCls = "field";
 
 function NumberRow({ label, value, onChange, step = 0.1, min, max }: { label: string; value: number; onChange: (n: number) => void; step?: number; min?: number; max?: number }) {
   return (
@@ -1178,6 +1284,7 @@ function SliderRow({ label, value, onChange, min = 0, max = 1, step = 0.01 }: { 
 }
 
 function Inspector({
+  pane,
   edl,
   sel,
   update,
@@ -1188,6 +1295,7 @@ function Inspector({
   brief,
   setBrief,
 }: {
+  pane: Pane;
   edl: Edl;
   sel: Sel;
   update: (fn: (d: Edl) => void) => void;
@@ -1205,7 +1313,7 @@ function Inspector({
     if (!sel)
       return (
         <div className="mt-2">
-          <Row label="Project brief — what is this video for?">
+          <Row label="Project brief: what is this video for?">
             <textarea
               className={`${inputCls} min-h-20`}
               placeholder="e.g. 30-second product teaser for Instagram — energetic"
@@ -1213,11 +1321,13 @@ function Inspector({
               onChange={(e) => setBrief(e.target.value)}
             />
           </Row>
-          <p className="text-xs text-faint">
-            The brief anchors every AI action — cuts are only "effective" relative to a goal.
+          <p className="text-fine text-muted">
+            The brief anchors every AI action: cuts are only “effective” relative to a goal.
           </p>
-          <div className="mt-4 text-xs text-faint text-center">
-            Canvas: {edl.output.width}×{edl.output.height} @ {edl.output.fps}fps · Select a clip to edit it
+          <div className="mt-4 text-fine text-faint text-center tabular-nums">
+            Canvas {edl.output.width}×{edl.output.height} at {edl.output.fps}fps
+            <br />
+            Select a clip to edit it
           </div>
         </div>
       );
@@ -1229,7 +1339,7 @@ function Inspector({
       const dur = srcDur(el.src);
       return (
         <>
-          <div className="eyebrow mb-3">{el.type === "video" ? "Video clip" : "Image"}</div>
+          <Zone>{el.type === "video" ? "Video clip" : "Image"}</Zone>
           {el.type === "video" ? (
             <>
               <NumberRow label="Trim start (s)" value={el.trimStart ?? 0} min={0} onChange={(n) => set((e) => ((e as MainVideo).trimStart = Math.max(0, n)))} />
@@ -1319,7 +1429,7 @@ function Inspector({
                             x: 0.5,
                             y: 0.82,
                             align: "center",
-                            color: "#ffffff",
+                            color: DEFAULT_TEXT_COLOR,
                             background: "#000000a0",
                           });
                         }
@@ -1333,11 +1443,15 @@ function Inspector({
                     setAnalyzing(false);
                   }
                 }}
-                className="w-full mt-1 mb-2 py-2 rounded-sm bg-primary text-on-primary text-sm font-medium hover:bg-primary-hover disabled:opacity-60 flex items-center justify-center gap-1.5"
+                /* Secondary, not solid: Export is this screen's one ink action. */
+                className={`${btnSecondary} ${stretch} mt-1 mb-2`}
               >
                 {analyzing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Clean up clip (AI)
               </button>
-              {analyzeMsg && <div className="text-xs text-muted mb-2">{analyzeMsg}</div>}
+              {analyzing && (
+                <div className="text-fine text-muted mb-2">Watching the clip — this takes a moment…</div>
+              )}
+              {analyzeMsg && <div className="text-fine text-muted mb-2">{analyzeMsg}</div>}
             </>
           ) : (
             <>
@@ -1360,7 +1474,7 @@ function Inspector({
       const set = (fn: (e: OverlayElement) => void) => update((d) => fn(d.overlays![sel.ti].elements[sel.i]));
       return (
         <>
-          <div className="eyebrow mb-3">{el.type === "text" ? "Text" : el.type === "image" ? "Image overlay" : "Video overlay"}</div>
+          <Zone>{el.type === "text" ? "Text" : el.type === "image" ? "Image overlay" : "Video overlay"}</Zone>
           {el.type === "text" && (
             <>
               <Row label="Text">
@@ -1376,7 +1490,9 @@ function Inspector({
               </Row>
               <div className="grid grid-cols-2 gap-2">
                 <Row label="Color">
-                  <input type="color" className="w-full h-8 rounded-sm border border-border bg-surface" value={(el.color ?? "#ffffff").slice(0, 7)} onChange={(e) => set((x) => ((x as OverlayText).color = e.target.value))} />
+                  {/* The value IS a colour the user is authoring into the video,
+                      not app chrome — a colour input is the right control. */}
+                  <input type="color" className="field p-1" value={(el.color ?? DEFAULT_TEXT_COLOR).slice(0, 7)} onChange={(e) => set((x) => ((x as OverlayText).color = e.target.value))} />
                 </Row>
                 <Row label="Box (hex+alpha)">
                   <input className={inputCls} value={el.background ?? ""} placeholder="#00000080" onChange={(e) => set((x) => ((x as OverlayText).background = e.target.value || undefined))} />
@@ -1410,7 +1526,7 @@ function Inspector({
     const set = (fn: (e: AudioElement) => void) => update((d) => fn(d.audio![sel.ti].elements[sel.i]));
     return (
       <>
-        <div className="eyebrow mb-3">Audio</div>
+        <Zone>Audio</Zone>
         <SliderRow label="Volume" value={el.volume ?? 1} max={2} onChange={(n) => set((x) => (x.volume = n))} />
         <div className="grid grid-cols-2 gap-2">
           <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
@@ -1422,10 +1538,10 @@ function Inspector({
   };
 
   return (
-    <div className="w-64 shrink-0 border-l border-border bg-surface overflow-y-auto p-4">
+    <div className={`${pane === "inspector" ? "block" : "hidden"} lg:block w-full lg:w-64 shrink-0 border-l border-border bg-surface overflow-y-auto p-4`}>
       {body()}
       {sel && (
-        <button onClick={onDelete} className="w-full mt-2 py-2 rounded-sm border border-border text-sm text-danger hover:bg-danger-tint flex items-center justify-center gap-1.5">
+        <button onClick={onDelete} className={`${btnDanger} ${stretch} mt-2`}>
           <Trash2 className="w-4 h-4" /> Delete
         </button>
       )}
@@ -1463,25 +1579,31 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
   return (
     <div className="flex items-center gap-2">
       {last?.status === "completed" && last.output_url && (
-        <a href={last.output_url} target="_blank" className="text-sm text-link hover:underline">
+        <a
+          href={last.output_url}
+          target="_blank"
+          className="hidden sm:inline text-body-sm text-link underline decoration-border underline-offset-2"
+        >
           Last export ↗
         </a>
       )}
+      {/* A failure is data that happens to be alarming: danger TEXT, not a pill. */}
       {last?.status === "failed" && (
-        <span className="text-xs text-danger max-w-64 truncate" title={last.error ?? ""}>
+        <span className="text-fine text-danger max-w-64 truncate" title={last.error ?? ""}>
           {last.error}
         </span>
       )}
-      <select value={quality} onChange={(e) => setQuality(e.target.value)} className="px-2 py-1.5 rounded-sm border border-border bg-surface text-sm">
+      <select
+        value={quality}
+        onChange={(e) => setQuality(e.target.value)}
+        aria-label="Export quality"
+        className="field w-auto hidden sm:block"
+      >
         <option value="draft">Draft</option>
         <option value="standard">Standard</option>
         <option value="high">High</option>
       </select>
-      <button
-        onClick={run}
-        disabled={busy || disabled}
-        className="flex items-center gap-1.5 px-3 py-1.5 rounded-sm bg-primary text-on-primary text-sm font-medium hover:bg-primary-hover disabled:opacity-60"
-      >
+      <button onClick={run} disabled={busy || disabled} className={btnPrimary}>
         {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Film className="w-4 h-4" />} Export
       </button>
     </div>
@@ -1496,6 +1618,7 @@ const ROW_H = 30;
 const HEAD_W = 96;
 
 function TimelinePanel({
+  pane,
   edl,
   segments,
   total,
@@ -1511,6 +1634,7 @@ function TimelinePanel({
   splitAtPlayhead,
   deleteSelected,
 }: {
+  pane: Pane;
   edl: Edl;
   segments: ReturnType<typeof mainSegments>;
   total: number;
@@ -1634,25 +1758,39 @@ function TimelinePanel({
   }, [zoom, total]);
 
   return (
-    <div className="h-64 shrink-0 border-t border-border bg-surface flex flex-col">
+    <div className={`${pane === "canvas" ? "flex" : "hidden"} lg:flex h-64 shrink-0 border-t border-border bg-surface flex-col`}>
       {/* toolbar */}
       <div className="flex items-center gap-2 px-3 h-10 border-b border-border shrink-0">
-        <button onClick={() => setPlaying(!playing)} className="p-1.5 rounded-sm hover:bg-surface-sunken" title="Play / pause (space)">
+        <button
+          onClick={() => setPlaying(!playing)}
+          className={btnIcon}
+          aria-label={playing ? "Pause" : "Play"}
+          title="Play / pause (space)"
+        >
           {playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
         </button>
-        <span className="text-sm tabular-nums">
-          <span className="text-primary">{fmtTime(playhead)}</span>
+        <span className="text-data tabular-nums whitespace-nowrap">
+          <span className="text-foreground">{fmtTime(playhead)}</span>
           <span className="text-faint"> / {fmtTime(total)}</span>
         </span>
         <div className="w-px h-5 bg-border mx-1" />
-        <button onClick={splitAtPlayhead} className="p-1.5 rounded-sm hover:bg-surface-sunken text-muted hover:text-foreground" title="Split at playhead">
+        <button onClick={splitAtPlayhead} className={btnIcon} aria-label="Split at playhead" title="Split at playhead">
           <Scissors className="w-4 h-4" />
         </button>
-        <button onClick={deleteSelected} disabled={!sel} className="p-1.5 rounded-sm hover:bg-surface-sunken text-muted hover:text-foreground disabled:opacity-40" title="Delete selected">
+        <button onClick={deleteSelected} disabled={!sel} className={btnIcon} aria-label="Delete selected" title="Delete selected">
           <Trash2 className="w-4 h-4" />
         </button>
         <div className="flex-1" />
-        <input type="range" min={10} max={160} value={zoom} onChange={(e) => setZoom(Number(e.target.value))} className="w-32" title="Zoom" />
+        <input
+          type="range"
+          min={10}
+          max={160}
+          value={zoom}
+          onChange={(e) => setZoom(Number(e.target.value))}
+          className="w-32 accent-foreground"
+          aria-label="Timeline zoom"
+          title="Zoom"
+        />
       </div>
 
       {/* tracks */}
@@ -1663,7 +1801,7 @@ function TimelinePanel({
             <div style={{ width: HEAD_W }} className="shrink-0 border-r border-b border-border bg-surface" />
             <div className="relative flex-1 border-b border-border cursor-ew-resize select-none" onPointerDown={scrub}>
               {ticks.map((t) => (
-                <div key={t} className="absolute top-0 h-full border-l border-border text-[10px] text-faint pl-1 pt-0.5" style={{ left: t * zoom }}>
+                <div key={t} className="absolute top-0 h-full border-l border-border text-fine text-faint pl-1 pt-0.5 tabular-nums" style={{ left: t * zoom }}>
                   {t % 1 === 0 ? fmtTime(t) : ""}
                 </div>
               ))}
@@ -1699,7 +1837,7 @@ function TimelinePanel({
                     e.stopPropagation();
                     setSel({ area: "main", i: seg.i });
                   }}
-                  className={`absolute top-1 bottom-1 rounded-[4px] overflow-hidden border ${selected ? "border-ring ring-1 ring-ring" : "border-black/30"} bg-black cursor-grab`}
+                  className={`absolute top-1 bottom-1 rounded-xs overflow-hidden bg-black cursor-grab ${selected ? "ring-2 ring-ring" : "shadow-edge"}`}
                   style={{ left: seg.start * zoom, width: w }}
                   title={a?.name}
                 >
@@ -1714,7 +1852,7 @@ function TimelinePanel({
                   ) : a ? (
                     <img src={assetUrl(a)} className="w-full h-full object-cover" />
                   ) : null}
-                  <div className="absolute left-1 bottom-0.5 text-[10px] text-white/90 drop-shadow truncate max-w-[90%]">
+                  <div className="absolute left-1 bottom-0.5 text-fine text-on-accent/90 drop-shadow truncate max-w-[90%] tabular-nums">
                     {a?.name} · {seg.dur.toFixed(1)}s
                   </div>
                   <div onPointerDown={trimDrag(seg.i, "l")} className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize bg-white/0 hover:bg-white/30" />
@@ -1746,9 +1884,9 @@ function TimelinePanel({
                   <div
                     key={el.id}
                     onPointerDown={floatDrag("ovl", ti, i, "move")}
-                    className={`absolute top-1 bottom-1 rounded-[4px] border px-1.5 text-[10px] flex items-center gap-1 truncate cursor-grab ${
-                      selected ? "border-ring ring-1 ring-ring" : "border-transparent"
-                    } ${el.type === "text" ? "bg-primary/25 text-foreground" : "bg-ring/25"} ${track.hidden ? "opacity-40" : ""}`}
+                    className={`absolute top-1 bottom-1 rounded-xs px-1.5 text-fine flex items-center gap-1 truncate cursor-grab ${
+                      selected ? "ring-2 ring-ring" : ""
+                    } ${el.type === "text" ? "bg-track-text-tint text-track-text" : "bg-track-image-tint text-track-image"} ${track.hidden ? "opacity-40" : ""}`}
                     style={{ left: el.startTime * zoom, width: Math.max(14, el.duration * zoom) }}
                   >
                     {el.type === "text" ? <TypeIcon className="w-3 h-3 shrink-0" /> : <ImageIcon className="w-3 h-3 shrink-0" />}
@@ -1785,8 +1923,8 @@ function TimelinePanel({
                   <div
                     key={el.id}
                     onPointerDown={floatDrag("aud", ti, i, "move")}
-                    className={`absolute top-1 bottom-1 rounded-[4px] overflow-hidden border bg-success/30 cursor-grab ${
-                      selected ? "border-ring ring-1 ring-ring" : "border-transparent"
+                    className={`absolute top-1 bottom-1 rounded-xs overflow-hidden bg-track-audio cursor-grab ${
+                      selected ? "ring-2 ring-ring" : ""
                     } ${track.muted ? "opacity-40" : ""}`}
                     style={{ left: el.startTime * zoom, width: w }}
                     title={a?.name}
@@ -1801,8 +1939,8 @@ function TimelinePanel({
 
           {/* playhead */}
           <div className="absolute top-0 bottom-0 z-30 pointer-events-none" style={{ left: HEAD_W + playhead * zoom }}>
-            <div className="w-px h-full bg-primary" />
-            <div className="absolute -top-0 -left-[5px] w-[11px] h-3 bg-primary rounded-b-[3px]" />
+            <div className="w-px h-full bg-foreground" />
+            <div className="absolute -top-0 -left-[5px] w-[11px] h-3 bg-foreground rounded-b-xs" />
           </div>
         </div>
       </div>
@@ -1814,7 +1952,7 @@ function TrackRow({ label, height, action, children }: { label: string; height: 
   return (
     <div className="flex" style={{ height }}>
       <div style={{ width: HEAD_W }} className="shrink-0 border-r border-b border-border px-2 flex items-center justify-between bg-surface sticky left-0 z-10">
-        <span className="text-[11px] text-muted truncate">{label}</span>
+        <span className="text-fine text-muted truncate">{label}</span>
         {action}
       </div>
       <div className="relative flex-1 border-b border-border bg-surface-sunken/50">{children}</div>
