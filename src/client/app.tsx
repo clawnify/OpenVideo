@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { EditProjectsSection, EditRoute } from "./edit";
 import { STARTER_HTML } from "./starter";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
+import { AppNav, reportLocation, type AppNavItem } from "@clawnify/app/client";
 import {
   ArrowLeft,
   Film,
@@ -88,9 +89,32 @@ const api = {
 
 // ── app ──────────────────────────────────────────────────────────────
 
-type Tab = "compose" | "timeline" | "media" | "renders";
+type Tab = "compose" | "timeline" | "renders";
 
-// Minimal history-based router: `/` = gallery, `/<id>` = editor for that id.
+// One definition of the navigation. <AppNav> paints it as this app's own
+// sidebar when opened directly, and hands it to the Clawnify dashboard's
+// sidebar when embedded there — so the user only ever sees one nav.
+const NAV: AppNavItem[] = [
+  // The gallery is home: it is not a row, the app's name opens it.
+  { id: "compositions", label: "Compositions", href: "/", home: true },
+  { id: "media", label: "Media", href: "/media", icon: "image", color: "violet" },
+];
+
+// The footage library, owned one level above the screen that shows it, so the
+// sidebar count stays live when a file is uploaded or deleted.
+function useAssets() {
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const reload = useCallback(async () => {
+    setAssets(await api.get<Asset[]>("/api/assets"));
+  }, []);
+  useEffect(() => {
+    reload().catch(() => setAssets([]));
+  }, [reload]);
+  return { assets, reload };
+}
+
+// Minimal history-based router: `/` = gallery, `/media` = the footage
+// library, `/<id>` = editor for that id.
 function useRouter() {
   const [path, setPath] = useState(() => window.location.pathname);
   useEffect(() => {
@@ -108,35 +132,87 @@ function useRouter() {
 
 export function App() {
   const { path, navigate } = useRouter();
-  // "/" → gallery; "/edits/<id>" → footage editor; "/<id>" → composition editor.
+  // "/" → gallery; "/media" → footage library; "/edits/<id>" → footage editor;
+  // "/<id>" → composition editor.
   const id = decodeURIComponent(path.replace(/^\/+|\/+$/g, ""));
+  const isMedia = id === "media";
   const editId = id.startsWith("edits/") ? id.slice(6) : id === "edits" ? "" : null;
+  const { assets, reload: reloadAssets } = useAssets();
+
+  // Lets the dashboard restore this exact screen on reload.
+  useEffect(() => {
+    reportLocation(path);
+  }, [path]);
+
+  // The badge is just state: it moves the moment the library does.
+  const items = NAV.map((item) =>
+    item.id === "media" && assets.length > 0 ? { ...item, count: assets.length } : item,
+  );
 
   return (
-    <div className="h-dvh flex flex-col text-foreground">
-      {/* Brand row: the app icon is the identity object, and the accent hue
-          lives here (plus count badges and the focus ring) and nowhere else. */}
-      <header className="flex items-center gap-2 px-5 h-14 border-b border-border bg-surface shrink-0">
-        {id && (
-          <button onClick={() => navigate("/")} className={`${btnGhost} -ml-2`}>
-            <ArrowLeft className="w-4 h-4" /> Videos
-          </button>
-        )}
-        <span className="grid place-items-center w-7 h-7 rounded-sm bg-accent text-on-accent shrink-0">
-          <Film className="w-4 h-4" />
-        </span>
-        <span className="text-heading-3">OpenVideo</span>
-        <span className="text-fine text-faint hidden sm:inline">edit &amp; render video</span>
-      </header>
+    // The SDK rail is a 275px column at ≥768px and a horizontal strip below
+    // that, so it has to be the first child of the shell's flex container.
+    // The shell takes a definite `h-dvh`, never a min-height: the editor's
+    // resizable group sizes itself off a percentage height, and a min-height
+    // here leaves every descendant height indefinite, collapsing it to a
+    // 4px seam on the phone layout.
+    <div className="flex h-dvh flex-col overflow-hidden text-foreground md:flex-row">
+      <AppNav
+        title="OpenVideo"
+        icon="video"
+        groups={[{ items }]}
+        active={isMedia ? "media" : "compositions"}
+        onNavigate={(item) => navigate(item.href ?? "/")}
+      />
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {/* Brand row: the app icon is the identity object, and the accent hue
+            lives here (plus count badges and the focus ring) and nowhere else.
+            It stays inside the dashboard too, where the rail paints nothing. */}
+        <header className="flex items-center gap-2 px-5 h-14 border-b border-border bg-surface shrink-0">
+          {id && !isMedia && (
+            <button onClick={() => navigate("/")} className={`${btnGhost} -ml-2`}>
+              <ArrowLeft className="w-4 h-4" /> Videos
+            </button>
+          )}
+          <span className="grid place-items-center w-7 h-7 rounded-sm bg-accent text-on-accent shrink-0">
+            <Film className="w-4 h-4" />
+          </span>
+          <span className="text-heading-3">OpenVideo</span>
+          <span className="text-fine text-faint hidden sm:inline">edit &amp; render video</span>
+        </header>
 
-      {editId ? (
-        <EditRoute id={editId} navigate={navigate} />
-      ) : id ? (
-        <EditorRoute id={id} navigate={navigate} />
-      ) : (
-        <Gallery navigate={navigate} />
-      )}
+        {isMedia ? (
+          <MediaRoute assets={assets} reload={reloadAssets} />
+        ) : editId ? (
+          <EditRoute id={editId} navigate={navigate} />
+        ) : id ? (
+          <EditorRoute id={id} navigate={navigate} />
+        ) : (
+          <Gallery navigate={navigate} />
+        )}
+      </div>
     </div>
+  );
+}
+
+// ── media route ──────────────────────────────────────────────────────
+
+// The footage library on its own screen. Same panel the editor used to hold
+// in a tab; it is global, so it belongs beside the gallery, not inside one
+// composition.
+function MediaRoute({ assets, reload }: { assets: Asset[]; reload: () => Promise<void> }) {
+  return (
+    <main className="flex-1 overflow-y-auto">
+      <div className="max-w-6xl mx-auto px-6 py-8">
+        <h1 className="text-heading-1 mb-6">
+          Media
+          {assets.length > 0 && (
+            <span className="ml-2 text-data text-muted tabular-nums">{assets.length}</span>
+          )}
+        </h1>
+        <MediaPanel assets={assets} reload={reload} />
+      </div>
+    </main>
   );
 }
 
@@ -486,7 +562,7 @@ function Editor({
           {/* view switcher: a segmented track, active segment raised white */}
           <div className="px-5 pt-3 shrink-0">
             <div className="inline-flex items-center gap-0.5 rounded-full bg-surface-sunken p-0.5">
-              {(["timeline", "compose", "media", "renders"] as Tab[]).map((t) => (
+              {(["timeline", "compose", "renders"] as Tab[]).map((t) => (
                 <button
                   key={t}
                   onClick={() => setTab(t)}
@@ -556,7 +632,6 @@ function Editor({
             onTogglePlay={togglePlay}
           />
         )}
-        {tab === "media" && <MediaPanel />}
         {tab === "renders" && <RendersPanel comp={comp} />}
           </div>
         </Panel>
@@ -951,19 +1026,13 @@ function toHex(color: string): string {
 
 // ── media ────────────────────────────────────────────────────────────
 
-function MediaPanel() {
-  const [assets, setAssets] = useState<Asset[]>([]);
+// The list is owned by <App> so the sidebar count follows it; the panel reads
+// it and asks for a reload after it changes something.
+function MediaPanel({ assets, reload }: { assets: Asset[]; reload: () => Promise<void> }) {
   const [copied, setCopied] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [confirmDel, setConfirmDel] = useState<Asset | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-
-  async function load() {
-    setAssets(await api.get<Asset[]>("/api/assets"));
-  }
-  useEffect(() => {
-    load();
-  }, []);
 
   async function upload(files: FileList | null) {
     if (!files?.length) return;
@@ -974,7 +1043,7 @@ function MediaPanel() {
         fd.append("file", f);
         await fetch("/api/assets", { method: "POST", body: fd });
       }
-      await load();
+      await reload();
     } finally {
       setUploading(false);
     }
@@ -982,7 +1051,7 @@ function MediaPanel() {
 
   async function del(id: string) {
     await api.send("DELETE", `/api/assets/${id}`);
-    load();
+    reload();
   }
 
   function copy(key: string) {

@@ -47,7 +47,7 @@ HTML by path: `assets/<key>`. Reference it as `<img src="assets/logo.png">` or
 the assets your HTML actually references — you don't attach them manually.
 
 To list what's available: `GET /api/assets` → `[{ key, name, content_type }]`.
-Use the exact `key` in `assets/<key>`. (Users upload via the Media tab; you can
+Use the exact `key` in `assets/<key>`. (Users upload on the Media screen; you can
 also upload programmatically with a multipart `POST /api/assets`.)
 
 ## API

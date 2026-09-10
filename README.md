@@ -50,7 +50,7 @@ pnpm install
 pnpm dev        # editor UI + API, with a local database & storage
 ```
 
-Open the editor, hit **New composition** for a starter, edit the HTML in the **Compose** tab, drop media in **Media**, scrub the timeline, and render from **Renders**.
+Open the editor, hit **New composition** for a starter, edit the HTML in the **Compose** tab, drop media on the **Media** screen, scrub the timeline, and render from **Renders**.
 
 ## Deploy
 
