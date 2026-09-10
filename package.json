@@ -10,7 +10,9 @@
     "deploy": "clawnify deploy"
   },
   "dependencies": {
+    "@clawnify/app": "^0.2.1",
     "@clawnify/db": "^0.2.0",
+    "@phosphor-icons/react": "^2.1.10",
     "hono": "^4.6.0",
     "lucide-react": "^0.400.0",
     "react": "^19.0.0",
