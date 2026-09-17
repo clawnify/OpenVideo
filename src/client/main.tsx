@@ -1,5 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { App } from "./app";
+// One family, Inter, bundled with the app. The token declares it; this is what makes it true.
+import "@fontsource-variable/inter/wght.css";
 import "./styles.css";
 
 // Agent dual-mode: an agent driving a browser passes ?agent (or mode=agent).

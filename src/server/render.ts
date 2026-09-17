@@ -61,12 +61,13 @@ export async function renderComposition(args: RenderArgs): Promise<ArrayBuffer> 
   });
 
   if (!res.ok) {
-    let detail = `render service returned ${res.status}`;
+    const text = await res.text().catch(() => "");
+    let detail = text.trim().slice(0, 300) || `render service returned ${res.status}`;
     try {
-      const j = (await res.json()) as { error?: string; detail?: string };
-      detail = j.detail || j.error || detail;
+      const j = JSON.parse(text) as { error?: string; detail?: string };
+      detail = j.detail || j.error || `render service returned ${res.status}`;
     } catch {
-      /* non-JSON error body */
+      /* plain-text error body: keep it as the detail */
     }
     throw new Error(detail);
   }

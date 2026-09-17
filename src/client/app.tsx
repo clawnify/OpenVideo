@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { EditProjectsSection, EditRoute } from "./edit";
+import { EditProjectsSection, EditRoute, type EditProject } from "./edit";
+import { AppNav, embedded, reportLocation } from "@clawnify/app/client";
 import { STARTER_HTML } from "./starter";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
 import {
@@ -106,6 +107,37 @@ function useRouter() {
   return { path, navigate };
 }
 
+/**
+ * Inside the Clawnify dashboard the videos and edits are listed in the
+ * dashboard sidebar, and the open screen is kept in the host URL so a reload
+ * returns to it.
+ */
+function HostNav({ active, path, navigate }: { active: string; path: string; navigate: (to: string) => void }) {
+  const [comps, setComps] = useState<Composition[]>([]);
+  const [projects, setProjects] = useState<Omit<EditProject, "edl">[]>([]);
+  useEffect(() => {
+    api.get<Composition[]>("/api/compositions").then(setComps).catch(() => {});
+    api.get<Omit<EditProject, "edl">[]>("/api/projects").then(setProjects).catch(() => {});
+    reportLocation(window.location.pathname + window.location.search);
+  }, [path]);
+  return (
+    <AppNav
+      title="Video"
+      icon="video"
+      active={active || "home"}
+      groups={[
+        { items: [{ id: "home", label: "Videos", icon: "video", href: "/", home: true }] },
+        { label: "Videos", items: comps.map((c) => ({ id: c.id, label: c.name, icon: "play", href: `/${c.id}` })) },
+        {
+          label: "Footage edits",
+          items: projects.map((p) => ({ id: `edits/${p.id}`, label: p.name, icon: "camera", href: `/edits/${p.id}` })),
+        },
+      ]}
+      onNavigate={(item) => item.href && navigate(item.href)}
+    />
+  );
+}
+
 export function App() {
   const { path, navigate } = useRouter();
   // "/" → gallery; "/edits/<id>" → footage editor; "/<id>" → composition editor.
@@ -114,8 +146,11 @@ export function App() {
 
   return (
     <div className="h-dvh flex flex-col text-foreground">
+      {embedded && <HostNav active={id} path={path} navigate={navigate} />}
       {/* Brand row: the app icon is the identity object, and the accent hue
-          lives here (plus count badges and the focus ring) and nowhere else. */}
+          lives here (plus count badges and the focus ring) and nowhere else.
+          The dashboard draws its own, so it is standalone-only. */}
+      {!embedded && (
       <header className="flex items-center gap-2 px-5 h-14 border-b border-border bg-surface shrink-0">
         {id && (
           <button onClick={() => navigate("/")} className={`${btnGhost} -ml-2`}>
@@ -128,6 +163,7 @@ export function App() {
         <span className="text-heading-3">OpenVideo</span>
         <span className="text-fine text-faint hidden sm:inline">edit &amp; render video</span>
       </header>
+      )}
 
       {editId ? (
         <EditRoute id={editId} navigate={navigate} />
@@ -293,7 +329,18 @@ function Editor({
   comp: Composition;
   navigate: (to: string) => void;
 }) {
-  const [tab, setTab] = useState<Tab>("timeline");
+  const [tab, setTab] = useState<Tab>(() => {
+    const t = new URLSearchParams(window.location.search).get("tab");
+    return t === "compose" || t === "media" || t === "renders" ? t : "timeline";
+  });
+  // Keep the tab in the URL so a reload (or the dashboard) reopens it.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (tab === "timeline") url.searchParams.delete("tab");
+    else url.searchParams.set("tab", tab);
+    window.history.replaceState(null, "", url);
+    reportLocation(url.pathname + url.search);
+  }, [tab]);
   const [html, setHtml] = useState(comp.html);
   const [name, setName] = useState(comp.name);
   const [fps, setFps] = useState(comp.fps);
