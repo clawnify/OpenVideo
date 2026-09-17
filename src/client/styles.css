@@ -187,7 +187,7 @@
   --text-fine: 0.75rem;
   --text-fine--line-height: 1.4;
 
-  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 /* Elevation: three recipes, and the difference between resting and floating

@@ -93,10 +93,26 @@ app.delete("/api/compositions/:id", async (c) => {
 // Serve the composition wrapped in a full HTML doc with a preview harness that
 // scales it to fit and loops its GSAP timelines. Loaded by the editor iframe.
 app.get("/api/compositions/:id/preview", async (c) => {
-  const row = await get<Composition>("SELECT html FROM compositions WHERE id = ?", [c.req.param("id")]);
+  const id = c.req.param("id");
+  const row = await get<Composition>("SELECT html FROM compositions WHERE id = ?", [id]);
   if (!row) return c.text("Not found", 404);
-  return c.html(previewDoc(row.html));
+  return c.html(previewDoc(row.html, id));
 });
+
+// The preview loads every script by URL rather than inline, so it also runs
+// under a strict `script-src 'self'` policy. Each inline <script> of the
+// composition is served here by position; the harness is a fixed file.
+app.get("/api/compositions/:id/preview/scripts/:n{[0-9]+\\.js}", async (c) => {
+  const row = await get<Composition>("SELECT html FROM compositions WHERE id = ?", [c.req.param("id")]);
+  const n = Number.parseInt(c.req.param("n"), 10);
+  const script = row ? inlineScripts(previewSource(row.html))[n] : undefined;
+  if (script === undefined) return c.text("Not found", 404);
+  return c.body(script.body, 200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" });
+});
+
+app.get("/api/preview-harness.js", (c) =>
+  c.body(PREVIEW_HARNESS, 200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" }),
+);
 
 // ── Assets (media library) ───────────────────────────────────────────
 
@@ -573,12 +589,11 @@ function lower8(): string {
     .join("");
 }
 
-function previewDoc(html: string): string {
-  // Master-clock harness: one playhead drives every GSAP timeline so the editor's
-  // timeline view stays in sync. Talks to the parent via postMessage:
-  //   parent → iframe: { target:'hf-preview', type:'seek'|'play'|'pause', t }
-  //   iframe → parent: { source:'hf-preview', type:'time'|'meta', t, duration }
-  const harness = `
+// Master-clock harness: one playhead drives every GSAP timeline so the editor's
+// timeline view stays in sync. Talks to the parent via postMessage:
+//   parent → iframe: { target:'hf-preview', type:'seek'|'play'|'pause', t }
+//   iframe → parent: { source:'hf-preview', type:'time'|'meta', t, duration }
+const PREVIEW_HARNESS = `
     window.__timelines = window.__timelines || {};
     // ?start / ?end define a loop window (a selected clip's span); ?play=1 autoplays.
     // Default (no params) is paused on the whole composition.
@@ -650,15 +665,38 @@ function previewDoc(html: string): string {
       tls.forEach(function (tl) { try { tl.time(Math.min(playhead, tl.duration())); } catch (e) {} });
       parent.postMessage({ source: 'hf-preview', type: 'time', t: playhead, duration: duration }, '*');
     }`;
-  // Media is referenced as a relative `assets/<key>` path (what the renderer
-  // needs, since it writes files into the project's assets/ dir). The preview
-  // iframe has no such dir, so rewrite those references to the served R2 URL.
-  const rewritten = html.replace(/(["'(])assets\//g, "$1/api/uploads/");
+
+// GSAP from the jsDelivr CDN (what the starter and most compositions use) is
+// swapped for the copy bundled under /vendor/gsap, so previews need no
+// third-party script. Renders keep the original URL.
+const GSAP_CDN = /https:\/\/cdn\.jsdelivr\.net\/npm\/gsap@3(?:\.[0-9.]+)?\/dist\/([A-Za-z0-9]+\.min\.js)/g;
+
+const INLINE_SCRIPT = /<script\b((?:(?!\bsrc\s*=)[^>])*)>([\s\S]*?)<\/script>/gi;
+
+/**
+ * Media is referenced as a relative `assets/<key>` path (what the renderer
+ * needs, since it writes files into the project's assets/ dir). The preview
+ * iframe has no such dir, so rewrite those references to the served R2 URL.
+ */
+function previewSource(html: string): string {
+  return html.replace(/(["'(])assets\//g, "$1/api/uploads/").replace(GSAP_CDN, "/vendor/gsap/$1");
+}
+
+/** Inline <script> elements of a composition, in document order. */
+function inlineScripts(html: string): { attrs: string; body: string }[] {
+  return [...html.matchAll(INLINE_SCRIPT)].map((m) => ({ attrs: m[1], body: m[2] }));
+}
+
+function previewDoc(html: string, id: string): string {
+  let n = 0;
+  const rewritten = previewSource(html).replace(INLINE_SCRIPT, (_m, attrs: string) =>
+    `<script${attrs} src="/api/compositions/${encodeURIComponent(id)}/preview/scripts/${n++}.js"></script>`,
+  );
   return `<!doctype html><html><head><meta charset="utf-8" />
 <style>html,body{margin:0;padding:0;background:#000;overflow:hidden}</style>
 </head><body>
 ${rewritten}
-<script>${harness}</script>
+<script src="/api/preview-harness.js"></script>
 </body></html>`;
 }
 
