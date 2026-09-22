@@ -123,3 +123,38 @@ export function Dialog({
     </div>
   );
 }
+
+/** A destructive confirm NAMES the object and says what is lost. Never
+ *  window.confirm — it cannot be styled, and an agent driving the browser
+ *  cannot answer it. */
+export function ConfirmDialog({
+  title,
+  body,
+  confirmLabel = "Delete",
+  onConfirm,
+  onClose,
+}: {
+  title: string;
+  body: string;
+  confirmLabel?: string;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog
+      title={title}
+      description={body}
+      onClose={onClose}
+      footer={
+        <>
+          <button className={btnGhost} onClick={onClose}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button className={btnDanger} data-autofocus onClick={onConfirm}>
+            {confirmLabel}
+          </button>
+        </>
+      }
+    />
+  );
+}

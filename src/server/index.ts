@@ -204,8 +204,18 @@ function projectOut(row: EditProject) {
 }
 
 app.get("/api/projects", async (c) => {
-  const rows = await query<Omit<EditProject, "edl">>(
-    "SELECT id, name, created_at, updated_at FROM edit_projects ORDER BY updated_at DESC",
+  // The first main-track clip is the project's cover: the frame a list of cuts
+  // is recognised by. `substr(…, 7)` strips the "asset:" prefix; a URL source
+  // matches no asset id and simply has no cover.
+  const rows = await query<
+    Omit<EditProject, "edl" | "brief"> & { cover_key: string | null; cover_type: string | null; cover_at: number | null }
+  >(
+    `SELECT p.id, p.name, p.created_at, p.updated_at,
+            a.key AS cover_key, a.content_type AS cover_type,
+            json_extract(p.edl, '$.main.elements[0].trimStart') AS cover_at
+       FROM edit_projects p
+       LEFT JOIN assets a ON a.id = substr(json_extract(p.edl, '$.main.elements[0].src'), 7)
+      ORDER BY p.updated_at DESC`,
   );
   return c.json(rows);
 });

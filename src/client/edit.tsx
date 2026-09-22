@@ -30,6 +30,7 @@ import {
   VolumeX,
 } from "lucide-react";
 import {
+  ConfirmDialog,
   Dialog,
   EmptyState,
   Kbd,
@@ -366,13 +367,50 @@ function fmtDate(s: string): string {
     : d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
+/** A row of the projects list: no document, but its first clip as a cover. */
+type ProjectSummary = Omit<EditProject, "edl" | "brief"> & {
+  cover_key: string | null;
+  cover_type: string | null;
+  /** Where the cut starts in the cover clip (its trimStart), in seconds. */
+  cover_at: number | null;
+};
+
+/** The frame a project is recognised by: its opening shot, or a blank tile. */
+function ProjectCover({ p }: { p: ProjectSummary }) {
+  const url = p.cover_key ? `/api/uploads/${encodeURIComponent(p.cover_key)}` : null;
+  return (
+    <div className="aspect-video bg-surface-sunken grid place-items-center overflow-hidden">
+      {url && p.cover_type?.startsWith("video/") ? (
+        // Half a second in, not frame zero: footage often fades up from black.
+        <video
+          src={`${url}#t=${(p.cover_at ?? 0) + 0.5}`}
+          muted
+          preload="metadata"
+          className="w-full h-full object-cover bg-black"
+        />
+      ) : url && p.cover_type?.startsWith("image/") ? (
+        <img src={url} alt="" className="w-full h-full object-cover" />
+      ) : (
+        <Film className="w-6 h-6 text-faint" />
+      )}
+    </div>
+  );
+}
+
 export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
-  const [projects, setProjects] = useState<Omit<EditProject, "edl">[] | null>(null);
+  const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [busy, setBusy] = useState(false);
+  const [confirmDel, setConfirmDel] = useState<ProjectSummary | null>(null);
 
   useEffect(() => {
-    api.get<Omit<EditProject, "edl">[]>("/api/projects").then(setProjects).catch(() => setProjects([]));
+    api.get<ProjectSummary[]>("/api/projects").then(setProjects).catch(() => setProjects([]));
   }, []);
+
+  const remove = async (p: ProjectSummary) => {
+    setConfirmDel(null);
+    await api.send("DELETE", `/api/projects/${p.id}`);
+    setProjects((cur) => cur?.filter((x) => x.id !== p.id) ?? null);
+  };
 
   const create = async () => {
     setBusy(true);
@@ -420,9 +458,12 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
           /* Loading is the shape of the answer, never a spinner. */
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {[0, 1, 2].map((i) => (
-              <div key={i} className={`${card} p-4 space-y-2`}>
-                <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
-                <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+              <div key={i} className={`${card} overflow-hidden`}>
+                <div className="aspect-video bg-surface-sunken animate-pulse" />
+                <div className="px-4 py-3 space-y-2">
+                  <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
+                  <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+                </div>
               </div>
             ))}
           </div>
@@ -440,16 +481,40 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {projects.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => navigate(`/edits/${p.id}`)}
-                className={`${card} text-left p-4 hover:bg-surface-sunken`}
-              >
-                <div className="text-body-sm font-medium truncate">{p.name}</div>
-                <div className="text-fine text-faint mt-1">Edited {fmtDate(p.updated_at)}</div>
-              </button>
+              // Two sibling buttons, not one inside the other: open is the
+              // card, delete is its own target (and never needs a hover to
+              // show, which a touch screen does not have).
+              <div key={p.id} className={`${card} relative overflow-hidden`}>
+                <button
+                  onClick={() => navigate(`/edits/${p.id}`)}
+                  className="block w-full text-left hover:bg-surface-sunken"
+                >
+                  <ProjectCover p={p} />
+                  <div className="pl-4 pr-12 py-3">
+                    <div className="text-body-sm font-medium truncate">{p.name}</div>
+                    <div className="text-fine text-faint mt-0.5">Edited {fmtDate(p.updated_at)}</div>
+                  </div>
+                </button>
+                <button
+                  onClick={() => setConfirmDel(p)}
+                  className={`${btnIcon} absolute right-2 bottom-3 hover:text-danger`}
+                  aria-label={`Delete ${p.name}`}
+                  title="Delete project"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
             ))}
           </div>
+        )}
+
+        {confirmDel && (
+          <ConfirmDialog
+            title={`Delete “${confirmDel.name}”?`}
+            body="The project and its export history go with it. Your footage stays in the media library."
+            onConfirm={() => remove(confirmDel)}
+            onClose={() => setConfirmDel(null)}
+          />
         )}
       </div>
     </main>
