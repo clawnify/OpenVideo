@@ -10,6 +10,7 @@ import {
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
+import { frameUrl, importMedia, mediaPlayback, mediaState, prepareMedia } from "./media";
 import {
   DRIVE_FILE_ID,
   SHARED_WITH_ME,
@@ -60,6 +61,10 @@ interface Asset {
   content_type: string;
   size: number;
   created_at: string;
+  /** Seconds, probed at upload or reported by the media service. */
+  duration: number | null;
+  /** Set when the footage lives on the media service rather than in storage. */
+  media_uid: string | null;
 }
 
 app.get("/api/assets", async (c) => {
@@ -157,6 +162,22 @@ app.post("/api/drive/import", async (c) => {
   }
 
   const file = await driveDownloadLink(c.env, b.fileId);
+
+  // A video goes to the media service: it fetches the link itself, so nothing
+  // passes through this app and no size ceiling applies. Stills and sound are
+  // small, and stay in the app's own storage.
+  if (file.mimeType.startsWith("video/")) {
+    const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+    const imported = await importMedia(cfg, file.url, file.name);
+    if ("failure" in imported) return c.json(imported.failure, 422);
+    const res = await run(
+      "INSERT INTO assets (key, name, content_type, size, duration, media_uid) VALUES (?, ?, ?, ?, ?, ?)",
+      [`media/${imported.media.id}`, file.name, file.mimeType, 0, b.duration ?? null, imported.media.id],
+    );
+    const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
+    return c.json(row, 201);
+  }
+
   const key = await uniqueKey(file.name);
   const stored = await putUploadFromUrl(file.url, key, file.mimeType);
   // Drive's own probe of the video length, when the picker had it.
@@ -168,6 +189,58 @@ app.post("/api/drive/import", async (c) => {
   );
   const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
   return c.json(row, 201);
+});
+
+/**
+ * Where to play a media-backed asset from, and where its frames come from.
+ * The URLs are signed and short-lived, so the client asks again rather than
+ * storing them.
+ */
+app.get("/api/assets/:id/playback", async (c) => {
+  const asset = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
+  if (!asset) return c.json({ error: "Not found" }, 404);
+  if (!asset.media_uid) return c.json({ error: "not_media", detail: "this asset plays from app storage" }, 400);
+
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const state = await mediaState(cfg, asset.media_uid);
+  if ("failure" in state) return c.json(state.failure, 502);
+  if (!state.media.ready) {
+    return c.json({ ready: false, state: state.media.state, progress: state.media.progress });
+  }
+  const play = await mediaPlayback(cfg, asset.media_uid);
+  if ("failure" in play) return c.json(play.failure, 502);
+  // The length the service measured beats the one the picker guessed.
+  if (state.media.duration && Math.abs((asset.duration ?? 0) - state.media.duration) > 0.5) {
+    await run("UPDATE assets SET duration = ? WHERE id = ?", [state.media.duration, asset.id]);
+  }
+  return c.json({ ready: true, duration: state.media.duration, ...play.playback });
+});
+
+/**
+ * Where an asset's bytes are, whichever side they live on. A redirect keeps
+ * one URL shape for the whole client, and the range requests a video element
+ * makes survive it.
+ */
+app.get("/api/assets/:id/source", async (c) => {
+  const asset = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
+  if (!asset) return c.json({ error: "Not found" }, 404);
+  if (!asset.media_uid) return c.redirect(`/api/uploads/${encodeURIComponent(asset.key)}`, 302);
+
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const play = await mediaPlayback(cfg, asset.media_uid);
+  if ("failure" in play) return c.json(play.failure, 502);
+  return c.redirect(play.playback.download, 302);
+});
+
+/** One frame of a media-backed asset, for covers and the timeline. */
+app.get("/api/assets/:id/frame", async (c) => {
+  const asset = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
+  if (!asset?.media_uid) return c.json({ error: "Not found" }, 404);
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const play = await mediaPlayback(cfg, asset.media_uid);
+  if ("failure" in play) return c.json(play.failure, 502);
+  const at = Number(c.req.query("t") ?? 0);
+  return c.redirect(frameUrl(play.playback, Number.isFinite(at) ? at : 0), 302);
 });
 
 // Backfill a probed duration onto a legacy asset (self-healing library).
@@ -300,6 +373,7 @@ app.get("/api/projects", async (c) => {
   >(
     `SELECT p.id, p.name, p.created_at, p.updated_at,
             a.key AS cover_key, a.content_type AS cover_type,
+            a.id AS cover_asset, a.media_uid AS cover_media,
             json_extract(p.edl, '$.main.elements[0].trimStart') AS cover_at
        FROM edit_projects p
        LEFT JOIN assets a ON a.id = substr(json_extract(p.edl, '$.main.elements[0].src'), 7)

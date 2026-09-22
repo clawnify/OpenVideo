@@ -68,3 +68,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Long footage lives on the managed media service instead of this app's
+-- storage; the row then carries the service's id and `key` holds no object.
+ALTER TABLE assets ADD COLUMN media_uid TEXT;

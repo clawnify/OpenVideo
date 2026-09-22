@@ -57,6 +57,8 @@ export interface Asset {
   size: number;
   /** Seconds, probed client-side at upload (null for legacy/images). */
   duration?: number | null;
+  /** Set when the footage lives on the media service rather than in storage. */
+  media_uid?: string | null;
 }
 
 interface MainVideo {
@@ -196,7 +198,14 @@ const DEFAULT_TEXT_COLOR = "#ffffff";
 const DEFAULT_TEXT_BOX = "#00000080";
 
 const rid = () => Math.random().toString(36).slice(2, 10);
-const assetUrl = (a: Asset) => `/api/uploads/${encodeURIComponent(a.key)}`;
+/**
+ * One URL shape for every asset: the server redirects to app storage or to
+ * the media service, and a video element's range requests survive that.
+ */
+const assetUrl = (a: Asset) => `/api/assets/${encodeURIComponent(a.id)}/source`;
+
+/** A frame of media-service footage, which beats decoding the video for one. */
+const frameUrl = (a: Asset, at = 0) => `/api/assets/${encodeURIComponent(a.id)}/frame?t=${Math.max(0, at).toFixed(1)}`;
 const isVideoAsset = (a: Asset) => a.content_type.startsWith("video/");
 const isImageAsset = (a: Asset) => a.content_type.startsWith("image/");
 const isAudioAsset = (a: Asset) => a.content_type.startsWith("audio/");
@@ -597,6 +606,11 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const [playhead, setPlayhead] = useState(0);
   const [autocutOpen, setAutocutOpen] = useState(false);
   const playheadRef = useRef(0);
+  // While a video is playing it IS the clock: the wall clock only fills in
+  // for stretches with no video (stills, text). Driving the wall clock and
+  // seeking the video to match made every rebuffer force a seek, which
+  // rebuffered again — the stutter people saw on long footage.
+  const mediaClock = useRef<(() => number | null) | null>(null);
   const { srcDur, resolveAsset } = useSourceDurations(edl, assets);
 
   // ── persistence (debounced) ───────────────────────────────────────────────
@@ -659,7 +673,10 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     const tick = (now: number) => {
       const dt = (now - last) / 1000;
       last = now;
-      let t = playheadRef.current + dt;
+      const fromMedia = mediaClock.current?.();
+      let t = fromMedia !== null && fromMedia !== undefined && Number.isFinite(fromMedia)
+        ? fromMedia
+        : playheadRef.current + dt;
       if (t >= total) {
         t = total;
         setPlaying(false);
@@ -827,6 +844,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           total={total}
           playhead={playhead}
           playheadRef={playheadRef}
+          mediaClock={mediaClock}
           playing={playing}
           resolveAsset={resolveAsset}
           sel={sel}
@@ -1120,7 +1138,11 @@ function LeftPanel({
                   className="w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group"
                 >
                   {isVideoAsset(a) ? (
-                    <video src={assetUrl(a)} muted preload="metadata" className="w-full h-20 object-cover bg-black" />
+                    a.media_uid ? (
+                      <img src={frameUrl(a, 1)} alt="" className="w-full h-20 object-cover bg-black" />
+                    ) : (
+                      <video src={assetUrl(a)} muted preload="metadata" className="w-full h-20 object-cover bg-black" />
+                    )
                   ) : isImageAsset(a) ? (
                     <img src={assetUrl(a)} alt="" className="w-full h-20 object-cover bg-black" />
                   ) : (
@@ -1493,6 +1515,7 @@ function Player({
   total,
   playhead,
   playheadRef,
+  mediaClock,
   playing,
   resolveAsset,
   sel,
@@ -1505,6 +1528,8 @@ function Player({
   total: number;
   playhead: number;
   playheadRef: React.MutableRefObject<number>;
+  /** Filled here so the master clock can follow the playing video. */
+  mediaClock: React.MutableRefObject<(() => number | null) | null>;
   playing: boolean;
   resolveAsset: (src: string) => Asset | undefined;
   sel: Sel;
@@ -1544,6 +1569,24 @@ function Player({
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
 
+  // The playing video's position on the timeline, for the master clock.
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  useEffect(() => {
+    mediaClock.current = () => {
+      const seg = activeRef.current;
+      if (!seg || seg.el.type !== "video" || seg.dur <= 0) return null;
+      const v = videoRefs.current.get(seg.el.id);
+      // A paused or starved element is not a clock: let the wall clock carry
+      // on rather than freezing the playhead while the buffer fills.
+      if (!v || v.paused || v.readyState < 2) return null;
+      return seg.start + (v.currentTime - (seg.el.trimStart ?? 0));
+    };
+    return () => {
+      mediaClock.current = null;
+    };
+  }, [mediaClock]);
+
   // Sync media elements to the master clock (drift-corrected seeks).
   useEffect(() => {
     const t = playhead;
@@ -1553,7 +1596,11 @@ function Player({
       const isActive = seg === active && seg.dur > 0;
       const wanted = (seg.el.trimStart ?? 0) + (t - seg.start);
       if (isActive) {
-        if (Math.abs(v.currentTime - wanted) > 0.18) v.currentTime = wanted;
+        // Playing, the video leads and needs no correction; only a real jump
+        // (a scrub, or a cut to another clip) is worth a seek, because each
+        // one empties the buffer. Paused, follow the playhead closely.
+        const jumped = Math.abs(v.currentTime - wanted) > (playing ? 0.75 : 0.05);
+        if (jumped && !v.seeking) v.currentTime = wanted;
         v.volume = Math.min(1, seg.el.volume ?? 1);
         v.muted = seg.el.sourceAudio === false;
         if (playing && v.paused) v.play().catch(() => {});
