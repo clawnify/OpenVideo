@@ -38,6 +38,10 @@ import {
 } from "lucide-react";
 import {
   ConfirmDialog,
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
   Dialog,
   EmptyState,
   Kbd,
@@ -880,8 +884,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     });
   };
 
-  const splitAtPlayhead = () => {
-    const t = playheadRef.current;
+  /** Cut the main-track clip under `t` in two, both halves the same source. */
+  const splitAt = (t: number) => {
     const seg = segments.find((s) => t > s.start + 0.05 && t < s.start + s.dur - 0.05);
     if (!seg) return;
     const off = t - seg.start;
@@ -909,6 +913,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     });
   };
 
+  const splitAtPlayhead = () => splitAt(playheadRef.current);
+
   const deleteSelected = () => {
     if (!sel) return;
     update((d) => {
@@ -918,6 +924,21 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     });
     setSel(null);
   };
+
+  // Delete or Backspace removes what is selected, as the trash button does.
+  // Ignored while typing, so editing text never deletes a clip.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Delete" && e.key !== "Backspace") return;
+      const el = e.target as HTMLElement | null;
+      if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+      if (!sel) return;
+      e.preventDefault();
+      deleteSelected();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -1081,6 +1102,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         srcDur={srcDur}
         resolveAsset={resolveAsset}
         splitAtPlayhead={splitAtPlayhead}
+        splitAt={splitAt}
         deleteSelected={deleteSelected}
       />
     </div>
@@ -2495,6 +2517,7 @@ function TimelinePanel({
   srcDur,
   resolveAsset,
   splitAtPlayhead,
+  splitAt,
   deleteSelected,
 }: {
   pane: Pane;
@@ -2512,12 +2535,16 @@ function TimelinePanel({
   srcDur: (src: string) => number | undefined;
   resolveAsset: (src: string) => Asset | undefined;
   splitAtPlayhead: () => void;
+  /** Split the main-track clip under a timeline time (right-click "Split here"). */
+  splitAt: (t: number) => void;
   deleteSelected: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(40); // px per second
   const width = Math.max(300, (total || 10) * zoom + 60);
   const dragMain = useRef<{ from: number; over: number } | null>(null);
+  // Timeline seconds under the last right-click, for "Split here".
+  const menuAt = useRef(0);
   const [, bump] = useState(0);
 
   const timeAt = (clientX: number) => {
@@ -2682,9 +2709,16 @@ function TimelinePanel({
               // one strip; each piece should read as its own video.
               const w = Math.max(8, seg.dur * zoom - CLIP_GAP);
               return (
+                <ContextMenu key={seg.el.id}>
+                <ContextMenuTrigger asChild>
                 <div
-                  key={seg.el.id}
                   draggable
+                  onContextMenu={(e) => {
+                    // Where the right-click landed, in timeline seconds.
+                    const box = e.currentTarget.getBoundingClientRect();
+                    menuAt.current = seg.start + (e.clientX - box.left) / zoom;
+                    setSel({ area: "main", i: seg.i });
+                  }}
                   onDragStart={() => (dragMain.current = { from: seg.i, over: seg.i })}
                   onDragOver={(e) => {
                     e.preventDefault();
@@ -2734,6 +2768,24 @@ function TimelinePanel({
                   <div onPointerDown={trimDrag(seg.i, "l")} className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize bg-white/0 hover:bg-white/30" />
                   <div onPointerDown={trimDrag(seg.i, "r")} className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize bg-white/0 hover:bg-white/30" />
                 </div>
+                </ContextMenuTrigger>
+                <ContextMenuContent>
+                  <ContextMenuItem onSelect={() => splitAt(menuAt.current)}>
+                    <Scissors className="w-4 h-4" /> Split here
+                  </ContextMenuItem>
+                  <ContextMenuItem
+                    danger
+                    onSelect={() => {
+                      update((d) => {
+                        d.main.elements.splice(seg.i, 1);
+                      });
+                      setSel(null);
+                    }}
+                  >
+                    <Trash2 className="w-4 h-4" /> Delete clip
+                  </ContextMenuItem>
+                </ContextMenuContent>
+                </ContextMenu>
               );
             })}
           </TrackRow>

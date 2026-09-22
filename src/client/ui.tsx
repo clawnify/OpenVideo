@@ -7,6 +7,7 @@
 // Everything else is secondary (white with a raised shadow ring) or ghost.
 
 import { useEffect, useRef } from "react";
+import * as RadixContextMenu from "@radix-ui/react-context-menu";
 
 const btnBase =
   "inline-flex items-center gap-1.5 h-7 rounded-sm text-button whitespace-nowrap " +
@@ -159,5 +160,45 @@ export function ConfirmDialog({
         </>
       }
     />
+  );
+}
+
+/**
+ * A right-click menu on the design tokens. Radix owns placement at the
+ * pointer, keyboard, focus and dismissal. It is only ever a shortcut: every
+ * action in one must also be reachable from a visible control, because an
+ * agent driving the app never right-clicks.
+ */
+export const ContextMenu = RadixContextMenu.Root;
+export const ContextMenuTrigger = RadixContextMenu.Trigger;
+
+export function ContextMenuContent({ children }: { children: React.ReactNode }) {
+  return (
+    <RadixContextMenu.Portal>
+      <RadixContextMenu.Content className="z-50 min-w-40 rounded-md bg-surface p-1 shadow-float">
+        {children}
+      </RadixContextMenu.Content>
+    </RadixContextMenu.Portal>
+  );
+}
+
+export function ContextMenuItem({
+  children,
+  onSelect,
+  danger = false,
+}: {
+  children: React.ReactNode;
+  onSelect: () => void;
+  danger?: boolean;
+}) {
+  return (
+    <RadixContextMenu.Item
+      onSelect={onSelect}
+      className={`flex items-center gap-2 h-7 px-2 rounded-sm text-body-sm outline-none cursor-default select-none ${
+        danger ? "text-danger data-[highlighted]:bg-danger-tint" : "text-foreground data-[highlighted]:bg-surface-sunken"
+      }`}
+    >
+      {children}
+    </RadixContextMenu.Item>
   );
 }
