@@ -1352,7 +1352,7 @@ function DriveDialog({
           />
 
           <div className="mt-2 flex flex-col sm:flex-row gap-3">
-            <div className="flex-1 min-w-0 max-h-80 overflow-y-auto -mx-2">
+            <div className="flex-1 min-w-0 max-h-80 overflow-y-auto scroll-slim -ml-2 pr-1">
               {files === null ? (
                 /* Loading is the shape of the answer, never a spinner. */
                 [0, 1, 2].map((i) => (

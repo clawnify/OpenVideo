@@ -318,3 +318,32 @@ body {
     color: var(--faint);
   }
 }
+
+/* A scroll area whose scrollbar stays out of the way: thin, in the border
+   colour, darkening only while the pointer is in the area. The browser
+   default is a wide grey bar that lands on top of the content beside it. */
+@layer components {
+  .scroll-slim {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .scroll-slim::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scroll-slim::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scroll-slim::-webkit-scrollbar-thumb {
+    background-color: transparent;
+    border: 2px solid transparent;
+    background-clip: content-box;
+    border-radius: 9999px;
+  }
+  .scroll-slim:hover::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+  }
+  .scroll-slim::-webkit-scrollbar-thumb:hover {
+    background-color: var(--faint);
+  }
+}
