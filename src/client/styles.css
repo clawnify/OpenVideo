@@ -271,32 +271,6 @@ body {
   }
 }
 
-/* Resizable panel dividers (react-resizable-panels).
-   background-clip:content-box paints only the 1px line; the padding is a
-   transparent grab zone straddling it. */
-.ove-sep-x,
-.ove-sep-y {
-  background-color: var(--border);
-  background-clip: content-box;
-  transition: background-color 120ms ease;
-}
-.ove-sep-x:hover,
-.ove-sep-y:hover {
-  background-color: var(--faint);
-}
-.ove-sep-x {
-  /* vertical divider — drag horizontally */
-  width: 1px;
-  padding-inline: 2px;
-  cursor: col-resize;
-}
-.ove-sep-y {
-  /* horizontal divider — drag vertically */
-  height: 1px;
-  padding-block: 2px;
-  cursor: row-resize;
-}
-
 /* The primary button carries its own edge (a hairline plus a short drop) on
    top of the ink fill — component-level, not a fourth elevation level. */
 @utility shadow-button {

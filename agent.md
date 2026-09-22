@@ -1,68 +1,30 @@
 # OpenVideo — agent guide
 
-This app turns **HTML compositions into MP4 videos** using HeyGen HyperFrames.
-You author compositions as plain HTML, the user drops in media (logos, product
-demos), and renders run on the managed Clawnify render service. You never touch
-Chrome or FFmpeg — you write HTML and call this app's API.
+This app edits **real footage into MP4 videos**. The user (or you) uploads
+clips, stills and music to the media library; a **project** arranges them on a
+timeline (cut, trimmed and sequenced, with text and images on top and music
+underneath) and exports run on the managed Clawnify edit service. You never
+touch a video encoder: you read and write a project's plain-JSON document and
+call this app's API.
 
 Base URL: this app's own origin. All endpoints are under `/api`.
 
-## Composition format (HyperFrames)
+## Media library
 
-A composition is one HTML fragment with a root element carrying
-`data-composition-id`, `data-width`, `data-height`. Timed elements get
-`class="clip"` plus `data-start` / `data-duration` (seconds) /
-`data-track-index`. Animate with a **paused** GSAP timeline registered on
-`window.__timelines[<composition-id>]`.
-
-```html
-<div id="root" data-composition-id="promo" data-start="0" data-width="1920" data-height="1080"
-     style="width:1920px;height:1080px;background:#0b1020;position:relative;font-family:sans-serif">
-  <img src="assets/logo.png" class="clip" data-start="0" data-duration="6" data-track-index="0"
-       style="position:absolute;top:80px;left:80px;width:160px" />
-  <h1 id="title" class="clip" data-start="0.5" data-duration="6" data-track-index="0"
-      style="position:absolute;top:48%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:90px">
-    Introducing Northwind
-  </h1>
-  <video src="assets/demo.mp4" class="clip" data-start="2" data-duration="6" data-track-index="1"
-         style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover" />
-  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
-  <script>
-    const tl = gsap.timeline({ paused: true });
-    tl.from("#title", { opacity: 0, y: 40, duration: 1 }, 0.5);
-    window.__timelines = window.__timelines || {};
-    window.__timelines["promo"] = tl;
-  </script>
-</div>
-```
-
-Keep `data-composition-id` unique per composition and matching the
-`window.__timelines` key.
-
-## Embedding the user's media
-
-Media the user uploads lives in the **Media library** and is referenced from the
-HTML by path: `assets/<key>`. Reference it as `<img src="assets/logo.png">` or
-`<video src="assets/demo.mp4">`. At render time the app automatically ships only
-the assets your HTML actually references — you don't attach them manually.
-
-To list what's available: `GET /api/assets` → `[{ key, name, content_type }]`.
-Use the exact `key` in `assets/<key>`. (Users upload via the Media tab; you can
-also upload programmatically with a multipart `POST /api/assets`.)
+Everything a project uses lives in the media library. `GET /api/assets` lists
+it as `[{ id, key, name, content_type, size, duration }]`; a project references
+a file as `asset:<id>`. Users upload from the editor's Media panel; you can
+upload with a multipart `POST /api/assets` (field `file`), which returns the
+new asset row.
 
 ## API
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET  | `/api/compositions` | List compositions |
-| GET  | `/api/compositions/{id}` | Get one (includes `html`) |
-| POST | `/api/compositions` | Create `{ name, description?, html?, fps? }` |
-| PUT  | `/api/compositions/{id}` | Update any of `name/description/html/fps` |
-| DELETE | `/api/compositions/{id}` | Delete |
 | GET  | `/api/assets` | List uploaded media |
-| POST | `/api/renders` | Render `{ composition_id }` → returns the job |
-| GET  | `/api/renders` | List render jobs |
-| GET  | `/api/projects` | List footage edit projects |
+| POST | `/api/assets` | Upload one file (multipart, field `file`) → the asset |
+| POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
+| GET  | `/api/projects` | List projects |
 | GET  | `/api/projects/{id}` | Get one (includes the `edl` document and `brief`) |
 | POST | `/api/projects` | Create `{ name, brief?, edl? }` (empty 720p timeline if omitted) |
 | PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |
@@ -70,14 +32,11 @@ also upload programmatically with a multipart `POST /api/assets`.)
 | DELETE | `/api/projects/{id}` | Delete a project and its export history |
 | POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job (blocks until done) |
 | GET  | `/api/exports?project_id={id}` | Export history |
-| POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
 
-## Footage edit projects (EDL)
+## The project document (EDL)
 
-Compositions are for motion graphics you author as HTML. **Edit projects are
-for real footage**: cut, trim and sequence the user's uploaded clips, overlay
-images and text, and mix music underneath — then export to MP4. The document
-is an **EDL (edit decision list)**, plain JSON you read and transform.
+A project's document is an **EDL (edit decision list)**: plain JSON you read
+and transform, then save back.
 
 Rules that make editing easy to reason about:
 
@@ -249,23 +208,11 @@ same `{ error, detail, path }` shape as validation, so you can fix the EDL and
 export again. Your library media is staged to the edit service automatically
 on first use; you never manage that.
 
-## Authoring flow
+## Typical flow
 
-1. Read the brief. Pick dimensions (1920×1080 landscape, 1080×1080 square,
-   1080×1920 vertical/reel) from the use case.
-2. `GET /api/assets` to see the user's logo / demo clips and their `key`s.
-3. Write the composition HTML, referencing media as `assets/<key>`, and
-   `POST /api/compositions` (or `PUT` to revise an existing one).
-4. `POST /api/renders { composition_id }`. The call blocks until the MP4 is
-   ready (up to ~a minute) and returns the job with `output_url`, or
-   `status: "failed"` with an `error` to fix and retry.
-5. Share the rendered video's `output_url`.
-
-## How rendering works (so you can reason about failures)
-
-`POST /api/renders` ships your composition HTML + referenced assets to
-Clawnify's managed render service, which runs `hyperframes render` and returns
-the MP4. The app itself does no rendering — it's a thin client. Failures usually
-mean: a malformed composition (missing `data-composition-id`/dimensions, or a
-timeline not registered on `window.__timelines`), or a referenced asset path
-that doesn't match a real `key`. Read `error`, fix the HTML, render again.
+1. Get the purpose and set it as the project's `brief` (ask if you don't know).
+2. `GET /api/assets` to see the user's footage, or upload what they sent you.
+3. Several raw clips: `POST /api/projects/{id}/autocut`. One clip: analyze it,
+   then write the main track from the keep segments.
+4. Adjust with read → transform → `PUT`, fixing anything validation points at.
+5. Export `draft` to review, then `high` for the final, and share `output_url`.

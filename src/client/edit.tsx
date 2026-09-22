@@ -233,9 +233,9 @@ const peaksCache = new Map<string, number[]>();
 function useSourceDurations(edl: Edl, assets: Asset[]) {
   // `version` is not cosmetic: it is what gives `srcDur` a new identity when a
   // duration lands, which is what invalidates the `segments` memo downstream.
-  // Without it a project whose EDL already references an asset at mount (the
-  // "Use in an edit" flow) renders every clip at zero length forever, because
-  // the cache fills after the memo has already been computed.
+  // Without it a project whose EDL already references an asset at mount (any
+  // reopened project, or one an agent wrote) renders every clip at zero length
+  // forever, because the cache fills after the memo has already been computed.
   const [version, bump] = useState(0);
   const byId = useMemo(() => new Map(assets.map((a) => [a.id, a])), [assets]);
 
@@ -356,9 +356,17 @@ function Waveform({ url, width, height }: { url: string; width: number; height: 
   return <canvas ref={ref} width={Math.max(1, width)} height={height} className="w-full h-full" />;
 }
 
-// ── projects list (rendered on the home gallery) ────────────────────────────
+// ── projects (the home screen) ──────────────────────────────────────────────
 
-export function EditProjectsSection({ navigate }: { navigate: (to: string) => void }) {
+function fmtDate(s: string): string {
+  // SQLite datetime('now') is space-separated UTC; normalise for Date().
+  const d = new Date(s.replace(" ", "T") + "Z");
+  return isNaN(d.getTime())
+    ? ""
+    : d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
   const [projects, setProjects] = useState<Omit<EditProject, "edl">[] | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -369,72 +377,82 @@ export function EditProjectsSection({ navigate }: { navigate: (to: string) => vo
   const create = async () => {
     setBusy(true);
     try {
-      const p = await api.send<EditProject>("POST", "/api/projects", { name: "Untitled cut" });
+      const p = await api.send<EditProject>("POST", "/api/projects", { name: "Untitled project" });
       navigate(`/edits/${p.id}`);
     } finally {
       setBusy(false);
     }
   };
 
+  const newProject = (
+    <>
+      {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} New project
+    </>
+  );
+
   return (
-    <section className="mt-10">
-      {/* Card title row: sentence case, a live count, and the add affordance
-          at the right. The page's ONE solid action is "New video" above; this
-          section adds with a secondary. */}
-      <div className="flex items-start justify-between gap-4 mb-3">
-        <div>
-          <h2 className="text-heading-2 flex items-center gap-2">
-            <Scissors className="w-4 h-4 text-muted" /> Footage edits
-            {projects && projects.length > 0 && (
-              <span className="text-data text-muted tabular-nums">{projects.length}</span>
-            )}
-          </h2>
-          <p className="text-body-sm text-muted mt-0.5">
-            Video you already shot: trim it, put the clips in order, add text and music, export to
-            MP4.
-          </p>
+    <main className="flex-1 overflow-y-auto">
+      <div className="max-w-6xl mx-auto px-6 py-8">
+        {/* Toolbar grammar: identity left, the one solid action right. The
+            button appears here only once there is a list; an empty page
+            carries it in the empty state, so there are never two. */}
+        <div className="flex items-start justify-between gap-4 mb-6">
+          <div>
+            <h1 className="text-heading-1">
+              Projects
+              {projects && projects.length > 0 && (
+                <span className="ml-2 text-data text-muted tabular-nums">{projects.length}</span>
+              )}
+            </h1>
+            <p className="text-body-sm text-muted mt-0.5">
+              One project is one video: upload your footage, trim it, put the clips in order, add
+              text and music, and export it to MP4.
+            </p>
+          </div>
+          {projects && projects.length > 0 && (
+            <button onClick={create} disabled={busy} className={`${btnPrimary} shrink-0`}>
+              {newProject}
+            </button>
+          )}
         </div>
-        {projects && projects.length > 0 && (
-          <button onClick={create} disabled={busy} className={`${btnSecondary} shrink-0`}>
-            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} New edit
-          </button>
+
+        {projects === null ? (
+          /* Loading is the shape of the answer, never a spinner. */
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className={`${card} p-4 space-y-2`}>
+                <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
+                <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+              </div>
+            ))}
+          </div>
+        ) : projects.length === 0 ? (
+          <EmptyState
+            icon={<Scissors className="w-8 h-8" />}
+            title="No projects yet"
+            body="Start a project, upload a clip, and cut it down."
+            action={
+              <button onClick={create} disabled={busy} className={btnPrimary}>
+                {newProject}
+              </button>
+            }
+          />
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {projects.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => navigate(`/edits/${p.id}`)}
+                className={`${card} text-left p-4 hover:bg-surface-sunken`}
+              >
+                <div className="text-body-sm font-medium truncate">{p.name}</div>
+                <div className="text-fine text-faint mt-1">Edited {fmtDate(p.updated_at)}</div>
+              </button>
+            ))}
+          </div>
         )}
       </div>
-      {projects === null ? (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {[0, 1, 2].map((i) => (
-            <div key={i} className={`${card} p-4 space-y-2`}>
-              <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
-              <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
-            </div>
-          ))}
-        </div>
-      ) : projects.length === 0 ? (
-        <EmptyState
-          icon={<Scissors className="w-8 h-8" />}
-          title="No edits yet"
-          body="Upload a clip and cut it down."
-          action={
-            <button onClick={create} disabled={busy} className={btnSecondary}>
-              <Plus className="w-4 h-4" /> New edit
-            </button>
-          }
-        />
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {projects.map((p) => (
-            <button
-              key={p.id}
-              onClick={() => navigate(`/edits/${p.id}`)}
-              className={`${card} text-left p-4 hover:bg-surface-sunken`}
-            >
-              <div className="text-body-sm font-medium truncate">{p.name}</div>
-              <div className="text-fine text-faint mt-1">{p.updated_at?.slice(0, 10)}</div>
-            </button>
-          ))}
-        </div>
-      )}
-    </section>
+    </main>
   );
 }
 
@@ -468,11 +486,11 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
       <div className="flex-1 grid place-items-center">
         <EmptyState
           icon={<Film className="w-8 h-8" />}
-          title="This edit could not be opened"
+          title="This project could not be opened"
           body={err}
           action={
             <button className={btnSecondary} onClick={() => navigate("/")}>
-              Back to your videos
+              Back to projects
             </button>
           }
         />
@@ -1065,10 +1083,10 @@ function Player({
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-  // Scale to FIT, the way the composition preview's harness does: the limiting
-  // dimension wins. `aspect-ratio` alone sized the stage from the full width
-  // and let it run off the bottom of the pane (max-height never applied,
-  // because the parent's height is indefinite), so the frame was clipped.
+  // Scale to FIT: the limiting dimension wins. `aspect-ratio` alone sized the
+  // stage from the full width and let it run off the bottom of the pane
+  // (max-height never applied, because the parent's height is indefinite), so
+  // the frame was clipped.
   const [fit, setFit] = useState({ w: 0, h: 0, scale: 1 });
   const scale = fit.scale;
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
