@@ -1280,6 +1280,12 @@ function DriveDialog({
   const limited = !!status?.folder;
   const atLimitRoot = trail.length === 1;
   const atRoot = !limited && here?.id === "root";
+  const canLimitHere = !atLimitRoot && here?.id !== "sharedWithMe";
+  // A deep path keeps its start and its end; the middle collapses.
+  const crumbs: ({ folder: DriveFolder; at: number } | "gap")[] =
+    trail.length > 3
+      ? [{ folder: trail[0], at: 0 }, "gap", ...trail.slice(-2).map((f, i) => ({ folder: f, at: trail.length - 2 + i }))]
+      : trail.map((f, i) => ({ folder: f, at: i }));
 
   return (
     <Dialog
@@ -1304,25 +1310,31 @@ function DriveDialog({
           {/* Where you are, and the org's one folder rule. */}
           <div className="flex items-center gap-2 mb-2 min-h-7">
             <nav className="flex items-center gap-1 min-w-0 flex-1 text-fine text-muted">
-              {trail.map((f, i) => (
-                <span key={f.id} className="flex items-center gap-1 min-w-0">
-                  {i > 0 && <ChevronRight className="w-3 h-3 shrink-0 text-faint" />}
-                  <button
-                    onClick={() => goTo(i)}
-                    disabled={i === trail.length - 1}
-                    className="truncate hover:text-foreground disabled:text-foreground disabled:hover:text-foreground"
-                  >
-                    {f.name}
-                  </button>
-                </span>
-              ))}
+              {crumbs.map((c, i) =>
+                c === "gap" ? (
+                  <span key="gap" className="flex items-center gap-1 shrink-0 text-faint">
+                    <ChevronRight className="w-3 h-3" />…
+                  </span>
+                ) : (
+                  <span key={c.folder.id} className="flex items-center gap-1 min-w-0">
+                    {i > 0 && <ChevronRight className="w-3 h-3 shrink-0 text-faint" />}
+                    <button
+                      onClick={() => goTo(c.at)}
+                      disabled={c.at === trail.length - 1}
+                      className="truncate hover:text-foreground disabled:text-foreground disabled:hover:text-foreground"
+                    >
+                      {c.folder.name}
+                    </button>
+                  </span>
+                ),
+              )}
             </nav>
             {limited && atLimitRoot ? (
               <button onClick={() => setLimit(null)} disabled={savingFolder} className={`${btnGhost} shrink-0`}>
                 Show all of Drive
               </button>
             ) : (
-              !atLimitRoot && (
+              canLimitHere && (
                 <button onClick={() => here && setLimit(here.id)} disabled={savingFolder} className={`${btnGhost} shrink-0`}>
                   Limit to this folder
                 </button>
@@ -1414,8 +1426,9 @@ function DriveDialog({
             </div>
 
             {/* What you picked, before you commit to copying it. */}
+            {picked && (
             <div className="w-full sm:w-56 shrink-0">
-              {picked ? (
+              <>
                 <div className="space-y-2">
                   <div className="aspect-video rounded-sm bg-surface-sunken grid place-items-center overflow-hidden text-muted">
                     {picked.thumbnail ? (
@@ -1452,15 +1465,9 @@ function DriveDialog({
                     <div className="text-fine text-muted">Copying from Drive, this takes a moment for long videos…</div>
                   )}
                 </div>
-              ) : (
-                <div className="space-y-2">
-                  <div className="aspect-video rounded-sm border border-dashed border-border grid place-items-center text-faint">
-                    <ImageIcon className="w-5 h-5" />
-                  </div>
-                  <p className="text-fine text-faint">Pick a file to preview it.</p>
-                </div>
-              )}
+              </>
             </div>
+            )}
           </div>
           {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
         </div>
