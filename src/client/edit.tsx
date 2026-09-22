@@ -1223,7 +1223,7 @@ function LeftPanel({
 }) {
   const [uploading, setUploading] = useState(false);
   const [uploadErr, setUploadErr] = useState("");
-  const mediaReady = useMediaReady(assets);
+  const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(assets);
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1366,8 +1366,12 @@ function LeftPanel({
                   {isVideoAsset(a) ? (
                     preparing ? (
                       <div className="w-full h-20 grid place-items-center bg-surface-sunken text-fine text-muted gap-1">
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        Preparing
+                        {mediaIngesting.has(a.id) && (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Preparing
+                          </>
+                        )}
                       </div>
                     ) : a.media_uid ? (
                       <img src={frameUrl(a, 1)} alt="" className="w-full h-20 object-cover bg-black" />
@@ -1504,8 +1508,12 @@ function fmtBytes(n: number | null): string {
  * the library says so and the clip stays out of the timeline until it is.
  * Polls only while something is still pending.
  */
-function useMediaReady(assets: Asset[]): Set<string> {
+function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<string> } {
   const [ready, setReady] = useState<Set<string>>(new Set());
+  // Only what the service has actually reported as not ready yet. Until the
+  // first answer a clip is merely unknown, and calling it "Preparing" flashed
+  // that label on every page load for footage that had long been ready.
+  const [ingesting, setIngesting] = useState<Set<string>>(new Set());
   const pending = assets.filter((a) => a.media_uid && !ready.has(a.id)).map((a) => a.id);
   const key = pending.join(",");
 
@@ -1514,15 +1522,18 @@ function useMediaReady(assets: Asset[]): Set<string> {
     let dead = false;
     const check = async () => {
       const done: string[] = [];
+      const waiting: string[] = [];
       for (const id of key.split(",")) {
         try {
           const r = await api.get<{ ready: boolean }>(`/api/assets/${id}/playback`);
-          if (r.ready) done.push(id);
+          (r.ready ? done : waiting).push(id);
         } catch {
-          /* still ingesting, or a hiccup: ask again on the next pass */
+          /* a hiccup: ask again on the next pass */
         }
       }
-      if (!dead && done.length) setReady((cur) => new Set([...cur, ...done]));
+      if (dead) return;
+      if (done.length) setReady((cur) => new Set([...cur, ...done]));
+      setIngesting(new Set(waiting));
     };
     check();
     const t = setInterval(check, 5000);
@@ -1532,7 +1543,7 @@ function useMediaReady(assets: Asset[]): Set<string> {
     };
   }, [key]);
 
-  return ready;
+  return { ready, ingesting };
 }
 
 /** Search the org's Google Drive and copy picked files into the library. */
