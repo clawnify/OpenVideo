@@ -23,11 +23,14 @@ import {
   Pause,
   Play,
   Plus,
+  Redo2,
   Scissors,
   Sparkles,
   Trash2,
+  Undo2,
   Type as TypeIcon,
   Upload,
+  Wand2,
   Eye,
   EyeOff,
   Volume2,
@@ -57,6 +60,8 @@ export interface Asset {
   size: number;
   /** Seconds, probed client-side at upload (null for legacy/images). */
   duration?: number | null;
+  /** Set when the footage lives on the media service rather than in storage. */
+  media_uid?: string | null;
 }
 
 interface MainVideo {
@@ -196,7 +201,68 @@ const DEFAULT_TEXT_COLOR = "#ffffff";
 const DEFAULT_TEXT_BOX = "#00000080";
 
 const rid = () => Math.random().toString(36).slice(2, 10);
-const assetUrl = (a: Asset) => `/api/uploads/${encodeURIComponent(a.key)}`;
+/**
+ * One URL shape for every asset: the server redirects to app storage or to
+ * the media service, and a video element's range requests survive that.
+ */
+const assetUrl = (a: Asset) => `/api/assets/${encodeURIComponent(a.id)}/source`;
+
+/**
+ * Adaptive playback for one media-service clip. The library is fetched only
+ * when such a clip actually plays, and Safari needs none of it.
+ */
+function MediaVideo({
+  asset,
+  elementRef,
+  ...rest
+}: {
+  asset: Asset;
+  elementRef: (v: HTMLVideoElement | null) => void;
+} & React.VideoHTMLAttributes<HTMLVideoElement>) {
+  const ref = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const v = ref.current;
+    if (!v) return;
+    let dead = false;
+    let hls: { destroy: () => void } | null = null;
+
+    (async () => {
+      const play = await api.get<{ ready: boolean; hls?: string }>(`/api/assets/${asset.id}/playback`);
+      if (dead || !play.ready || !play.hls) return;
+      if (v.canPlayType("application/vnd.apple.mpegurl")) {
+        v.src = play.hls;
+        return;
+      }
+      const { default: Hls } = await import("hls.js");
+      if (dead || !Hls.isSupported()) return;
+      const instance = new Hls({ maxBufferLength: 30 });
+      instance.loadSource(play.hls);
+      instance.attachMedia(v);
+      hls = instance;
+    })().catch(() => {
+      /* the tile already shows whether the clip is ready */
+    });
+
+    return () => {
+      dead = true;
+      hls?.destroy();
+    };
+  }, [asset.id]);
+
+  return (
+    <video
+      ref={(v) => {
+        ref.current = v;
+        elementRef(v);
+      }}
+      {...rest}
+    />
+  );
+}
+
+/** A frame of media-service footage, which beats decoding the video for one. */
+const frameUrl = (a: Asset, at = 0) => `/api/assets/${encodeURIComponent(a.id)}/frame?t=${Math.max(0, at).toFixed(1)}`;
 const isVideoAsset = (a: Asset) => a.content_type.startsWith("video/");
 const isImageAsset = (a: Asset) => a.content_type.startsWith("image/");
 const isAudioAsset = (a: Asset) => a.content_type.startsWith("audio/");
@@ -308,7 +374,15 @@ function FilmStrip({ url, from, to, width, height }: { url: string; from: number
           v.addEventListener("seeked", done);
         });
         if (dead) return;
-        ctx.drawImage(v, i * fw, 0, fw, height);
+        // Fill the cell without distorting the frame: scale to cover, then
+        // take the middle of what does not fit. A 16:9 clip in a narrow cell
+        // was being squeezed sideways.
+        const vw = v.videoWidth || fw;
+        const vh = v.videoHeight || height;
+        const scale = Math.max(fw / vw, height / vh);
+        const sw = Math.min(vw, fw / scale);
+        const sh = Math.min(vh, height / scale);
+        ctx.drawImage(v, (vw - sw) / 2, (vh - sh) / 2, sw, sh, i * fw, 0, fw, height);
       }
     };
     return () => {
@@ -317,6 +391,30 @@ function FilmStrip({ url, from, to, width, height }: { url: string; from: number
     };
   }, [url, from, to, width, height]);
   return <canvas ref={ref} width={Math.max(1, width)} height={height} className="w-full h-full rounded-[3px]" />;
+}
+
+/**
+ * The same strip for media-service footage, from the service's own frames.
+ * Decoding a master in the browser to draw ten thumbnails competed with
+ * playback for the same bytes, which is part of what made it stutter.
+ */
+function FrameStrip({ asset, from, to, width }: { asset: Asset; from: number; to: number; width: number }) {
+  const n = Math.max(1, Math.min(10, Math.floor(width / 56)));
+  const span = Math.max(0.01, to - from);
+  return (
+    <div className="flex w-full h-full">
+      {Array.from({ length: n }, (_, i) => (
+        <img
+          key={i}
+          src={frameUrl(asset, from + ((i + 0.5) * span) / n)}
+          alt=""
+          loading="lazy"
+          className="h-full object-cover"
+          style={{ width: `${100 / n}%` }}
+        />
+      ))}
+    </div>
+  );
 }
 
 /** Simple peak waveform for an audio source. */
@@ -578,6 +676,15 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const [name, setName] = useState(initial.name);
   const [brief, setBrief] = useState(initial.brief ?? "");
   const [edl, setEdl] = useState<Edl>(initial.edl);
+  // Undo history. Every edit already replaces the whole document, so a step
+  // is just the document before it. A stroke (dragging a trim handle) folds
+  // into one step: undo should walk back an action, not a pixel.
+  const edlRef = useRef(edl);
+  edlRef.current = edl;
+  const past = useRef<Edl[]>([]);
+  const future = useRef<Edl[]>([]);
+  const lastEdit = useRef(0);
+  const [, bumpHistory] = useState(0);
   const [assets, setAssets] = useState<Asset[]>(initialAssets);
   const [sel, setSel] = useState<Sel>(null);
   const [tab, setTab] = useState<"media" | "audio" | "text">("media");
@@ -588,7 +695,13 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const [playing, setPlaying] = useState(false);
   const [playhead, setPlayhead] = useState(0);
   const [autocutOpen, setAutocutOpen] = useState(false);
+  const [askOpen, setAskOpen] = useState(false);
   const playheadRef = useRef(0);
+  // While a video is playing it IS the clock: the wall clock only fills in
+  // for stretches with no video (stills, text). Driving the wall clock and
+  // seeking the video to match made every rebuffer force a seek, which
+  // rebuffered again — the stutter people saw on long footage.
+  const mediaClock = useRef<(() => number | null) | null>(null);
   const { srcDur, resolveAsset } = useSourceDurations(edl, assets);
 
   // ── persistence (debounced) ───────────────────────────────────────────────
@@ -609,13 +722,66 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     return () => clearTimeout(t);
   }, [edl, name, brief, initial.id, initial.edl, initial.name, initial.brief]);
 
-  const update = useCallback((fn: (draft: Edl) => void) => {
-    setEdl((cur) => {
-      const draft = structuredClone(cur);
-      fn(draft);
-      return draft;
-    });
+  /**
+   * Replace the document, remembering the version before it. `coalesce` folds
+   * this edit into the previous step when they belong to the same gesture.
+   */
+  const commit = useCallback((next: Edl, coalesce = false) => {
+    const cur = edlRef.current;
+    if (next === cur) return;
+    const now = Date.now();
+    if (!(coalesce && now - lastEdit.current < 600)) {
+      past.current = [...past.current, cur].slice(-50);
+    }
+    lastEdit.current = now;
+    future.current = [];
+    edlRef.current = next;
+    setEdl(next);
+    bumpHistory((n) => n + 1);
   }, []);
+
+  const update = useCallback(
+    (fn: (draft: Edl) => void, coalesce = false) => {
+      const draft = structuredClone(edlRef.current);
+      fn(draft);
+      commit(draft, coalesce);
+    },
+    [commit],
+  );
+
+  const undo = useCallback(() => {
+    const prev = past.current.pop();
+    if (!prev) return;
+    future.current = [...future.current, edlRef.current];
+    edlRef.current = prev;
+    setEdl(prev);
+    setSel(null);
+    bumpHistory((n) => n + 1);
+  }, []);
+
+  const redo = useCallback(() => {
+    const next = future.current.pop();
+    if (!next) return;
+    past.current = [...past.current, edlRef.current];
+    edlRef.current = next;
+    setEdl(next);
+    setSel(null);
+    bumpHistory((n) => n + 1);
+  }, []);
+
+  // Cmd+Z / Ctrl+Z, and Shift for redo. Ignored while typing.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "z") return;
+      const el = e.target as HTMLElement | null;
+      if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+      e.preventDefault();
+      if (e.shiftKey) redo();
+      else undo();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [undo, redo]);
 
   // ── derived timeline ──────────────────────────────────────────────────────
   const segments = useMemo(() => mainSegments(edl, srcDur), [edl, srcDur]);
@@ -651,7 +817,10 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     const tick = (now: number) => {
       const dt = (now - last) / 1000;
       last = now;
-      let t = playheadRef.current + dt;
+      const fromMedia = mediaClock.current?.();
+      let t = fromMedia !== null && fromMedia !== undefined && Number.isFinite(fromMedia)
+        ? fromMedia
+        : playheadRef.current + dt;
       if (t >= total) {
         t = total;
         setPlaying(false);
@@ -752,6 +921,31 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         </span>
         <div className="flex-1" />
         <button
+          onClick={undo}
+          disabled={past.current.length === 0}
+          title="Undo (Cmd+Z)"
+          aria-label="Undo"
+          className={btnIcon}
+        >
+          <Undo2 className="w-4 h-4" />
+        </button>
+        <button
+          onClick={redo}
+          disabled={future.current.length === 0}
+          title="Redo (Shift+Cmd+Z)"
+          aria-label="Redo"
+          className={btnIcon}
+        >
+          <Redo2 className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => setAskOpen(true)}
+          className={btnSecondary}
+          title="Change the cut by describing it"
+        >
+          <Wand2 className="w-4 h-4" /> <span className="hidden sm:inline">Ask</span>
+        </button>
+        <button
           onClick={() => setAutocutOpen(true)}
           className={btnSecondary}
           title="Assemble a cut from several clips with AI"
@@ -785,6 +979,18 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         </div>
       </div>
 
+      {askOpen && (
+        <AskDialog
+          projectId={initial.id}
+          onClose={() => setAskOpen(false)}
+          onApplied={(next) => {
+            // One step for the whole instruction, like Auto-cut.
+            commit(next);
+            setSel(null);
+          }}
+        />
+      )}
+
       {autocutOpen && (
         <AutocutModal
           projectId={initial.id}
@@ -793,7 +999,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           setBrief={setBrief}
           onClose={() => setAutocutOpen(false)}
           onApplied={(next) => {
-            setEdl(next);
+            // One step for the whole AI pass: undo puts the cut back as it was.
+            commit(next);
             setSel(null);
             setAutocutOpen(false);
             seek(0);
@@ -819,6 +1026,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           total={total}
           playhead={playhead}
           playheadRef={playheadRef}
+          mediaClock={mediaClock}
           playing={playing}
           resolveAsset={resolveAsset}
           sel={sel}
@@ -975,6 +1183,7 @@ function LeftPanel({
 }) {
   const [uploading, setUploading] = useState(false);
   const [uploadErr, setUploadErr] = useState("");
+  const mediaReady = useMediaReady(assets);
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1103,16 +1312,28 @@ function LeftPanel({
             />
             {uploadErr && <div className="text-fine text-danger mb-2">{uploadErr}</div>}
             <div className="space-y-2">
-              {list.map((a) => (
+              {list.map((a) => {
+                const preparing = !!a.media_uid && !mediaReady.has(a.id);
+                return (
                 <button
                   key={a.id}
-                  onClick={() => onAdd(a)}
-                  title="Add to timeline"
+                  onClick={() => !preparing && onAdd(a)}
+                  disabled={preparing}
+                  title={preparing ? "Still being prepared" : "Add to timeline"}
                   aria-label={`Add ${a.name} to the timeline`}
-                  className="w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group"
+                  className="w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group disabled:hover:bg-surface"
                 >
                   {isVideoAsset(a) ? (
-                    <video src={assetUrl(a)} muted preload="metadata" className="w-full h-20 object-cover bg-black" />
+                    preparing ? (
+                      <div className="w-full h-20 grid place-items-center bg-surface-sunken text-fine text-muted gap-1">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Preparing
+                      </div>
+                    ) : a.media_uid ? (
+                      <img src={frameUrl(a, 1)} alt="" className="w-full h-20 object-cover bg-black" />
+                    ) : (
+                      <video src={assetUrl(a)} muted preload="metadata" className="w-full h-20 object-cover bg-black" />
+                    )
                   ) : isImageAsset(a) ? (
                     <img src={assetUrl(a)} alt="" className="w-full h-20 object-cover bg-black" />
                   ) : (
@@ -1122,7 +1343,8 @@ function LeftPanel({
                   )}
                   <div className="px-2 py-1.5 text-fine truncate text-muted group-hover:text-foreground">{a.name}</div>
                 </button>
-              ))}
+                );
+              })}
               {list.length === 0 && (
                 <p className="text-fine text-muted py-4 text-center">
                   {tab === "audio"
@@ -1135,6 +1357,81 @@ function LeftPanel({
         )}
       </div>
     </div>
+  );
+}
+
+// ── ask for a change ────────────────────────────────────────────────────────
+
+/**
+ * Change the cut by asking. The model calls checked operations on the server
+ * rather than writing the document, and the answer says what it did, so an
+ * edit is reviewable instead of a black box. The whole pass is one undo step.
+ */
+function AskDialog({
+  projectId,
+  onClose,
+  onApplied,
+}: {
+  projectId: string;
+  onClose: () => void;
+  onApplied: (edl: Edl) => void;
+}) {
+  const [instruction, setInstruction] = useState("");
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState("");
+
+  const run = async () => {
+    if (!instruction.trim()) return;
+    setRunning(true);
+    setErr("");
+    try {
+      const out = await api.send<{ edl: Edl; said: string; applied: string[] }>(
+        "POST",
+        `/api/projects/${projectId}/instruct`,
+        { instruction: instruction.trim() },
+      );
+      onApplied(out.edl);
+      onClose();
+    } catch (e) {
+      setErr(String((e as Error).message));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <Dialog
+      title="Ask for a change"
+      icon={<Wand2 className="w-4 h-4 text-muted" />}
+      description="Describe the change in your words. It edits the cut you have, one step you can undo."
+      onClose={onClose}
+      footer={
+        <>
+          <button onClick={onClose} className={btnGhost}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button onClick={run} disabled={running || !instruction.trim()} className={btnPrimary}>
+            {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />} Apply
+          </button>
+        </>
+      }
+    >
+      <div className="mt-4">
+        <textarea
+          className={`${inputCls} min-h-16`}
+          placeholder="e.g. drop the first two seconds of clip 1, put the demo first, and add a title that says Spring Open Day for the first 3 seconds"
+          value={instruction}
+          onChange={(e) => setInstruction(e.target.value)}
+          data-autofocus
+        />
+        <p className="mt-2 text-fine text-faint">
+          It can trim, split, delete, reorder and mute clips, add or remove on-screen text, and switch the video
+          between landscape, vertical and square.
+        </p>
+        {running && <div className="mt-2 text-fine text-muted">Working through the cut…</div>}
+        {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
+      </div>
+    </Dialog>
   );
 }
 
@@ -1160,6 +1457,42 @@ function fmtBytes(n: number | null): string {
   if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
   return `${Math.max(1, Math.round(n / 1e3))} KB`;
+}
+
+/**
+ * Footage handed to the media service is not playable while it ingests, so
+ * the library says so and the clip stays out of the timeline until it is.
+ * Polls only while something is still pending.
+ */
+function useMediaReady(assets: Asset[]): Set<string> {
+  const [ready, setReady] = useState<Set<string>>(new Set());
+  const pending = assets.filter((a) => a.media_uid && !ready.has(a.id)).map((a) => a.id);
+  const key = pending.join(",");
+
+  useEffect(() => {
+    if (!key) return;
+    let dead = false;
+    const check = async () => {
+      const done: string[] = [];
+      for (const id of key.split(",")) {
+        try {
+          const r = await api.get<{ ready: boolean }>(`/api/assets/${id}/playback`);
+          if (r.ready) done.push(id);
+        } catch {
+          /* still ingesting, or a hiccup: ask again on the next pass */
+        }
+      }
+      if (!dead && done.length) setReady((cur) => new Set([...cur, ...done]));
+    };
+    check();
+    const t = setInterval(check, 5000);
+    return () => {
+      dead = true;
+      clearInterval(t);
+    };
+  }, [key]);
+
+  return ready;
 }
 
 /** Search the org's Google Drive and copy picked files into the library. */
@@ -1352,7 +1685,7 @@ function DriveDialog({
           />
 
           <div className="mt-2 flex flex-col sm:flex-row gap-3">
-            <div className="flex-1 min-w-0 max-h-80 overflow-y-auto -mx-2">
+            <div className="flex-1 min-w-0 max-h-80 overflow-y-auto scroll-slim -ml-2 pr-1">
               {files === null ? (
                 /* Loading is the shape of the answer, never a spinner. */
                 [0, 1, 2].map((i) => (
@@ -1485,6 +1818,7 @@ function Player({
   total,
   playhead,
   playheadRef,
+  mediaClock,
   playing,
   resolveAsset,
   sel,
@@ -1497,11 +1831,14 @@ function Player({
   total: number;
   playhead: number;
   playheadRef: React.MutableRefObject<number>;
+  /** Filled here so the master clock can follow the playing video. */
+  mediaClock: React.MutableRefObject<(() => number | null) | null>;
   playing: boolean;
   resolveAsset: (src: string) => Asset | undefined;
   sel: Sel;
   setSel: (s: Sel) => void;
-  update: (fn: (d: Edl) => void) => void;
+  /** `coalesce` folds this edit into the previous undo step (one drag, one step). */
+  update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -1536,6 +1873,24 @@ function Player({
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
 
+  // The playing video's position on the timeline, for the master clock.
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  useEffect(() => {
+    mediaClock.current = () => {
+      const seg = activeRef.current;
+      if (!seg || seg.el.type !== "video" || seg.dur <= 0) return null;
+      const v = videoRefs.current.get(seg.el.id);
+      // A paused or starved element is not a clock: let the wall clock carry
+      // on rather than freezing the playhead while the buffer fills.
+      if (!v || v.paused || v.readyState < 2) return null;
+      return seg.start + (v.currentTime - (seg.el.trimStart ?? 0));
+    };
+    return () => {
+      mediaClock.current = null;
+    };
+  }, [mediaClock]);
+
   // Sync media elements to the master clock (drift-corrected seeks).
   useEffect(() => {
     const t = playhead;
@@ -1545,7 +1900,11 @@ function Player({
       const isActive = seg === active && seg.dur > 0;
       const wanted = (seg.el.trimStart ?? 0) + (t - seg.start);
       if (isActive) {
-        if (Math.abs(v.currentTime - wanted) > 0.18) v.currentTime = wanted;
+        // Playing, the video leads and needs no correction; only a real jump
+        // (a scrub, or a cut to another clip) is worth a seek, because each
+        // one empties the buffer. Paused, follow the playhead closely.
+        const jumped = Math.abs(v.currentTime - wanted) > (playing ? 0.75 : 0.05);
+        if (jumped && !v.seeking) v.currentTime = wanted;
         v.volume = Math.min(1, seg.el.volume ?? 1);
         v.muted = seg.el.sourceAudio === false;
         if (playing && v.paused) v.play().catch(() => {});
@@ -1590,7 +1949,7 @@ function Player({
           t.x = Math.round(nx * 1000) / 1000;
           t.y = Math.round(ny * 1000) / 1000;
         }
-      });
+      }, true);
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -1623,16 +1982,29 @@ function Player({
               style: { objectFit: fit } as React.CSSProperties,
             };
             return seg.el.type === "video" ? (
-              <video
-                key={seg.el.id}
-                ref={(v) => {
-                  if (v) videoRefs.current.set(seg.el.id, v);
-                }}
-                src={assetUrl(a)}
-                preload="auto"
-                playsInline
-                {...common}
-              />
+              a.media_uid ? (
+                <MediaVideo
+                  key={seg.el.id}
+                  asset={a}
+                  elementRef={(v) => {
+                    if (v) videoRefs.current.set(seg.el.id, v);
+                  }}
+                  preload="auto"
+                  playsInline
+                  {...common}
+                />
+              ) : (
+                <video
+                  key={seg.el.id}
+                  ref={(v) => {
+                    if (v) videoRefs.current.set(seg.el.id, v);
+                  }}
+                  src={assetUrl(a)}
+                  preload="auto"
+                  playsInline
+                  {...common}
+                />
+              )
             ) : (
               <img key={seg.el.id} src={assetUrl(a)} {...common} />
             );
@@ -1768,7 +2140,8 @@ function Inspector({
   pane: Pane;
   edl: Edl;
   sel: Sel;
-  update: (fn: (d: Edl) => void) => void;
+  /** `coalesce` folds this edit into the previous undo step (one drag, one step). */
+  update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
   srcDur: (src: string) => number | undefined;
   resolveAsset: (src: string) => Asset | undefined;
   segments: ReturnType<typeof mainSegments>;
@@ -2114,7 +2487,8 @@ function TimelinePanel({
   seek: (t: number) => void;
   sel: Sel;
   setSel: (s: Sel) => void;
-  update: (fn: (d: Edl) => void) => void;
+  /** `coalesce` folds this edit into the previous undo step (one drag, one step). */
+  update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
   srcDur: (src: string) => number | undefined;
   resolveAsset: (src: string) => Asset | undefined;
   splitAtPlayhead: () => void;
@@ -2182,7 +2556,7 @@ function TimelinePanel({
             (t as MainVideo).trimEnd = Math.round(ne * 100) / 100;
           }
         }
-      });
+      }, true);
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -2209,7 +2583,7 @@ function TimelinePanel({
         const t = get(d) as { startTime: number; duration?: number };
         if (mode === "move") t.startTime = Math.max(0, Math.round((orig.startTime + ds) * 100) / 100);
         else t.duration = Math.max(0.2, Math.round(((orig.duration ?? 1) + ds) * 100) / 100);
-      });
+      }, true);
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -2312,13 +2686,22 @@ function TimelinePanel({
                   title={a?.name}
                 >
                   {seg.el.type === "video" && a && seg.dur > 0 ? (
-                    <FilmStrip
-                      url={assetUrl(a)}
-                      from={(seg.el as MainVideo).trimStart ?? 0}
-                      to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
-                      width={Math.round(w)}
-                      height={MAIN_H - 8}
-                    />
+                    a.media_uid ? (
+                      <FrameStrip
+                        asset={a}
+                        from={(seg.el as MainVideo).trimStart ?? 0}
+                        to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
+                        width={Math.round(w)}
+                      />
+                    ) : (
+                      <FilmStrip
+                        url={assetUrl(a)}
+                        from={(seg.el as MainVideo).trimStart ?? 0}
+                        to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
+                        width={Math.round(w)}
+                        height={MAIN_H - 8}
+                      />
+                    )
                   ) : a ? (
                     <img src={assetUrl(a)} className="w-full h-full object-cover" />
                   ) : null}

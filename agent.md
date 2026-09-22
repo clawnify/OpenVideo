@@ -17,6 +17,14 @@ a file as `asset:<id>`. Users upload from the editor's Media panel; you can
 upload with a multipart `POST /api/assets` (field `file`), which returns the
 new asset row.
 
+A video imported from Drive goes to the managed media service rather than this
+app's storage: it can be hours long, the service fetches it from the link
+itself, and the export reads only the seconds a cut needs. Such an asset
+carries `media_uid`, its `size` is 0, and it is not playable until
+`GET /api/assets/{id}/playback` answers `ready`. Everything else (stills,
+sound, uploads) stays in app storage, where a file has to be 500 MB or smaller
+to export.
+
 When the org has Google Drive (or Google Workspace) connected, files can also come from Google
 Drive: search with `GET /api/drive/files`, then `POST /api/drive/import` with a
 file's `id` to copy it into the library. The import returns the new asset row,
@@ -37,13 +45,17 @@ back as `folders`); a search looks inside that folder only, never the subtree.
 | POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
 | GET  | `/api/drive` | Whether Google Drive is connected: `{ connected }` |
 | GET  | `/api/drive/files?kind=media\|audio&q=&page=` | Search the org's Drive, newest first → `{ files, nextPageToken }` |
-| POST | `/api/drive/import` | `{ fileId, duration? }` copies a Drive file into the library → the asset |
+| POST | `/api/drive/import` | `{ fileId, duration? }` brings a Drive file into the library → the asset |
+| GET  | `/api/assets/{id}/source` | The asset's bytes, wherever they live (a redirect) |
+| GET  | `/api/assets/{id}/playback` | For long footage: `{ ready, hls, thumbnail, duration }` |
+| GET  | `/api/assets/{id}/frame?t=` | One frame of long footage, as an image |
 | PUT  | `/api/drive/folder` | `{ folderId }` limits browsing to one folder, `null` clears it |
 | GET  | `/api/projects` | List projects |
 | GET  | `/api/projects/{id}` | Get one (includes the `edl` document and `brief`) |
 | POST | `/api/projects` | Create `{ name, brief?, edl? }` (empty 720p timeline if omitted) |
 | PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
+| POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied }` |
 | DELETE | `/api/projects/{id}` | Delete a project and its export history |
 | POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job (blocks until done) |
 | GET  | `/api/exports?project_id={id}` | Export history |

@@ -9,6 +9,7 @@
 
 import { get, run } from "./db";
 import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
+import { prepareMedia } from "./media";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -26,6 +27,7 @@ export interface ExportConfig {
 interface AssetRow {
   id: string;
   key: string;
+  media_uid?: string | null;
   name: string;
   content_type: string;
   size: number;
@@ -45,6 +47,11 @@ export interface ExportFailure {
  * returns its "file:…" src. Used by exports (every referenced asset) and by
  * footage analysis (one asset at a time).
  */
+/** What the edit service accepts for one staged file (services/staging.ts). */
+const MAX_STAGE_BYTES = 500 * 1024 * 1024;
+
+const mb = (n: number) => `${Math.round(n / (1024 * 1024))} MB`;
+
 export async function ensureStagedSrc(
   assetId: string,
   cfg: ExportConfig,
@@ -55,6 +62,36 @@ export async function ensureStagedSrc(
       failure: {
         error: "asset_not_found",
         detail: `no media-library asset with id "${assetId}" — list assets with GET /api/assets`,
+      },
+    };
+  }
+
+  // Footage on the media service is cut where it lies: the edit service reads
+  // only the seconds the cut needs, so nothing is staged and no size applies.
+  if (asset.media_uid) {
+    const prepared = await prepareMedia(cfg, asset.media_uid);
+    if ("failure" in prepared) {
+      return { failure: { error: prepared.failure.error, detail: prepared.failure.detail } };
+    }
+    if (prepared.media.download?.status !== "ready") {
+      return {
+        failure: {
+          error: "source_not_ready",
+          detail: `"${asset.name}" is still being prepared for editing — try again in a moment`,
+        },
+      };
+    }
+    return { src: `media:${asset.media_uid}` };
+  }
+
+  // The edit service accepts a staged file up to this size. Without the check
+  // the upload dies part-way and the runtime reports a lost connection, which
+  // tells the user nothing about the actual problem.
+  if (asset.size > MAX_STAGE_BYTES) {
+    return {
+      failure: {
+        error: "clip_too_large",
+        detail: `"${asset.name}" is ${mb(asset.size)}; a clip has to be ${mb(MAX_STAGE_BYTES)} or smaller to export or analyse. Trim it, or import a smaller version.`,
       },
     };
   }
