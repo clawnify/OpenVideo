@@ -1,7 +1,8 @@
-// Google Drive as a media source, through the org's Google Workspace
-// connection. Browsing is a Drive search; importing copies the file into this
-// app's own storage, exactly like an upload, so the editor and the export
-// never read from Drive themselves.
+// Google Drive as a media source, through the org's Google Drive connection
+// or, failing that, its Google Workspace one (which includes Drive). Browsing
+// is a Drive search; importing copies the file into this app's own storage,
+// exactly like an upload, so the editor and the export never read from Drive
+// themselves.
 //
 // The connection's broker never hands this app a raw Google token, so the
 // bytes come the one way it allows: the download action parks the file behind
@@ -9,7 +10,10 @@
 
 import { connect, describe, type ConnectionsEnv } from "@clawnify/connections";
 
-const SERVICE = "googlesuper";
+// Both toolkits carry the same Drive actions, prefixed with their own name.
+// Google Drive comes first: it is the connection a studio makes for its files.
+const SERVICES = ["googledrive", "googlesuper"] as const;
+type Service = (typeof SERVICES)[number];
 
 /** What the picker lists. `duration` is seconds, for videos Drive has probed. */
 export interface DriveFile {
@@ -24,9 +28,25 @@ export interface DriveFile {
 /** A Drive file id: letters, digits, `-` and `_`, never a path. */
 export const DRIVE_FILE_ID = /^[A-Za-z0-9_-]{10,200}$/;
 
-export async function driveStatus(env: ConnectionsEnv): Promise<{ connected: boolean; hint: string | null }> {
-  const [entry] = await describe(env, undefined, [{ service: SERVICE, as: "integration" }]);
-  return { connected: !!entry?.connected, hint: entry?.hint ?? null };
+/** The first Google connection the org has that reaches Drive, if any. */
+async function driveService(env: ConnectionsEnv): Promise<Service | null> {
+  const entries = await describe(
+    env,
+    undefined,
+    SERVICES.map((service) => ({ service, as: "integration" as const })),
+  );
+  return SERVICES.find((s) => entries.some((e) => e.id === s && e.connected)) ?? null;
+}
+
+async function requireDriveService(env: ConnectionsEnv): Promise<Service> {
+  const service = await driveService(env);
+  if (!service) throw new Error("Google Drive is not connected");
+  return service;
+}
+
+export async function driveStatus(env: ConnectionsEnv): Promise<{ connected: boolean; service: Service | null }> {
+  const service = await driveService(env);
+  return { connected: service !== null, service };
 }
 
 /**
@@ -44,7 +64,8 @@ export async function listDriveFiles(
   const search = opts.search?.replace(/['\\]/g, " ").trim();
   if (search) q += ` and name contains '${search}'`;
 
-  const data = (await connect(SERVICE, env).run("GOOGLESUPER_FIND_FILE", {
+  const service = await requireDriveService(env);
+  const data = (await connect(service, env).run(`${service.toUpperCase()}_FIND_FILE`, {
     q,
     orderBy: "modifiedTime desc",
     pageSize: 50,
@@ -80,7 +101,8 @@ export async function driveDownloadLink(
   env: ConnectionsEnv,
   fileId: string,
 ): Promise<{ url: string; name: string; mimeType: string }> {
-  const data = (await connect(SERVICE, env).run("GOOGLESUPER_DOWNLOAD_FILE", { fileId })) as {
+  const service = await requireDriveService(env);
+  const data = (await connect(service, env).run(`${service.toUpperCase()}_DOWNLOAD_FILE`, { fileId })) as {
     downloaded_file_content?: { s3url?: string; name?: string; mimetype?: string };
   };
   const file = data.downloaded_file_content;

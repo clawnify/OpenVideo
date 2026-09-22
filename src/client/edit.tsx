@@ -1235,7 +1235,7 @@ function DriveDialog({
     >
       {connected === false ? (
         <p className="mt-4 text-body-sm text-muted">
-          Google Drive isn't connected yet. Connect Google Workspace in your Clawnify dashboard under
+          Google Drive isn't connected yet. Connect Google Drive in your Clawnify dashboard under
           Integrations, then open this again.
         </p>
       ) : (

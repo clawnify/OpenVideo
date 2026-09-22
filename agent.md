@@ -17,12 +17,12 @@ a file as `asset:<id>`. Users upload from the editor's Media panel; you can
 upload with a multipart `POST /api/assets` (field `file`), which returns the
 new asset row.
 
-When the org has Google Workspace connected, files can also come from Google
+When the org has Google Drive (or Google Workspace) connected, files can also come from Google
 Drive: search with `GET /api/drive/files`, then `POST /api/drive/import` with a
 file's `id` to copy it into the library. The import returns the new asset row,
 the same as an upload, and the project references it as `asset:<id>`. Check
 `GET /api/drive` first: `{ "connected": false }` means the org has to connect
-Google Workspace in the Clawnify dashboard before any of this works.
+Google Drive in the Clawnify dashboard before any of this works.
 
 ## API
 
