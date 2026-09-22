@@ -13,8 +13,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
+  ChevronRight,
   Cloud,
   Film,
+  Folder,
   Image as ImageIcon,
   Loader2,
   Music,
@@ -1145,6 +1147,12 @@ interface DriveFile {
   size: number | null;
   modifiedTime: string | null;
   duration: number | null;
+  thumbnail: string | null;
+}
+
+interface DriveFolder {
+  id: string;
+  name: string;
 }
 
 function fmtBytes(n: number | null): string {
@@ -1164,42 +1172,90 @@ function DriveDialog({
   onImported: (a: Asset) => void;
   onClose: () => void;
 }) {
-  const [connected, setConnected] = useState<boolean | null>(null);
+  const [status, setStatus] = useState<{ connected: boolean; folder: DriveFolder | null } | null>(null);
+  // Where we are, deepest last. The first entry is the org's folder limit, or
+  // My Drive when there is none; the picker can never walk above it.
+  const [trail, setTrail] = useState<DriveFolder[]>([]);
   const [search, setSearch] = useState("");
+  const [folders, setFolders] = useState<DriveFolder[]>([]);
   const [files, setFiles] = useState<DriveFile[] | null>(null);
   const [next, setNext] = useState<string | null>(null);
+  const [picked, setPicked] = useState<DriveFile | null>(null);
   const [importing, setImporting] = useState<string | null>(null);
   const [imported, setImported] = useState<Set<string>>(new Set());
+  const [savingFolder, setSavingFolder] = useState(false);
   const [err, setErr] = useState("");
+
+  const here = trail[trail.length - 1];
 
   useEffect(() => {
     api
-      .get<{ connected: boolean }>("/api/drive")
-      .then((s) => setConnected(s.connected))
+      .get<{ connected: boolean; folder: DriveFolder | null }>("/api/drive")
+      .then((s) => {
+        setStatus(s);
+        setTrail([s.folder ?? { id: "root", name: "My Drive" }]);
+      })
       .catch((e) => setErr(String((e as Error).message)));
   }, []);
 
   const load = useCallback(
     async (page?: string) => {
-      const qs = new URLSearchParams({ kind });
+      if (!here) return;
+      const qs = new URLSearchParams({ kind, folder: here.id });
       if (search.trim()) qs.set("q", search.trim());
       if (page) qs.set("page", page);
-      const r = await api.get<{ files: DriveFile[]; nextPageToken: string | null }>(`/api/drive/files?${qs}`);
+      const r = await api.get<{ folders: DriveFolder[]; files: DriveFile[]; nextPageToken: string | null }>(
+        `/api/drive/files?${qs}`,
+      );
+      setFolders(page ? (cur) => [...cur, ...r.folders] : r.folders);
       setFiles((cur) => (page && cur ? [...cur, ...r.files] : r.files));
       setNext(r.nextPageToken);
     },
-    [kind, search],
+    [kind, search, here],
   );
 
-  // Search as you type, a beat after the last key.
+  // Search as you type, a beat after the last key; also reloads on a move.
   useEffect(() => {
-    if (!connected) return;
+    if (!status?.connected || !here) return;
     const t = setTimeout(() => {
       setErr("");
       load().catch((e) => setErr(String((e as Error).message)));
     }, 300);
     return () => clearTimeout(t);
-  }, [connected, load]);
+  }, [status, load, here]);
+
+  const openFolder = (f: DriveFolder) => {
+    setTrail((cur) => [...cur, f]);
+    setFiles(null);
+    setFolders([]);
+    setPicked(null);
+    setSearch("");
+  };
+
+  const goTo = (i: number) => {
+    setTrail((cur) => cur.slice(0, i + 1));
+    setFiles(null);
+    setFolders([]);
+    setPicked(null);
+    setSearch("");
+  };
+
+  const setLimit = async (folderId: string | null) => {
+    setSavingFolder(true);
+    setErr("");
+    try {
+      const r = await api.send<{ folder: DriveFolder | null }>("PUT", "/api/drive/folder", { folderId });
+      setStatus((cur) => (cur ? { ...cur, folder: r.folder } : cur));
+      setTrail([r.folder ?? { id: "root", name: "My Drive" }]);
+      setFiles(null);
+      setFolders([]);
+      setPicked(null);
+    } catch (e) {
+      setErr(String((e as Error).message));
+    } finally {
+      setSavingFolder(false);
+    }
+  };
 
   const importFile = async (f: DriveFile) => {
     setImporting(f.id);
@@ -1221,97 +1277,183 @@ function DriveDialog({
   const kindIcon = (t: string) =>
     t.startsWith("video/") ? <Film className="w-4 h-4" /> : t.startsWith("audio/") ? <Music className="w-4 h-4" /> : <ImageIcon className="w-4 h-4" />;
 
+  const limited = !!status?.folder;
+  const atLimitRoot = trail.length === 1;
+
   return (
     <Dialog
       title="Import from Google Drive"
       icon={<Cloud className="w-4 h-4 text-muted" />}
       description="Files are copied into your media library, so an edit keeps working if the original is moved or deleted."
       onClose={onClose}
+      size="lg"
       footer={
         <button onClick={onClose} className={btnGhost}>
           Done <Kbd>esc</Kbd>
         </button>
       }
     >
-      {connected === false ? (
+      {status?.connected === false ? (
         <p className="mt-4 text-body-sm text-muted">
           Google Drive isn't connected yet. Connect Google Drive in your Clawnify dashboard under
           Integrations, then open this again.
         </p>
       ) : (
         <div className="mt-4">
+          {/* Where you are, and the org's one folder rule. */}
+          <div className="flex items-center gap-2 mb-2 min-h-7">
+            <nav className="flex items-center gap-1 min-w-0 flex-1 text-fine text-muted">
+              {trail.map((f, i) => (
+                <span key={f.id} className="flex items-center gap-1 min-w-0">
+                  {i > 0 && <ChevronRight className="w-3 h-3 shrink-0 text-faint" />}
+                  <button
+                    onClick={() => goTo(i)}
+                    disabled={i === trail.length - 1}
+                    className="truncate hover:text-foreground disabled:text-foreground disabled:hover:text-foreground"
+                  >
+                    {f.name}
+                  </button>
+                </span>
+              ))}
+            </nav>
+            {limited && atLimitRoot ? (
+              <button onClick={() => setLimit(null)} disabled={savingFolder} className={`${btnGhost} shrink-0`}>
+                Show all of Drive
+              </button>
+            ) : (
+              !atLimitRoot && (
+                <button onClick={() => here && setLimit(here.id)} disabled={savingFolder} className={`${btnGhost} shrink-0`}>
+                  Limit to this folder
+                </button>
+              )
+            )}
+          </div>
+
           <input
             className={inputCls}
-            placeholder={kind === "audio" ? "Search audio in your Drive" : "Search videos and images in your Drive"}
+            placeholder={kind === "audio" ? "Search audio in this folder" : "Search videos and images in this folder"}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             aria-label="Search Google Drive"
             data-autofocus
           />
-          <div className="mt-2 max-h-80 overflow-y-auto -mx-2">
-            {files === null ? (
-              /* Loading is the shape of the answer, never a spinner. */
-              [0, 1, 2].map((i) => (
-                <div key={i} className="flex items-center gap-3 px-2 py-2">
-                  <div className="w-8 h-8 rounded-sm bg-surface-sunken animate-pulse" />
-                  <div className="flex-1 space-y-1.5">
-                    <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
-                    <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+
+          <div className="mt-2 flex gap-3">
+            <div className="flex-1 min-w-0 max-h-80 overflow-y-auto -mx-2">
+              {files === null ? (
+                /* Loading is the shape of the answer, never a spinner. */
+                [0, 1, 2].map((i) => (
+                  <div key={i} className="flex items-center gap-3 px-2 py-2">
+                    <div className="w-12 h-9 rounded-sm bg-surface-sunken animate-pulse" />
+                    <div className="flex-1 space-y-1.5">
+                      <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
+                      <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+                    </div>
                   </div>
-                </div>
-              ))
-            ) : files.length === 0 ? (
-              <p className="px-2 py-4 text-center text-fine text-muted">
-                {search.trim() ? "Nothing in your Drive matches that name." : "No files of this kind in your Drive."}
-              </p>
-            ) : (
-              files.map((f) => {
-                const done = imported.has(f.id);
-                const meta = [
-                  fmtBytes(f.size),
-                  f.duration ? fmtTime(f.duration) : "",
-                  f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : "",
-                ].filter(Boolean);
-                return (
-                  <button
-                    key={f.id}
-                    onClick={() => importFile(f)}
-                    disabled={importing !== null || done}
-                    title={done ? "In your library" : "Import into the library"}
-                    className="w-full flex items-center gap-3 px-2 py-2 rounded-sm text-left hover:bg-surface-sunken disabled:hover:bg-transparent"
-                  >
-                    <span className="grid place-items-center w-8 h-8 rounded-sm bg-surface-sunken text-muted shrink-0">
-                      {kindIcon(f.mimeType)}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-body-sm">{f.name}</span>
-                      <span className="block text-fine text-faint tabular-nums">{meta.join(" · ")}</span>
-                    </span>
-                    {importing === f.id ? (
-                      <Loader2 className="w-4 h-4 animate-spin text-muted shrink-0" />
-                    ) : done ? (
-                      <Check className="w-4 h-4 text-success shrink-0" />
+                ))
+              ) : folders.length === 0 && files.length === 0 ? (
+                <p className="px-2 py-4 text-center text-fine text-muted">
+                  {search.trim() ? "Nothing in this folder matches that name." : "This folder is empty."}
+                </p>
+              ) : (
+                <>
+                  {folders.map((f) => (
+                    <button
+                      key={f.id}
+                      onClick={() => openFolder(f)}
+                      className="w-full flex items-center gap-3 px-2 py-2 rounded-sm text-left hover:bg-surface-sunken"
+                    >
+                      <span className="grid place-items-center w-12 h-9 rounded-sm bg-surface-sunken text-muted shrink-0">
+                        <Folder className="w-4 h-4" />
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-body-sm">{f.name}</span>
+                      <ChevronRight className="w-4 h-4 text-faint shrink-0" />
+                    </button>
+                  ))}
+                  {files.map((f) => {
+                    const done = imported.has(f.id);
+                    return (
+                      <button
+                        key={f.id}
+                        onClick={() => setPicked(f)}
+                        className={`w-full flex items-center gap-3 px-2 py-2 rounded-sm text-left hover:bg-surface-sunken ${picked?.id === f.id ? "bg-surface-sunken" : ""}`}
+                      >
+                        <span className="grid place-items-center w-12 h-9 rounded-sm bg-surface-sunken text-muted shrink-0 overflow-hidden">
+                          {f.thumbnail ? (
+                            <img src={f.thumbnail} alt="" className="w-full h-full object-cover" loading="lazy" />
+                          ) : (
+                            kindIcon(f.mimeType)
+                          )}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-body-sm">{f.name}</span>
+                          <span className="block text-fine text-faint tabular-nums">
+                            {[fmtBytes(f.size), f.duration ? fmtTime(f.duration) : ""].filter(Boolean).join(" · ")}
+                          </span>
+                        </span>
+                        {done && <Check className="w-4 h-4 text-success shrink-0" />}
+                      </button>
+                    );
+                  })}
+                  {next && (
+                    <button
+                      onClick={() => load(next).catch((e) => setErr(String((e as Error).message)))}
+                      className={`${btnGhost} ${stretch} mt-1`}
+                    >
+                      Load more
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* What you picked, before you commit to copying it. */}
+            <div className="w-56 shrink-0">
+              {picked ? (
+                <div className="space-y-2">
+                  <div className="aspect-video rounded-sm bg-surface-sunken grid place-items-center overflow-hidden text-muted">
+                    {picked.thumbnail ? (
+                      <img src={picked.thumbnail} alt="" className="w-full h-full object-contain" />
                     ) : (
-                      <Plus className="w-4 h-4 text-muted shrink-0" />
+                      kindIcon(picked.mimeType)
                     )}
-                  </button>
-                );
-              })
-            )}
-            {next && (
-              <button
-                onClick={() => load(next).catch((e) => setErr(String((e as Error).message)))}
-                className={`${btnGhost} ${stretch} mt-1`}
-              >
-                Load more
-              </button>
-            )}
+                  </div>
+                  <div className="text-body-sm break-words">{picked.name}</div>
+                  <div className="text-fine text-faint tabular-nums">
+                    {[
+                      fmtBytes(picked.size),
+                      picked.duration ? fmtTime(picked.duration) : "",
+                      picked.modifiedTime ? new Date(picked.modifiedTime).toLocaleDateString() : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </div>
+                  {imported.has(picked.id) ? (
+                    <div className="flex items-center gap-1.5 text-fine text-success">
+                      <Check className="w-4 h-4" /> In your library
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => importFile(picked)}
+                      disabled={importing !== null}
+                      className={`${btnPrimary} ${stretch}`}
+                    >
+                      {importing === picked.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                      Import
+                    </button>
+                  )}
+                  {importing === picked.id && (
+                    <div className="text-fine text-muted">Copying from Drive, this takes a moment for long videos…</div>
+                  )}
+                </div>
+              ) : (
+                <p className="text-fine text-faint">Pick a file to preview it.</p>
+              )}
+            </div>
           </div>
-          {/* Work with an unknown duration says so in place, never a bare spinner. */}
-          {importing && <div className="mt-2 text-fine text-muted">Copying from Drive, this takes a moment for long videos…</div>}
+          {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
         </div>
       )}
-      {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
     </Dialog>
   );
 }

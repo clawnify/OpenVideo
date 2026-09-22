@@ -79,6 +79,7 @@ export function Dialog({
   onClose,
   children,
   footer,
+  size = "md",
 }: {
   title: string;
   icon?: React.ReactNode;
@@ -86,6 +87,8 @@ export function Dialog({
   onClose: () => void;
   children?: React.ReactNode;
   footer: React.ReactNode;
+  /** "lg" for a dialog that has to show a list and a preview side by side. */
+  size?: "md" | "lg";
 }) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -108,7 +111,7 @@ export function Dialog({
           role="dialog"
           aria-modal="true"
           aria-label={title}
-          className="w-full max-w-md rounded-lg bg-surface p-5 shadow-float"
+          className={`w-full ${size === "lg" ? "max-w-2xl" : "max-w-md"} rounded-lg bg-surface p-5 shadow-float`}
           onPointerDown={(e) => e.stopPropagation()}
         >
           <h2 className="flex items-center gap-2 text-heading-2">

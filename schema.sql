@@ -59,3 +59,12 @@ CREATE TABLE IF NOT EXISTS export_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_export_jobs_project ON export_jobs(project_id);
+
+-- App-wide settings, one row per key. Today only `drive_folder`: the Google
+-- Drive folder the picker is limited to, stored as JSON {"id","name"}. Absent
+-- means the whole Drive is browsable.
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
