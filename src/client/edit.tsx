@@ -2457,6 +2457,8 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
 
 const RULER_H = 22;
 const MAIN_H = 52;
+/** Space between neighbouring clips on the main track, in pixels. */
+const CLIP_GAP = 2;
 const ROW_H = 30;
 const HEAD_W = 96;
 
@@ -2657,7 +2659,10 @@ function TimelinePanel({
             {segments.map((seg) => {
               const a = resolveAsset(seg.el.src);
               const selected = sel?.area === "main" && sel.i === seg.i;
-              const w = Math.max(10, seg.dur * zoom);
+              // A gap between clips, taken from the right edge so the ruler
+              // stays exact. Without it the two halves of a split fused into
+              // one strip; each piece should read as its own video.
+              const w = Math.max(8, seg.dur * zoom - CLIP_GAP);
               return (
                 <div
                   key={seg.el.id}
