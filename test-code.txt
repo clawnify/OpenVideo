@@ -1,0 +1,191 @@
+import {
+  AbsoluteFill,
+  Sequence,
+  interpolate,
+  useCurrentFrame,
+  spring,
+  useVideoConfig,
+} from "remotion";
+
+export interface BabetteSalonWelcomeProps {
+  salonName: string;
+  tagline: string;
+  subtext: string;
+  backgroundColor: string;
+  textColor: string;
+  accentColor: string;
+}
+
+export const BabetteSalonWelcome: React.FC<BabetteSalonWelcomeProps> = ({
+  salonName,
+  tagline,
+  subtext,
+  backgroundColor,
+  textColor,
+  accentColor,
+}) => {
+  const frame = useCurrentFrame();
+  const { fps, durationInFrames } = useVideoConfig();
+
+  // Background fade in
+  const bgOpacity = interpolate(frame, [0, 20], [0, 1], { extrapolateRight: "clamp" });
+
+  // Decorative line expands
+  const lineWidth = spring({ frame, fps, from: 0, to: 220, durationInFrames: 40, delay: 20 });
+
+  // Tagline fades up
+  const taglineOpacity = interpolate(frame, [15, 45], [0, 1], { extrapolateRight: "clamp" });
+  const taglineY = spring({ frame, fps, from: 20, to: 0, durationInFrames: 35, delay: 15 });
+
+  // Salon name pops in with scale
+  const nameOpacity = interpolate(frame, [30, 60], [0, 1], { extrapolateRight: "clamp" });
+  const nameScale = spring({ frame, fps, from: 0.85, to: 1, durationInFrames: 40, delay: 30 });
+
+  // Subtext fades in
+  const subtextOpacity = interpolate(frame, [60, 90], [0, 1], { extrapolateRight: "clamp" });
+  const subtextY = spring({ frame, fps, from: 15, to: 0, durationInFrames: 30, delay: 60 });
+
+  // Bottom line expands
+  const bottomLineWidth = spring({ frame, fps, from: 0, to: 120, durationInFrames: 30, delay: 70 });
+
+  // Fade out at end
+  const fadeOut = interpolate(frame, [durationInFrames - 25, durationInFrames - 5], [1, 0], {
+    extrapolateLeft: "clamp",
+    extrapolateRight: "clamp",
+  });
+
+  // Subtle shimmer on accent line
+  const shimmer = interpolate(frame, [20, 80], [0, 1], { extrapolateRight: "clamp" });
+
+  return (
+    <AbsoluteFill
+      style={{
+        background: `radial-gradient(ellipse at center, #2e2520 0%, ${backgroundColor} 70%)`,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        fontFamily: "'Inter', system-ui, sans-serif",
+        opacity: bgOpacity * fadeOut,
+      }}
+    >
+      {/* Decorative corner accents */}
+      {[
+        { top: 48, left: 48 },
+        { top: 48, right: 48 },
+        { bottom: 48, left: 48 },
+        { bottom: 48, right: 48 },
+      ].map((style, i) => {
+        const cornerOpacity = interpolate(frame, [10 + i * 5, 40 + i * 5], [0, 1], {
+          extrapolateRight: "clamp",
+        });
+        return (
+          <div
+            key={i}
+            style={{
+              position: "absolute",
+              ...style,
+              width: 40,
+              height: 40,
+              opacity: cornerOpacity * fadeOut,
+              borderTop: i < 2 ? `2px solid ${accentColor}` : "none",
+              borderBottom: i >= 2 ? `2px solid ${accentColor}` : "none",
+              borderLeft: i % 2 === 0 ? `2px solid ${accentColor}` : "none",
+              borderRight: i % 2 === 1 ? `2px solid ${accentColor}` : "none",
+            }}
+          />
+        );
+      })}
+
+      {/* Main content */}
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 0,
+        }}
+      >
+        {/* Top accent line */}
+        <Sequence from={20} durationInFrames={130} name="TopLine" layout="none">
+          <div
+            style={{
+              width: lineWidth,
+              height: 1.5,
+              background: `linear-gradient(90deg, transparent, ${accentColor}, transparent)`,
+              marginBottom: 32,
+              opacity: shimmer,
+            }}
+          />
+        </Sequence>
+
+        {/* Tagline */}
+        <Sequence from={15} durationInFrames={135} name="Tagline" layout="none">
+          <div
+            style={{
+              color: accentColor,
+              fontSize: 18,
+              fontWeight: 400,
+              letterSpacing: 8,
+              textTransform: "uppercase",
+              opacity: taglineOpacity,
+              transform: `translateY(${taglineY}px)`,
+              marginBottom: 20,
+            }}
+          >
+            {tagline}
+          </div>
+        </Sequence>
+
+        {/* Salon Name */}
+        <Sequence from={30} durationInFrames={120} name="SalonName" layout="none">
+          <div
+            style={{
+              color: textColor,
+              fontSize: 110,
+              fontWeight: 300,
+              letterSpacing: 18,
+              textTransform: "uppercase",
+              opacity: nameOpacity,
+              transform: `scale(${nameScale})`,
+              textShadow: `0 4px 40px rgba(201, 169, 110, 0.25)`,
+              lineHeight: 1,
+              marginBottom: 28,
+            }}
+          >
+            {salonName}
+          </div>
+        </Sequence>
+
+        {/* Bottom accent line */}
+        <Sequence from={70} durationInFrames={80} name="BottomLine" layout="none">
+          <div
+            style={{
+              width: bottomLineWidth,
+              height: 1,
+              background: `linear-gradient(90deg, transparent, ${accentColor}, transparent)`,
+              marginBottom: 28,
+            }}
+          />
+        </Sequence>
+
+        {/* Subtext */}
+        <Sequence from={60} durationInFrames={90} name="Subtext" layout="none">
+          <div
+            style={{
+              color: textColor,
+              fontSize: 20,
+              fontWeight: 300,
+              letterSpacing: 6,
+              opacity: subtextOpacity * 0.75,
+              transform: `translateY(${subtextY}px)`,
+              textTransform: "uppercase",
+            }}
+          >
+            {subtext}
+          </div>
+        </Sequence>
+      </div>
+    </AbsoluteFill>
+  );
+};

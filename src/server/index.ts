@@ -10,7 +10,15 @@ import {
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
-import { DRIVE_FILE_ID, driveDownloadLink, driveStatus, listDriveFiles } from "./drive";
+import {
+  DRIVE_FILE_ID,
+  SHARED_WITH_ME,
+  driveDownloadLink,
+  driveFolderName,
+  driveStatus,
+  listDriveFiles,
+  withinFolder,
+} from "./drive";
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { analyzeAsset, autocutAssets, copyOutput, resolveEdlSources, runEdit } from "./export";
 
@@ -84,18 +92,69 @@ app.post("/api/assets", async (c) => {
 // ── Google Drive (a source for the media library) ──────────────────
 // Import copies the file in, like an upload; see src/server/drive.ts.
 
-app.get("/api/drive", async (c) => c.json(await driveStatus(c.env)));
+/** The folder the org limited the picker to, or null for the whole Drive. */
+async function driveFolder(): Promise<{ id: string; name: string } | null> {
+  const row = await get<{ value: string }>("SELECT value FROM app_settings WHERE key = 'drive_folder'");
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.value) as { id?: string; name?: string };
+    return parsed.id ? { id: parsed.id, name: parsed.name || "Drive folder" } : null;
+  } catch {
+    return null;
+  }
+}
+
+app.get("/api/drive", async (c) => c.json({ ...(await driveStatus(c.env)), folder: await driveFolder() }));
+
+// Limit the picker to one folder, or clear the limit with `null`. Anyone in
+// the org can set it: an app sees who is calling, never their role.
+app.put("/api/drive/folder", async (c) => {
+  const b = await c.req.json<{ folderId?: string | null }>().catch(() => ({}) as { folderId?: string | null });
+  if (b.folderId === null) {
+    await run("DELETE FROM app_settings WHERE key = 'drive_folder'");
+    return c.json({ folder: null });
+  }
+  if (!b.folderId || !DRIVE_FILE_ID.test(b.folderId)) return c.json({ error: "folderId is required" }, 400);
+  const name = await driveFolderName(c.env, b.folderId);
+  if (!name) return c.json({ error: "no such folder in Drive" }, 404);
+  const folder = { id: b.folderId, name };
+  await run(
+    `INSERT INTO app_settings (key, value, updated_at) VALUES ('drive_folder', ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    [JSON.stringify(folder)],
+  );
+  return c.json({ folder });
+});
 
 app.get("/api/drive/files", async (c) => {
   const kind = c.req.query("kind") === "audio" ? "audio" : "media";
-  return c.json(
-    await listDriveFiles(c.env, { kind, search: c.req.query("q"), pageToken: c.req.query("page") || undefined }),
-  );
+  const limit = await driveFolder();
+  const asked = c.req.query("folder");
+  // Outside the limit, fall back to it rather than serving the wider Drive.
+  let folderId = asked && DRIVE_FILE_ID.test(asked) ? asked : limit?.id;
+  // A limit means one folder and its subfolders: shared-with-me is not in it.
+  if (limit && folderId !== limit.id && (folderId === SHARED_WITH_ME || !(await withinFolder(c.env, folderId!, limit.id)))) {
+    folderId = limit.id;
+  }
+  return c.json({
+    ...(await listDriveFiles(c.env, {
+      kind,
+      search: c.req.query("q"),
+      pageToken: c.req.query("page") || undefined,
+      folderId,
+    })),
+    folder: folderId && limit && folderId !== limit.id ? { id: folderId } : null,
+  });
 });
 
 app.post("/api/drive/import", async (c) => {
   const b = await c.req.json<{ fileId?: string; duration?: number }>().catch(() => ({}) as { fileId?: string; duration?: number });
   if (!b.fileId || !DRIVE_FILE_ID.test(b.fileId)) return c.json({ error: "fileId is required" }, 400);
+
+  const limit = await driveFolder();
+  if (limit && !(await withinFolder(c.env, b.fileId, limit.id))) {
+    return c.json({ error: `that file is outside ${limit.name}` }, 403);
+  }
 
   const file = await driveDownloadLink(c.env, b.fileId);
   const key = await uniqueKey(file.name);

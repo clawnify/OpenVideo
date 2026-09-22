@@ -1,0 +1,1 @@
+{"salonName": "Babette", "tagline": "Welcome to our salon", "subtext": "Beauty \u2022 Style \u2022 Care", "backgroundColor": "#1a1a1a", "textColor": "#f5e6d3", "accentColor": "#c9a96e"}
