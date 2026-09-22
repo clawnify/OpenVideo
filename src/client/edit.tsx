@@ -2541,7 +2541,19 @@ function TimelinePanel({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(40); // px per second
-  const width = Math.max(300, (total || 10) * zoom + 60);
+  // The visible width of the track area. The ruler and every row reach at
+  // least this far, so a short or empty project does not stop mid-screen.
+  const [viewW, setViewW] = useState(0);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () => setViewW(el.clientWidth);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const width = Math.max(300, (total || 10) * zoom + 60, viewW - HEAD_W);
   const dragMain = useRef<{ from: number; over: number } | null>(null);
   // Timeline seconds under the last right-click, for "Split here".
   const menuAt = useRef(0);
@@ -2644,9 +2656,9 @@ function TimelinePanel({
     const stepOptions = [0.5, 1, 2, 5, 10, 30, 60];
     const step = stepOptions.find((s) => s * zoom >= 42) ?? 60;
     const out: number[] = [];
-    for (let t = 0; t <= (total || 10) + step; t += step) out.push(Math.round(t * 100) / 100);
+    for (let t = 0; t <= width / zoom; t += step) out.push(Math.round(t * 100) / 100);
     return out;
-  }, [zoom, total]);
+  }, [zoom, width]);
 
   return (
     <div className={`${pane === "canvas" ? "flex" : "hidden"} lg:flex h-64 shrink-0 border-t border-border bg-surface flex-col`}>
