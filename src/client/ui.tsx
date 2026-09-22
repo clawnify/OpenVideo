@@ -32,28 +32,6 @@ export const stretch = "w-full justify-center px-2";
 /** A resting card: white, edged by an inset ring at 12px. Never a drop shadow. */
 export const card = "rounded-md bg-surface shadow-edge";
 
-/** A fact (file kind, track, plan): quiet gray, 4px corners, no border. */
-export const chip =
-  "inline-flex items-center rounded-xs bg-surface-sunken px-2 py-1 text-fine text-muted";
-
-// ── status badge ────────────────────────────────────────────────────────────
-
-const BADGE: Record<string, string> = {
-  info: "bg-info-tint text-info",
-  success: "bg-success-tint text-success",
-  warning: "bg-warning-tint text-warning",
-  danger: "bg-danger-tint text-danger",
-};
-
-/** A signal that demands attention: tinted fill, same-hue text, no border. */
-export function Badge({ tone, children }: { tone: keyof typeof BADGE | string; children: React.ReactNode }) {
-  return (
-    <span className={`inline-flex items-center rounded-full px-2 py-1 text-fine font-medium ${BADGE[tone] ?? BADGE.info}`}>
-      {children}
-    </span>
-  );
-}
-
 // ── empty state ─────────────────────────────────────────────────────────────
 
 /** Never a bare "No data": say what this is and offer the way forward. An

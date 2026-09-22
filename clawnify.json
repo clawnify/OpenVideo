@@ -2,14 +2,14 @@
   "$schema": "https://app.clawnify.com/schema/v1/clawnify.json",
   "version": 1,
   "name": "OpenVideo",
-  "description": "Open-source, agent-friendly video editor. Compose videos as plain HTML on a timeline, drop in your own media (logos, product demos), preview with a scrubbable playhead, and render to MP4. Powered by HyperFrames.",
+  "description": "Open-source, agent-friendly video editor. Upload your footage, trim and arrange clips on a timeline, add text and music, and export to MP4. Every project is a plain-JSON edit an AI agent can read and change.",
   "icon": "icon.svg",
   "tags": [
     "video",
     "editor",
     "timeline",
-    "html",
-    "animation"
+    "footage",
+    "mp4"
   ],
   "app": {
     "framework": "react+hono",
@@ -18,7 +18,7 @@
   },
   "deploy": {
     "title": "Deploy your OpenVideo studio",
-    "subtitle": "Compose videos as HTML on a timeline, drop in your logo and product demos, and render to MP4.",
+    "subtitle": "Upload your footage, cut it on a timeline, add text and music, and export to MP4.",
     "prompts": [
       {
         "key": "brand_name",
