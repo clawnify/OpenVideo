@@ -12,6 +12,29 @@ export async function putUpload(
   await _bucket.put(key, data, { httpMetadata: { contentType } });
 }
 
+/**
+ * Stream a file from a URL straight into storage, never holding it in memory.
+ * A streamed put needs its length up front, so it comes from the response's
+ * Content-Length, or from `sizeHint` when the server leaves that out.
+ */
+export async function putUploadFromUrl(
+  url: string,
+  key: string,
+  contentType?: string,
+  sizeHint?: number,
+): Promise<{ size: number; contentType: string }> {
+  const res = await fetch(url);
+  if (!res.ok || !res.body) throw new Error(`download failed (${res.status})`);
+  const size = Number(res.headers.get("content-length") ?? sizeHint);
+  if (!Number.isFinite(size) || size <= 0) throw new Error("download has no length");
+  const type = contentType || res.headers.get("content-type") || "application/octet-stream";
+  const fixed = new FixedLengthStream(size);
+  const pipe = res.body.pipeTo(fixed.writable);
+  await putUpload(key, fixed.readable, type);
+  await pipe;
+  return { size, contentType: type };
+}
+
 export async function getUpload(
   key: string,
 ): Promise<{ data: ReadableStream; contentType: string; size: number } | null> {

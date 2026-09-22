@@ -8,7 +8,7 @@
 // streams — nothing is buffered in the worker.
 
 import { get, run } from "./db";
-import { getUpload, getUploadBytes, putUpload } from "./uploads";
+import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -540,11 +540,5 @@ export async function autocutAssets(
 
 /** Copy the finished MP4 into this app's storage; returns the storage key. */
 export async function copyOutput(result: EditResult, key: string): Promise<void> {
-  const res = await fetch(result.url);
-  if (!res.ok || !res.body) throw new Error(`output download failed (${res.status})`);
-  const size = Number(res.headers.get("content-length") ?? result.size);
-  const fixed = new FixedLengthStream(size);
-  const pipe = res.body.pipeTo(fixed.writable);
-  await putUpload(key, fixed.readable, "video/mp4");
-  await pipe;
+  await putUploadFromUrl(result.url, key, "video/mp4", result.size);
 }

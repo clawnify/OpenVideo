@@ -14,7 +14,8 @@
   "app": {
     "framework": "react+hono",
     "database": true,
-    "storage": true
+    "storage": true,
+    "credentials": ["googlesuper"]
   },
   "deploy": {
     "title": "Deploy your OpenVideo studio",

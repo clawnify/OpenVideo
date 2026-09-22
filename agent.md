@@ -17,6 +17,13 @@ a file as `asset:<id>`. Users upload from the editor's Media panel; you can
 upload with a multipart `POST /api/assets` (field `file`), which returns the
 new asset row.
 
+When the org has Google Workspace connected, files can also come from Google
+Drive: search with `GET /api/drive/files`, then `POST /api/drive/import` with a
+file's `id` to copy it into the library. The import returns the new asset row,
+the same as an upload, and the project references it as `asset:<id>`. Check
+`GET /api/drive` first: `{ "connected": false }` means the org has to connect
+Google Workspace in the Clawnify dashboard before any of this works.
+
 ## API
 
 | Method | Path | Purpose |
@@ -24,6 +31,9 @@ new asset row.
 | GET  | `/api/assets` | List uploaded media |
 | POST | `/api/assets` | Upload one file (multipart, field `file`) → the asset |
 | POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
+| GET  | `/api/drive` | Whether Google Drive is connected: `{ connected }` |
+| GET  | `/api/drive/files?kind=media\|audio&q=&page=` | Search the org's Drive, newest first → `{ files, nextPageToken }` |
+| POST | `/api/drive/import` | `{ fileId, duration? }` copies a Drive file into the library → the asset |
 | GET  | `/api/projects` | List projects |
 | GET  | `/api/projects/{id}` | Get one (includes the `edl` document and `brief`) |
 | POST | `/api/projects` | Create `{ name, brief?, edl? }` (empty 720p timeline if omitted) |
