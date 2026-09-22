@@ -10,7 +10,7 @@
 import { get, run } from "./db";
 import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
 import { mediaState, prepareMedia } from "./media";
-import { lineStep, wrapLines } from "../shared/textLayout";
+import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -153,10 +153,12 @@ function layoutText(edl: Edl): Edl {
       ...track,
       elements: track.elements.flatMap((el): Overlay[] => {
         if (el.type !== "text") return [el];
-        const lines = wrapLines(el.text, el.fontSize, W, el.fontFamily ?? "sans");
+        const family = el.fontFamily ?? "sans";
+        const lines = wrapLines(el.text, el.fontSize, W, family);
         const step = lineStep(el.fontSize, !!el.background) / H;
+        const top = fitTop(el.y, blockHeight(el.text, el.fontSize, W, family, !!el.background), H);
         return lines
-          .map((line, n) => ({ ...el, id: `${el.id}-l${n}`, text: line, y: Math.min(1, el.y + n * step) }))
+          .map((line, n) => ({ ...el, id: `${el.id}-l${n}`, text: line, y: Math.min(1, top + n * step) }))
           .filter((line) => line.text.trim().length > 0);
       }),
     })),

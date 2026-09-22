@@ -11,7 +11,7 @@
 // debounced PUT; validation errors surface with their JSON pointer.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { blockHeight, lineStep, wrapLines } from "../shared/textLayout";
+import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import {
   AlignCenterHorizontal,
   AlignCenterVertical,
@@ -2080,8 +2080,10 @@ function Player({
                     const t = el as OverlayText;
                     // The same line breaks the export uses: one centred line
                     // per element, so what shows here is what renders.
-                    const lines = wrapLines(t.text, t.fontSize, edl.output.width, t.fontFamily ?? "sans");
+                    const family = t.fontFamily ?? "sans";
+                    const lines = wrapLines(t.text, t.fontSize, edl.output.width, family);
                     const step = lineStep(t.fontSize, !!t.background) / edl.output.height;
+                    const top = fitTop(t.y, blockHeight(t.text, t.fontSize, edl.output.width, family, !!t.background), edl.output.height);
                     return lines.map((line, n) =>
                       line.trim() ? (
                       <div
@@ -2090,7 +2092,7 @@ function Player({
                         className={`absolute cursor-move select-none whitespace-pre leading-tight ${selected ? "outline outline-2 outline-ring" : ""}`}
                         style={{
                           left: `${t.x * 100}%`,
-                          top: `${(t.y + n * step) * 100}%`,
+                          top: `${(top + n * step) * 100}%`,
                           transform: t.align === "center" ? "translateX(-50%)" : t.align === "right" ? "translateX(-100%)" : undefined,
                           fontSize: t.fontSize * scale,
                           fontFamily: t.fontFamily === "serif" ? "serif" : t.fontFamily === "mono" ? "monospace" : "Inter, sans-serif",
