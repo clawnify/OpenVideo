@@ -348,7 +348,17 @@ export interface SourceWindow {
  * source; without this, a proposal could reach back before a trim the person
  * already made and put that footage back.
  */
-function withinWindow(result: AnalyzeResult, window?: SourceWindow): AnalyzeResult {
+/** Move every timestamp by `byMs`: from the analysis copy's clock to the source's. */
+export function shiftResult(result: AnalyzeResult, byMs: number): AnalyzeResult {
+  if (!byMs) return result;
+  return {
+    ...result,
+    cuts: result.cuts.map((c) => ({ ...c, start_ms: c.start_ms + byMs, end_ms: c.end_ms + byMs })),
+    captions: result.captions.map((c) => ({ ...c, start_ms: c.start_ms + byMs, end_ms: c.end_ms + byMs })),
+  };
+}
+
+export function withinWindow(result: AnalyzeResult, window?: SourceWindow): AnalyzeResult {
   if (!window) return result;
   const lo = window.start * 1000;
   const hi = window.end * 1000;
@@ -375,8 +385,11 @@ export async function analyzeAsset(
     };
   }
 
-  const media = await analysisDataUrl(assetId, cfg);
+  const media = await analysisDataUrl(assetId, cfg, opts.window);
   if ("failure" in media) return media;
+  // Watching a copy cut to the window, the model's clock starts at the window;
+  // watching the whole source, it is told which part is in the edit.
+  const cutToWindow = media.cut;
 
   const mode = ["cuts", "captions", "both"].includes(opts.mode ?? "") ? opts.mode! : "both";
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -388,7 +401,7 @@ export async function analyzeAsset(
         {
           role: "user",
           content: [
-            { type: "text", text: analysisPrompt(mode, opts.prompt, opts.window) },
+            { type: "text", text: analysisPrompt(mode, opts.prompt, cutToWindow ? undefined : opts.window) },
             { type: "video_url", video_url: { url: media.dataUrl } },
           ],
         },
@@ -421,7 +434,8 @@ export async function analyzeAsset(
   if (!parsed || !Array.isArray(parsed.cuts)) {
     return { failure: { error: "analyze_failed", detail: "model returned unparseable output — retry" } };
   }
-  return { result: withinWindow({ ...(parsed as AnalyzeResult), model: ANALYSIS_MODEL }, opts.window) };
+  const result = shiftResult({ ...(parsed as AnalyzeResult), model: ANALYSIS_MODEL }, media.from * 1000);
+  return { result: withinWindow(result, opts.window) };
 }
 
 // ── analysis delivery: base64 data URLs over a small proxy ──────────────────
@@ -453,10 +467,51 @@ function bytesToBase64(buf: ArrayBuffer): string {
 async function analysisBytes(
   asset: AssetRow,
   cfg: ExportConfig,
-): Promise<{ bytes: ArrayBuffer } | { failure: ExportFailure }> {
-  if (asset.size <= DIRECT_ANALYSIS_BYTES && DIRECT_TYPES.has(asset.content_type)) {
+  window?: SourceWindow,
+): Promise<{ bytes: ArrayBuffer; from: number; cut: boolean } | { failure: ExportFailure }> {
+  if (asset.size > 0 && asset.size <= DIRECT_ANALYSIS_BYTES && DIRECT_TYPES.has(asset.content_type)) {
     const bytes = await getUploadBytes(asset.key);
-    if (bytes) return { bytes };
+    if (bytes) return { bytes, from: 0, cut: false };
+  }
+
+  // Only the part the clip plays. Rendering the whole source refused anything
+  // over 5 minutes, which is every long master on the media service, even
+  // when the clip itself was 20 seconds. Cached per window.
+  if (window) {
+    const key = `proxies/${asset.id}-${Math.round(window.start * 1000)}-${Math.round(window.end * 1000)}.mp4`;
+    let bytes = await getUploadBytes(key);
+    if (!bytes) {
+      const staged = await ensureStagedSrc(asset.id, cfg);
+      if ("failure" in staged) return staged;
+      const proxied = await runEdit(
+        {
+          version: 1,
+          output: { width: 640, height: 360, fps: 24, background: "#000000" },
+          main: {
+            elements: [
+              { id: "p", type: "video", src: staged.src, trimStart: window.start, duration: window.end - window.start },
+            ],
+          },
+          overlays: [],
+          audio: [],
+        } as Edl,
+        { quality: "draft", filename: `proxy-${asset.id}.mp4` },
+        cfg,
+      );
+      if ("failure" in proxied) {
+        const detail = proxied.failure.detail.includes("max is")
+          ? "this clip plays for more than 5 minutes — shorten it before analysis"
+          : `could not build the analysis copy: ${proxied.failure.detail}`;
+        return { failure: { error: "analyze_failed", detail } };
+      }
+      await copyOutput(proxied.result, key);
+      bytes = await getUploadBytes(key);
+    }
+    if (!bytes) return { failure: { error: "analyze_failed", detail: "analysis copy missing — retry" } };
+    if (bytes.byteLength > ANALYSIS_HARD_CAP) {
+      return { failure: { error: "analyze_failed", detail: "clip too long for analysis — shorten it first" } };
+    }
+    return { bytes, from: window.start, cut: true };
   }
 
   if (!asset.proxy_key) {
@@ -490,20 +545,30 @@ async function analysisBytes(
   if (bytes.byteLength > ANALYSIS_HARD_CAP) {
     return { failure: { error: "analyze_failed", detail: "clip too long for analysis — trim it first" } };
   }
-  return { bytes };
+  return { bytes, from: 0, cut: false };
 }
 
+/**
+ * The video the model watches, and where in the source it starts: 0 for the
+ * whole source, the window's start for a copy cut to the clip.
+ */
 async function analysisDataUrl(
   assetId: string,
   cfg: ExportConfig,
-): Promise<{ dataUrl: string; byteLength: number } | { failure: ExportFailure }> {
+  window?: SourceWindow,
+): Promise<{ dataUrl: string; byteLength: number; from: number; cut: boolean } | { failure: ExportFailure }> {
   const asset = await get<AssetRow>("SELECT * FROM assets WHERE id = ?", [assetId]);
   if (!asset) {
     return { failure: { error: "asset_not_found", detail: `no media-library asset with id "${assetId}"` } };
   }
-  const res = await analysisBytes(asset, cfg);
+  const res = await analysisBytes(asset, cfg, window);
   if ("failure" in res) return res;
-  return { dataUrl: `data:video/mp4;base64,${bytesToBase64(res.bytes)}`, byteLength: res.bytes.byteLength };
+  return {
+    dataUrl: `data:video/mp4;base64,${bytesToBase64(res.bytes)}`,
+    byteLength: res.bytes.byteLength,
+    from: res.from,
+    cut: res.cut,
+  };
 }
 
 export interface AutocutSegment {

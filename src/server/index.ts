@@ -10,7 +10,7 @@ import {
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
-import { frameUrl, importMedia, mediaPlayback, mediaState, prepareMedia } from "./media";
+import { deleteMedia, frameUrl, importMedia, mediaPlayback, mediaState, prepareMedia } from "./media";
 import {
   DRIVE_FILE_ID,
   SHARED_WITH_ME,
@@ -269,7 +269,13 @@ app.delete("/api/assets/:id", async (c) => {
     c.req.param("id"),
   ]);
   if (row) {
-    await deleteUpload(row.key);
+    // Footage on the media service counts against the org's storage minutes
+    // until it is deleted there; dropping only our row left it counting.
+    if (row.media_uid) {
+      await deleteMedia({ servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN }, row.media_uid);
+    } else {
+      await deleteUpload(row.key);
+    }
     if (row.proxy_key) await deleteUpload(row.proxy_key);
     await run("DELETE FROM assets WHERE id = ?", [row.id]);
   }

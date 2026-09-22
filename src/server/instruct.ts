@@ -10,6 +10,7 @@
 // with a single undo.
 
 import { MAX_TEXT_CHARS, validateEdl, type Edl, type EdlInvalid } from "./edl";
+import { splitClip } from "../shared/split";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 const MODEL = "google/gemini-3.7-flash";
@@ -159,7 +160,7 @@ const SHAPES: Record<string, { width: number; height: number }> = {
 const rid = () => Math.random().toString(36).slice(2, 10);
 
 /** Apply one operation to a draft. Returns what to tell the user, or an error. */
-function apply(draft: Edl, name: string, args: Record<string, unknown>): { said: string } | { error: string } {
+export function apply(draft: Edl, name: string, args: Record<string, unknown>): { said: string } | { error: string } {
   const main = draft.main.elements as unknown as Clip[];
   const clipAt = (n: unknown): Clip | null => {
     const i = Number(n);
@@ -182,16 +183,9 @@ function apply(draft: Edl, name: string, args: Record<string, unknown>): { said:
       const clip = clipAt(i);
       const at = Number(args.at);
       if (!clip) return { error: `there is no clip ${args.clip}` };
-      if (!(at > 0)) return { error: "split at a point after the clip starts" };
-      const playing = clip.duration;
-      if (playing !== undefined && at >= playing) return { error: "that point is past the end of the clip" };
-      const second = { ...clip, id: rid(), trimStart: (clip.trimStart ?? 0) + at } as Clip;
-      if (playing !== undefined) second.duration = playing - at;
-      // The first half plays up to the cut either way. Leaving it without a
-      // duration, as an untrimmed clip has, made it play to the end and the
-      // footage appeared twice.
-      clip.duration = at;
-      main.splice(i + 1, 0, second);
+      const halves = splitClip(clip, at, clip.duration, rid());
+      if (!halves) return { error: "split at a point inside the clip, after its start and before its end" };
+      main.splice(i, 1, ...halves);
       return { said: `Split clip ${i} at ${at.toFixed(1)}s` };
     }
     case "delete_clip": {
@@ -255,7 +249,7 @@ function apply(draft: Edl, name: string, args: Record<string, unknown>): { said:
 }
 
 /** Run the clip analysis on one clip's window and keep only what it keeps. */
-async function cleanUp(
+export async function cleanUp(
   draft: Edl,
   args: Record<string, unknown>,
   sourceSeconds: Map<string, number>,

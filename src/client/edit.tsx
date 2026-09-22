@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
+import { splitClip } from "../shared/split";
 import {
   AlignCenterHorizontal,
   AlignCenterVertical,
@@ -903,19 +904,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         el.duration = off;
         d.main.elements.splice(seg.i + 1, 0, right);
       } else {
-        const ts = el.trimStart ?? 0;
-        const right = { ...structuredClone(el), id: rid(), trimStart: ts + off };
-        if (el.duration !== undefined) {
-          // Play-window form ("play N seconds from here", what Auto-cut and
-          // Ask write): duration wins over trimEnd, so the window itself has
-          // to be divided. Setting trimEnd here left the first half playing
-          // its whole length and gave the second half a copy of it.
-          right.duration = seg.dur - off;
-          el.duration = off;
-        } else {
-          el.trimEnd = (el.trimEnd ?? 0) + (seg.dur - off);
-        }
-        d.main.elements.splice(seg.i + 1, 0, right);
+        const halves = splitClip(structuredClone(el), off, seg.dur, rid());
+        if (halves) d.main.elements.splice(seg.i, 1, ...halves);
       }
     });
   };
