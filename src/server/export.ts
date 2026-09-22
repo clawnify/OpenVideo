@@ -120,14 +120,12 @@ async function stageAsset(
   });
   await pipe;
 
-  const json = (await res.json().catch(() => null)) as
-    | { key?: string; expires_at?: string; error?: string; detail?: string }
-    | null;
+  const { json, text } = await readServiceResponse<{ key?: string; expires_at?: string; error?: string; detail?: string }>(res);
   if (res.status !== 201 || !json?.key) {
     return {
       failure: {
         error: json?.error ?? "staging_failed",
-        detail: `could not stage "${asset.name}": ${json?.detail ?? `service returned ${res.status}`}`,
+        detail: `could not stage "${asset.name}": ${json?.detail ?? (text || `service returned ${res.status}`)}`,
       },
     };
   }
@@ -137,6 +135,19 @@ async function stageAsset(
     [json.key, json.expires_at ?? null, asset.id],
   );
   return { key: json.key };
+}
+
+/**
+ * A service reply as JSON when it is JSON; otherwise the start of its text, so
+ * a plain-text refusal (a proxy or policy message) still reaches the user.
+ */
+async function readServiceResponse<T>(res: Response): Promise<{ json: T | null; text: string }> {
+  const raw = await res.text().catch(() => "");
+  try {
+    return { json: JSON.parse(raw) as T, text: "" };
+  } catch {
+    return { json: null, text: raw.trim().slice(0, 300) };
+  }
 }
 
 export interface EditResult {
@@ -156,15 +167,13 @@ export async function runEdit(
     headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ edl, quality: opts.quality, filename: opts.filename }),
   });
-  const json = (await res.json().catch(() => null)) as
-    | (Partial<EditResult> & Partial<EdlInvalid> & { error?: string })
-    | null;
+  const { json, text } = await readServiceResponse<Partial<EditResult> & Partial<EdlInvalid> & { error?: string }>(res);
 
   if (res.status !== 200 || !json?.url) {
     return {
       failure: {
         error: json?.error ?? "edit_failed",
-        detail: json?.detail ?? `edit service returned ${res.status}`,
+        detail: json?.detail ?? (text || `edit service returned ${res.status}`),
         ...(json?.path ? { path: json.path } : {}),
       },
     };

@@ -30,7 +30,22 @@ export async function getUploadRange(
   offset: number,
   length?: number,
 ): Promise<{ data: ReadableStream; contentType: string; size: number } | null> {
-  const obj = await _bucket.get(key, { range: { offset, ...(length !== undefined ? { length } : {}) } });
+  let obj: R2ObjectBody | null;
+  try {
+    obj = await _bucket.get(key, { range: { offset, ...(length !== undefined ? { length } : {}) } });
+  } catch {
+    // Storage without ranged reads (e.g. a sandboxed preview) — slice the whole
+    // object instead. Those stores cap file size, so reading it all is bounded.
+    const whole = await _bucket.get(key);
+    if (!whole) return null;
+    const bytes = await whole.arrayBuffer();
+    const end = length !== undefined ? Math.min(offset + length, bytes.byteLength) : bytes.byteLength;
+    return {
+      data: new Response(bytes.slice(offset, end)).body!,
+      contentType: whole.httpMetadata?.contentType || "application/octet-stream",
+      size: whole.size,
+    };
+  }
   if (!obj) return null;
   return {
     data: obj.body,
