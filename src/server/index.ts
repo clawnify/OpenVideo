@@ -12,6 +12,7 @@ import {
 import type { ConnectionsEnv } from "@clawnify/connections";
 import {
   DRIVE_FILE_ID,
+  SHARED_WITH_ME,
   driveDownloadLink,
   driveFolderName,
   driveStatus,
@@ -131,7 +132,10 @@ app.get("/api/drive/files", async (c) => {
   const asked = c.req.query("folder");
   // Outside the limit, fall back to it rather than serving the wider Drive.
   let folderId = asked && DRIVE_FILE_ID.test(asked) ? asked : limit?.id;
-  if (limit && folderId !== limit.id && !(await withinFolder(c.env, folderId!, limit.id))) folderId = limit.id;
+  // A limit means one folder and its subfolders: shared-with-me is not in it.
+  if (limit && folderId !== limit.id && (folderId === SHARED_WITH_ME || !(await withinFolder(c.env, folderId!, limit.id)))) {
+    folderId = limit.id;
+  }
   return c.json({
     ...(await listDriveFiles(c.env, {
       kind,

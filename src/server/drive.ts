@@ -34,6 +34,13 @@ export interface DriveFolder {
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 
+/**
+ * Files other people shared with this account live outside its own Drive, so
+ * the root listing never shows them. They get a folder of their own, the way
+ * Drive's own web UI does it.
+ */
+export const SHARED_WITH_ME = "sharedWithMe";
+
 /** How far up a parent chain we walk before giving up on the folder limit. */
 const MAX_ANCESTRY_DEPTH = 25;
 
@@ -77,6 +84,8 @@ export async function listDriveFiles(
   // search does not need them.
   const search = opts.search?.replace(/['\\]/g, " ").trim();
   if (search) q += ` and name contains '${search}'`;
+  const shared = opts.folderId === SHARED_WITH_ME;
+  if (shared) q += " and sharedWithMe = true";
 
   const service = await requireDriveService(env);
   const data = (await connect(service, env).run(`${service.toUpperCase()}_FIND_FILE`, {
@@ -86,7 +95,8 @@ export async function listDriveFiles(
     pageSize: 50,
     fields:
       "nextPageToken,files(id,name,mimeType,size,modifiedTime,thumbnailLink,videoMediaMetadata(durationMillis))",
-    folder_id: opts.folderId || "root",
+    // Shared items are found by the query, not by a parent folder.
+    ...(shared ? {} : { folder_id: opts.folderId || "root" }),
     ...(opts.pageToken ? { pageToken: opts.pageToken } : {}),
   })) as {
     files?: {
@@ -102,8 +112,10 @@ export async function listDriveFiles(
   };
 
   const items = data.files ?? [];
+  const atRoot = !opts.folderId || opts.folderId === "root";
+  const folders = items.filter((f) => f.mimeType === FOLDER_MIME).map((f) => ({ id: f.id, name: f.name }));
   return {
-    folders: items.filter((f) => f.mimeType === FOLDER_MIME).map((f) => ({ id: f.id, name: f.name })),
+    folders: atRoot && !opts.search ? [{ id: SHARED_WITH_ME, name: "Shared with me" }, ...folders] : folders,
     files: items
       .filter((f) => f.mimeType !== FOLDER_MIME)
       .map((f) => ({
