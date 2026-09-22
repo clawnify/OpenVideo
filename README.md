@@ -16,10 +16,10 @@ Most editors keep a project in a format built for their own app, not for you or 
 
 - **Timeline editor**: a main track of clips that play end to end, text on overlay tracks, music on audio tracks. Trim, split, reorder and zoom, with filmstrips and waveforms.
 - **Live preview**: one master clock plays the cut back in the browser as you edit.
-- **Media library**: upload clips, stills and music once and use them in any project.
+- **Media library**: upload clips, stills and music, or import them from Google Drive, and use them in any project.
 - **AI assist**: Auto-cut watches several clips together and assembles the strongest sequence for what the video is for, captions included; Clean up trims one clip down to its good parts.
 - **Export to MP4** in draft, standard or high quality, on Clawnify's managed edit service.
-- **Agent-ready**: a REST API (`/api/assets`, `/api/projects`, `/api/exports`) and an `agent.md`, so an AI agent can assemble, edit and export videos without a human in the loop. Validation errors carry a JSON pointer to the offending node, so an agent's edit loop self-corrects.
+- **Agent-ready**: a REST API (`/api/assets`, `/api/drive`, `/api/projects`, `/api/exports`) and an `agent.md`, so an AI agent can assemble, edit and export videos without a human in the loop. Validation errors carry a JSON pointer to the offending node, so an agent's edit loop self-corrects.
 
 ## How an edit works
 

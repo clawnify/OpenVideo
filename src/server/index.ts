@@ -3,11 +3,14 @@ import { initDB, query, get, run } from "./db";
 import {
   initUploads,
   putUpload,
+  putUploadFromUrl,
   getUpload,
   getUploadRange,
   deleteUpload,
   makeKey,
 } from "./uploads";
+import type { ConnectionsEnv } from "@clawnify/connections";
+import { DRIVE_FILE_ID, driveDownloadLink, driveStatus, listDriveFiles } from "./drive";
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { analyzeAsset, autocutAssets, copyOutput, resolveEdlSources, runEdit } from "./export";
 
@@ -21,6 +24,10 @@ type Bindings = {
   // The org's OpenRouter key (declared in clawnify.json `env`, injected at
   // deploy) — powers footage analysis; usage bills the org's own metering.
   OPENROUTER_API_KEY?: string;
+  // Injected because clawnify.json lists `credentials`: the org's connected
+  // integrations (Google Drive import) and which org this app serves.
+  CREDENTIALS?: ConnectionsEnv["CREDENTIALS"];
+  CLAWNIFY_ORG_ID?: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -57,15 +64,7 @@ app.post("/api/assets", async (c) => {
   const file = body["file"];
   if (!file || typeof file === "string") return c.json({ error: "No file provided" }, 400);
 
-  // Unique R2 key from the original name; suffix on collision.
-  let key = makeKey(file.name || "file");
-  const clash = await get<{ id: string }>("SELECT id FROM assets WHERE key = ?", [key]);
-  if (clash) {
-    const dot = key.lastIndexOf(".");
-    const suffix = lower8();
-    key = dot > 0 ? `${key.slice(0, dot)}-${suffix}${key.slice(dot)}` : `${key}-${suffix}`;
-  }
-
+  const key = await uniqueKey(file.name);
   const data = await file.arrayBuffer();
   const contentType = file.type || "application/octet-stream";
   await putUpload(key, data, contentType);
@@ -77,6 +76,36 @@ app.post("/api/assets", async (c) => {
   const res = await run(
     "INSERT INTO assets (key, name, content_type, size, duration) VALUES (?, ?, ?, ?, ?)",
     [key, file.name || key, contentType, data.byteLength, duration],
+  );
+  const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
+  return c.json(row, 201);
+});
+
+// ── Google Drive (a source for the media library) ──────────────────
+// Import copies the file in, like an upload; see src/server/drive.ts.
+
+app.get("/api/drive", async (c) => c.json(await driveStatus(c.env)));
+
+app.get("/api/drive/files", async (c) => {
+  const kind = c.req.query("kind") === "audio" ? "audio" : "media";
+  return c.json(
+    await listDriveFiles(c.env, { kind, search: c.req.query("q"), pageToken: c.req.query("page") || undefined }),
+  );
+});
+
+app.post("/api/drive/import", async (c) => {
+  const b = await c.req.json<{ fileId?: string; duration?: number }>().catch(() => ({}) as { fileId?: string; duration?: number });
+  if (!b.fileId || !DRIVE_FILE_ID.test(b.fileId)) return c.json({ error: "fileId is required" }, 400);
+
+  const file = await driveDownloadLink(c.env, b.fileId);
+  const key = await uniqueKey(file.name);
+  const stored = await putUploadFromUrl(file.url, key, file.mimeType);
+  // Drive's own probe of the video length, when the picker had it.
+  const duration = typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0 ? b.duration : null;
+
+  const res = await run(
+    "INSERT INTO assets (key, name, content_type, size, duration) VALUES (?, ?, ?, ?, ?)",
+    [key, file.name, stored.contentType, stored.size, duration],
   );
   const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
   return c.json(row, 201);
@@ -444,6 +473,16 @@ app.post("/api/projects/:id/export", async (c) => {
 });
 
 // ── helpers ──────────────────────────────────────────────────────────
+
+/** A storage key from a file name, suffixed when another asset already has it. */
+async function uniqueKey(name: string): Promise<string> {
+  const key = makeKey(name || "file");
+  const clash = await get<{ id: string }>("SELECT id FROM assets WHERE key = ?", [key]);
+  if (!clash) return key;
+  const dot = key.lastIndexOf(".");
+  const suffix = lower8();
+  return dot > 0 ? `${key.slice(0, dot)}-${suffix}${key.slice(dot)}` : `${key}-${suffix}`;
+}
 
 function lower8(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(4)))

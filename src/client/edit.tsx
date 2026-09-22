@@ -12,6 +12,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Check,
+  Cloud,
   Film,
   Image as ImageIcon,
   Loader2,
@@ -971,6 +973,8 @@ function LeftPanel({
 }) {
   const [uploading, setUploading] = useState(false);
   const [uploadErr, setUploadErr] = useState("");
+  const [driveOpen, setDriveOpen] = useState(false);
+  const closeDrive = useCallback(() => setDriveOpen(false), []);
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Read the media length from the LOCAL file — instant, no server roundtrip,
@@ -1064,10 +1068,23 @@ function LeftPanel({
             <button
               onClick={() => fileRef.current?.click()}
               disabled={uploading}
-              className="w-full h-8 mb-3 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5 disabled:opacity-50"
+              className="w-full h-8 mb-2 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5 disabled:opacity-50"
             >
               {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />} Upload
             </button>
+            <button
+              onClick={() => setDriveOpen(true)}
+              className="w-full h-8 mb-3 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
+            >
+              <Cloud className="w-4 h-4" /> Google Drive
+            </button>
+            {driveOpen && (
+              <DriveDialog
+                kind={tab === "audio" ? "audio" : "media"}
+                onImported={(a) => setAssets((prev) => [a, ...prev])}
+                onClose={closeDrive}
+              />
+            )}
             <input
               ref={fileRef}
               type="file"
@@ -1116,6 +1133,186 @@ function LeftPanel({
         )}
       </div>
     </div>
+  );
+}
+
+// ── Google Drive picker ─────────────────────────────────────────────────────
+
+interface DriveFile {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number | null;
+  modifiedTime: string | null;
+  duration: number | null;
+}
+
+function fmtBytes(n: number | null): string {
+  if (!n) return "";
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(n / 1e3))} KB`;
+}
+
+/** Search the org's Google Drive and copy picked files into the library. */
+function DriveDialog({
+  kind,
+  onImported,
+  onClose,
+}: {
+  kind: "media" | "audio";
+  onImported: (a: Asset) => void;
+  onClose: () => void;
+}) {
+  const [connected, setConnected] = useState<boolean | null>(null);
+  const [search, setSearch] = useState("");
+  const [files, setFiles] = useState<DriveFile[] | null>(null);
+  const [next, setNext] = useState<string | null>(null);
+  const [importing, setImporting] = useState<string | null>(null);
+  const [imported, setImported] = useState<Set<string>>(new Set());
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    api
+      .get<{ connected: boolean }>("/api/drive")
+      .then((s) => setConnected(s.connected))
+      .catch((e) => setErr(String((e as Error).message)));
+  }, []);
+
+  const load = useCallback(
+    async (page?: string) => {
+      const qs = new URLSearchParams({ kind });
+      if (search.trim()) qs.set("q", search.trim());
+      if (page) qs.set("page", page);
+      const r = await api.get<{ files: DriveFile[]; nextPageToken: string | null }>(`/api/drive/files?${qs}`);
+      setFiles((cur) => (page && cur ? [...cur, ...r.files] : r.files));
+      setNext(r.nextPageToken);
+    },
+    [kind, search],
+  );
+
+  // Search as you type, a beat after the last key.
+  useEffect(() => {
+    if (!connected) return;
+    const t = setTimeout(() => {
+      setErr("");
+      load().catch((e) => setErr(String((e as Error).message)));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [connected, load]);
+
+  const importFile = async (f: DriveFile) => {
+    setImporting(f.id);
+    setErr("");
+    try {
+      const asset = await api.send<Asset>("POST", "/api/drive/import", {
+        fileId: f.id,
+        ...(f.duration ? { duration: f.duration } : {}),
+      });
+      onImported(asset);
+      setImported((cur) => new Set(cur).add(f.id));
+    } catch (e) {
+      setErr(`${f.name}: ${String((e as Error).message)}`);
+    } finally {
+      setImporting(null);
+    }
+  };
+
+  const kindIcon = (t: string) =>
+    t.startsWith("video/") ? <Film className="w-4 h-4" /> : t.startsWith("audio/") ? <Music className="w-4 h-4" /> : <ImageIcon className="w-4 h-4" />;
+
+  return (
+    <Dialog
+      title="Import from Google Drive"
+      icon={<Cloud className="w-4 h-4 text-muted" />}
+      description="Files are copied into your media library, so an edit keeps working if the original is moved or deleted."
+      onClose={onClose}
+      footer={
+        <button onClick={onClose} className={btnGhost}>
+          Done <Kbd>esc</Kbd>
+        </button>
+      }
+    >
+      {connected === false ? (
+        <p className="mt-4 text-body-sm text-muted">
+          Google Drive isn't connected yet. Connect Google Workspace in your Clawnify dashboard under
+          Integrations, then open this again.
+        </p>
+      ) : (
+        <div className="mt-4">
+          <input
+            className={inputCls}
+            placeholder={kind === "audio" ? "Search audio in your Drive" : "Search videos and images in your Drive"}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            aria-label="Search Google Drive"
+            data-autofocus
+          />
+          <div className="mt-2 max-h-80 overflow-y-auto -mx-2">
+            {files === null ? (
+              /* Loading is the shape of the answer, never a spinner. */
+              [0, 1, 2].map((i) => (
+                <div key={i} className="flex items-center gap-3 px-2 py-2">
+                  <div className="w-8 h-8 rounded-sm bg-surface-sunken animate-pulse" />
+                  <div className="flex-1 space-y-1.5">
+                    <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
+                    <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+                  </div>
+                </div>
+              ))
+            ) : files.length === 0 ? (
+              <p className="px-2 py-4 text-center text-fine text-muted">
+                {search.trim() ? "Nothing in your Drive matches that name." : "No files of this kind in your Drive."}
+              </p>
+            ) : (
+              files.map((f) => {
+                const done = imported.has(f.id);
+                const meta = [
+                  fmtBytes(f.size),
+                  f.duration ? fmtTime(f.duration) : "",
+                  f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : "",
+                ].filter(Boolean);
+                return (
+                  <button
+                    key={f.id}
+                    onClick={() => importFile(f)}
+                    disabled={importing !== null || done}
+                    title={done ? "In your library" : "Import into the library"}
+                    className="w-full flex items-center gap-3 px-2 py-2 rounded-sm text-left hover:bg-surface-sunken disabled:hover:bg-transparent"
+                  >
+                    <span className="grid place-items-center w-8 h-8 rounded-sm bg-surface-sunken text-muted shrink-0">
+                      {kindIcon(f.mimeType)}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-body-sm">{f.name}</span>
+                      <span className="block text-fine text-faint tabular-nums">{meta.join(" · ")}</span>
+                    </span>
+                    {importing === f.id ? (
+                      <Loader2 className="w-4 h-4 animate-spin text-muted shrink-0" />
+                    ) : done ? (
+                      <Check className="w-4 h-4 text-success shrink-0" />
+                    ) : (
+                      <Plus className="w-4 h-4 text-muted shrink-0" />
+                    )}
+                  </button>
+                );
+              })
+            )}
+            {next && (
+              <button
+                onClick={() => load(next).catch((e) => setErr(String((e as Error).message)))}
+                className={`${btnGhost} ${stretch} mt-1`}
+              >
+                Load more
+              </button>
+            )}
+          </div>
+          {/* Work with an unknown duration says so in place, never a bare spinner. */}
+          {importing && <div className="mt-2 text-fine text-muted">Copying from Drive, this takes a moment for long videos…</div>}
+        </div>
+      )}
+      {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
+    </Dialog>
   );
 }
 
