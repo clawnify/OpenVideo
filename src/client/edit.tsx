@@ -706,13 +706,23 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
 
   // ── persistence (debounced) ───────────────────────────────────────────────
   const dirty = useRef(false);
+  // What the server holds. Compared against this, not the document the page
+  // opened with: undo can walk back to that very document, and comparing with
+  // it skipped the save, so the undo showed on screen and never persisted.
+  const saved = useRef({ edl: initial.edl, name: initial.name, brief: initial.brief ?? "" });
   useEffect(() => {
-    if (edl === initial.edl && name === initial.name && brief === (initial.brief ?? "")) return;
+    const last = saved.current;
+    if (edl === last.edl && name === last.name && brief === last.brief) {
+      dirty.current = false;
+      setSaveState("saved");
+      return;
+    }
     dirty.current = true;
     setSaveState("saving");
     const t = setTimeout(async () => {
       try {
         await api.send("PUT", `/api/projects/${initial.id}`, { name, edl, brief });
+        saved.current = { edl, name, brief };
         dirty.current = false;
         setSaveState("saved");
       } catch (e) {
