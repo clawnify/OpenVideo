@@ -10,6 +10,7 @@
 import { get, run } from "./db";
 import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
 import { mediaState, prepareMedia } from "./media";
+import { lineStep, wrapLines } from "../shared/textLayout";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -133,7 +134,33 @@ export async function resolveEdlSources(
     if ("failure" in res) return res;
     staged.set(assetId, res.src);
   }
-  return { edl: substituteAssetSrcs(edl, (id) => staged.get(id)!) };
+  return { edl: layoutText(substituteAssetSrcs(edl, (id) => staged.get(id)!)) };
+}
+
+/**
+ * Send each line of a wrapped caption as its own element. The render service
+ * draws text without wrapping, and a multi-line element would left-align its
+ * lines; one centred element per line matches what the preview shows, because
+ * both break lines with the same function.
+ */
+type Overlay = NonNullable<Edl["overlays"]>[number]["elements"][number];
+
+function layoutText(edl: Edl): Edl {
+  const { width: W, height: H } = edl.output;
+  return {
+    ...edl,
+    overlays: edl.overlays?.map((track) => ({
+      ...track,
+      elements: track.elements.flatMap((el): Overlay[] => {
+        if (el.type !== "text") return [el];
+        const lines = wrapLines(el.text, el.fontSize, W, el.fontFamily ?? "sans");
+        const step = lineStep(el.fontSize, !!el.background) / H;
+        return lines
+          .map((line, n) => ({ ...el, id: `${el.id}-l${n}`, text: line, y: Math.min(1, el.y + n * step) }))
+          .filter((line) => line.text.trim().length > 0);
+      }),
+    })),
+  };
 }
 
 /** Stream one asset from this app's storage to the edit service's staging. */
@@ -287,6 +314,8 @@ function analysisPrompt(mode: string, brief?: string, window?: SourceWindow): st
     "Cuts: the segments worth keeping, in playback order, with millisecond start/end timestamps " +
     "(tight in-points and out-points). " +
     "Captions: short on-screen lines matching the spoken content, with millisecond timing. " +
+    "If the footage already shows subtitles or captions on screen, return an empty captions array: " +
+    "a second set on top would cover the first. " +
     `${wants}${brief ? ` Context from the editor (the clip may sit inside a larger project): ${brief}` : ""}` +
     (window
       ? ` Only the part from ${window.start.toFixed(1)}s to ${window.end.toFixed(1)}s of this video is in the edit; ` +
@@ -561,7 +590,8 @@ export async function autocutAssets(
     `start/end within each clip, tight in/out points), drop dead air, false starts, filler and ` +
     `redundancy across clips, and ORDER the segments for the strongest result — the output order ` +
     `is your sequence array, and it does not have to follow the clip order. Give each segment an ` +
-    `optional short on-screen caption (empty string for none). Keep the total under 240 seconds ` +
+    `optional short on-screen caption (empty string for none; always empty if the footage already ` +
+    `shows subtitles on screen). Keep the total under 240 seconds ` +
     `unless the brief demands otherwise. ` +
     (brief ? `The video's purpose: ${brief}` : `No brief was given — aim for a tight, watchable cut.`);
 

@@ -11,6 +11,7 @@
 // debounced PUT; validation errors surface with their JSON pointer.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lineStep, wrapLines } from "../shared/textLayout";
 import {
   Check,
   ChevronRight,
@@ -2071,14 +2072,19 @@ function Player({
                   const selected = sel?.area === "ovl" && sel.ti === ti && sel.i === i;
                   if (el.type === "text") {
                     const t = el as OverlayText;
-                    return (
+                    // The same line breaks the export uses: one centred line
+                    // per element, so what shows here is what renders.
+                    const lines = wrapLines(t.text, t.fontSize, edl.output.width, t.fontFamily ?? "sans");
+                    const step = lineStep(t.fontSize, !!t.background) / edl.output.height;
+                    return lines.map((line, n) =>
+                      line.trim() ? (
                       <div
-                        key={el.id}
+                        key={`${el.id}-${n}`}
                         onPointerDown={dragOverlay(ti, i)}
                         className={`absolute cursor-move select-none whitespace-pre leading-tight ${selected ? "outline outline-2 outline-ring" : ""}`}
                         style={{
                           left: `${t.x * 100}%`,
-                          top: `${t.y * 100}%`,
+                          top: `${(t.y + n * step) * 100}%`,
                           transform: t.align === "center" ? "translateX(-50%)" : t.align === "right" ? "translateX(-100%)" : undefined,
                           fontSize: t.fontSize * scale,
                           fontFamily: t.fontFamily === "serif" ? "serif" : t.fontFamily === "mono" ? "monospace" : "Inter, sans-serif",
@@ -2089,8 +2095,9 @@ function Player({
                           textAlign: t.align ?? "left",
                         }}
                       >
-                        {t.text}
+                        {line}
                       </div>
+                      ) : null,
                     );
                   }
                   const m = el as OverlayMedia;
@@ -2284,7 +2291,9 @@ function Inspector({
                     const from = (el as MainVideo).trimStart ?? 0;
                     const window = seg ? { start: from, end: from + seg.dur } : undefined;
                     const r = await api.send<AnalyzeResult>("POST", `/api/assets/${a.id}/analyze`, {
-                      mode: "both",
+                      // Cuts only. Captions are their own deliberate step: added
+                      // here they landed on top of subtitles already in the footage.
+                      mode: "cuts",
                       ...(context ? { prompt: context } : {}),
                       ...(window ? { window } : {}),
                     });
@@ -2293,7 +2302,6 @@ function Inspector({
                       setAnalyzeMsg("No keep-segments proposed.");
                       return;
                     }
-                    const before = segments.slice(0, segments.findIndex((s) => s.i === sel.i)).reduce((acc, s) => acc + s.dur, 0);
                     update((d) => {
                       const base = d.main.elements[sel.i] as MainVideo;
                       const parts: MainVideo[] = keeps.map((k) => {
@@ -2302,41 +2310,10 @@ function Inspector({
                         return p;
                       });
                       d.main.elements.splice(sel.i, 1, ...parts);
-                      // Captions land on the output timeline: offset each by the
-                      // kept time that precedes it inside this clip.
-                      const caps = r.captions
-                        .map((c) => {
-                          let out = before;
-                          for (const k of keeps) {
-                            if (c.start_ms >= k.end_ms) out += (k.end_ms - k.start_ms) / 1000;
-                            else if (c.start_ms >= k.start_ms) return { c, at: out + (c.start_ms - k.start_ms) / 1000 };
-                            else return null;
-                          }
-                          return null;
-                        })
-                        .filter(Boolean) as { c: AnalyzeResult["captions"][number]; at: number }[];
-                      if (caps.length) {
-                        d.overlays = d.overlays ?? [];
-                        const track: OverlayTrack = { id: rid(), elements: [] };
-                        for (const { c, at } of caps) {
-                          track.elements.push({
-                            id: rid(),
-                            type: "text",
-                            text: c.text,
-                            fontSize: Math.round(edl.output.height * 0.055),
-                            startTime: Math.round(at * 100) / 100,
-                            duration: Math.max(0.4, (c.end_ms - c.start_ms) / 1000),
-                            x: 0.5,
-                            y: 0.82,
-                            align: "center",
-                            color: DEFAULT_TEXT_COLOR,
-                            background: "#000000a0",
-                          });
-                        }
-                        d.overlays.push(track);
-                      }
                     });
-                    setAnalyzeMsg(`Applied ${keeps.length} segment${keeps.length > 1 ? "s" : ""}${r.captions.length ? ` + ${r.captions.length} captions` : ""}.`);
+                    setAnalyzeMsg(
+                      keeps.length === 1 ? "Nothing to cut: the clip was kept whole." : `Kept ${keeps.length} parts.`,
+                    );
                   } catch (e) {
                     setAnalyzeMsg(String((e as Error).message));
                   } finally {
