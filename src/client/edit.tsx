@@ -883,9 +883,17 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         d.main.elements.splice(seg.i + 1, 0, right);
       } else {
         const ts = el.trimStart ?? 0;
-        const te = el.trimEnd ?? 0;
         const right = { ...structuredClone(el), id: rid(), trimStart: ts + off };
-        el.trimEnd = te + (seg.dur - off);
+        if (el.duration !== undefined) {
+          // Play-window form ("play N seconds from here", what Auto-cut and
+          // Ask write): duration wins over trimEnd, so the window itself has
+          // to be divided. Setting trimEnd here left the first half playing
+          // its whole length and gave the second half a copy of it.
+          right.duration = seg.dur - off;
+          el.duration = off;
+        } else {
+          el.trimEnd = (el.trimEnd ?? 0) + (seg.dur - off);
+        }
         d.main.elements.splice(seg.i + 1, 0, right);
       }
     });
@@ -2458,7 +2466,7 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
 const RULER_H = 22;
 const MAIN_H = 52;
 /** Space between neighbouring clips on the main track, in pixels. */
-const CLIP_GAP = 2;
+const CLIP_GAP = 4;
 const ROW_H = 30;
 const HEAD_W = 96;
 
