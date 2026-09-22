@@ -204,6 +204,60 @@ const rid = () => Math.random().toString(36).slice(2, 10);
  */
 const assetUrl = (a: Asset) => `/api/assets/${encodeURIComponent(a.id)}/source`;
 
+/**
+ * Adaptive playback for one media-service clip. The library is fetched only
+ * when such a clip actually plays, and Safari needs none of it.
+ */
+function MediaVideo({
+  asset,
+  elementRef,
+  ...rest
+}: {
+  asset: Asset;
+  elementRef: (v: HTMLVideoElement | null) => void;
+} & React.VideoHTMLAttributes<HTMLVideoElement>) {
+  const ref = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const v = ref.current;
+    if (!v) return;
+    let dead = false;
+    let hls: { destroy: () => void } | null = null;
+
+    (async () => {
+      const play = await api.get<{ ready: boolean; hls?: string }>(`/api/assets/${asset.id}/playback`);
+      if (dead || !play.ready || !play.hls) return;
+      if (v.canPlayType("application/vnd.apple.mpegurl")) {
+        v.src = play.hls;
+        return;
+      }
+      const { default: Hls } = await import("hls.js");
+      if (dead || !Hls.isSupported()) return;
+      const instance = new Hls({ maxBufferLength: 30 });
+      instance.loadSource(play.hls);
+      instance.attachMedia(v);
+      hls = instance;
+    })().catch(() => {
+      /* the tile already shows whether the clip is ready */
+    });
+
+    return () => {
+      dead = true;
+      hls?.destroy();
+    };
+  }, [asset.id]);
+
+  return (
+    <video
+      ref={(v) => {
+        ref.current = v;
+        elementRef(v);
+      }}
+      {...rest}
+    />
+  );
+}
+
 /** A frame of media-service footage, which beats decoding the video for one. */
 const frameUrl = (a: Asset, at = 0) => `/api/assets/${encodeURIComponent(a.id)}/frame?t=${Math.max(0, at).toFixed(1)}`;
 const isVideoAsset = (a: Asset) => a.content_type.startsWith("video/");
@@ -334,6 +388,30 @@ function FilmStrip({ url, from, to, width, height }: { url: string; from: number
     };
   }, [url, from, to, width, height]);
   return <canvas ref={ref} width={Math.max(1, width)} height={height} className="w-full h-full rounded-[3px]" />;
+}
+
+/**
+ * The same strip for media-service footage, from the service's own frames.
+ * Decoding a master in the browser to draw ten thumbnails competed with
+ * playback for the same bytes, which is part of what made it stutter.
+ */
+function FrameStrip({ asset, from, to, width }: { asset: Asset; from: number; to: number; width: number }) {
+  const n = Math.max(1, Math.min(10, Math.floor(width / 56)));
+  const span = Math.max(0.01, to - from);
+  return (
+    <div className="flex w-full h-full">
+      {Array.from({ length: n }, (_, i) => (
+        <img
+          key={i}
+          src={frameUrl(asset, from + ((i + 0.5) * span) / n)}
+          alt=""
+          loading="lazy"
+          className="h-full object-cover"
+          style={{ width: `${100 / n}%` }}
+        />
+      ))}
+    </div>
+  );
 }
 
 /** Simple peak waveform for an audio source. */
@@ -1001,6 +1079,7 @@ function LeftPanel({
 }) {
   const [uploading, setUploading] = useState(false);
   const [uploadErr, setUploadErr] = useState("");
+  const mediaReady = useMediaReady(assets);
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1129,16 +1208,24 @@ function LeftPanel({
             />
             {uploadErr && <div className="text-fine text-danger mb-2">{uploadErr}</div>}
             <div className="space-y-2">
-              {list.map((a) => (
+              {list.map((a) => {
+                const preparing = !!a.media_uid && !mediaReady.has(a.id);
+                return (
                 <button
                   key={a.id}
-                  onClick={() => onAdd(a)}
-                  title="Add to timeline"
+                  onClick={() => !preparing && onAdd(a)}
+                  disabled={preparing}
+                  title={preparing ? "Still being prepared" : "Add to timeline"}
                   aria-label={`Add ${a.name} to the timeline`}
-                  className="w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group"
+                  className="w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group disabled:hover:bg-surface"
                 >
                   {isVideoAsset(a) ? (
-                    a.media_uid ? (
+                    preparing ? (
+                      <div className="w-full h-20 grid place-items-center bg-surface-sunken text-fine text-muted gap-1">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Preparing
+                      </div>
+                    ) : a.media_uid ? (
                       <img src={frameUrl(a, 1)} alt="" className="w-full h-20 object-cover bg-black" />
                     ) : (
                       <video src={assetUrl(a)} muted preload="metadata" className="w-full h-20 object-cover bg-black" />
@@ -1152,7 +1239,8 @@ function LeftPanel({
                   )}
                   <div className="px-2 py-1.5 text-fine truncate text-muted group-hover:text-foreground">{a.name}</div>
                 </button>
-              ))}
+                );
+              })}
               {list.length === 0 && (
                 <p className="text-fine text-muted py-4 text-center">
                   {tab === "audio"
@@ -1190,6 +1278,42 @@ function fmtBytes(n: number | null): string {
   if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
   return `${Math.max(1, Math.round(n / 1e3))} KB`;
+}
+
+/**
+ * Footage handed to the media service is not playable while it ingests, so
+ * the library says so and the clip stays out of the timeline until it is.
+ * Polls only while something is still pending.
+ */
+function useMediaReady(assets: Asset[]): Set<string> {
+  const [ready, setReady] = useState<Set<string>>(new Set());
+  const pending = assets.filter((a) => a.media_uid && !ready.has(a.id)).map((a) => a.id);
+  const key = pending.join(",");
+
+  useEffect(() => {
+    if (!key) return;
+    let dead = false;
+    const check = async () => {
+      const done: string[] = [];
+      for (const id of key.split(",")) {
+        try {
+          const r = await api.get<{ ready: boolean }>(`/api/assets/${id}/playback`);
+          if (r.ready) done.push(id);
+        } catch {
+          /* still ingesting, or a hiccup: ask again on the next pass */
+        }
+      }
+      if (!dead && done.length) setReady((cur) => new Set([...cur, ...done]));
+    };
+    check();
+    const t = setInterval(check, 5000);
+    return () => {
+      dead = true;
+      clearInterval(t);
+    };
+  }, [key]);
+
+  return ready;
 }
 
 /** Search the org's Google Drive and copy picked files into the library. */
@@ -1678,16 +1802,29 @@ function Player({
               style: { objectFit: fit } as React.CSSProperties,
             };
             return seg.el.type === "video" ? (
-              <video
-                key={seg.el.id}
-                ref={(v) => {
-                  if (v) videoRefs.current.set(seg.el.id, v);
-                }}
-                src={assetUrl(a)}
-                preload="auto"
-                playsInline
-                {...common}
-              />
+              a.media_uid ? (
+                <MediaVideo
+                  key={seg.el.id}
+                  asset={a}
+                  elementRef={(v) => {
+                    if (v) videoRefs.current.set(seg.el.id, v);
+                  }}
+                  preload="auto"
+                  playsInline
+                  {...common}
+                />
+              ) : (
+                <video
+                  key={seg.el.id}
+                  ref={(v) => {
+                    if (v) videoRefs.current.set(seg.el.id, v);
+                  }}
+                  src={assetUrl(a)}
+                  preload="auto"
+                  playsInline
+                  {...common}
+                />
+              )
             ) : (
               <img key={seg.el.id} src={assetUrl(a)} {...common} />
             );
@@ -2367,13 +2504,22 @@ function TimelinePanel({
                   title={a?.name}
                 >
                   {seg.el.type === "video" && a && seg.dur > 0 ? (
-                    <FilmStrip
-                      url={assetUrl(a)}
-                      from={(seg.el as MainVideo).trimStart ?? 0}
-                      to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
-                      width={Math.round(w)}
-                      height={MAIN_H - 8}
-                    />
+                    a.media_uid ? (
+                      <FrameStrip
+                        asset={a}
+                        from={(seg.el as MainVideo).trimStart ?? 0}
+                        to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
+                        width={Math.round(w)}
+                      />
+                    ) : (
+                      <FilmStrip
+                        url={assetUrl(a)}
+                        from={(seg.el as MainVideo).trimStart ?? 0}
+                        to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
+                        width={Math.round(w)}
+                        height={MAIN_H - 8}
+                      />
+                    )
                   ) : a ? (
                     <img src={assetUrl(a)} className="w-full h-full object-cover" />
                   ) : null}
