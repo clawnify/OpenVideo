@@ -38,3 +38,15 @@ export function lineStep(fontSize: number, boxed: boolean): number {
   // A boxed line carries its padding above and below; boxes must not overlap.
   return fontSize * (boxed ? 1.7 : 1.25);
 }
+
+/** Height of a text block in frame pixels, from the top of its first line. */
+export function blockHeight(
+  text: string,
+  fontSize: number,
+  frameWidth: number,
+  family: FontFamily = "sans",
+  boxed = false,
+): number {
+  const lines = wrapLines(text, fontSize, frameWidth, family).length;
+  return (lines - 1) * lineStep(fontSize, boxed) + fontSize * (boxed ? 1.6 : 1.2);
+}

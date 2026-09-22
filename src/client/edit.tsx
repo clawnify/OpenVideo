@@ -11,8 +11,14 @@
 // debounced PUT; validation errors surface with their JSON pointer.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { lineStep, wrapLines } from "../shared/textLayout";
+import { blockHeight, lineStep, wrapLines } from "../shared/textLayout";
 import {
+  AlignCenterHorizontal,
+  AlignCenterVertical,
+  AlignEndHorizontal,
+  AlignEndVertical,
+  AlignStartHorizontal,
+  AlignStartVertical,
   Check,
   ChevronRight,
   Cloud,
@@ -2375,20 +2381,14 @@ function Inspector({
                   <input className={inputCls} value={el.background ?? ""} placeholder="#00000080" onChange={(e) => set((x) => ((x as OverlayText).background = e.target.value || undefined))} />
                 </Row>
               </div>
-              <Row label="Align">
-                <select className={inputCls} value={el.align ?? "left"} onChange={(e) => set((x) => ((x as OverlayText).align = e.target.value as OverlayText["align"]))}>
-                  <option value="left">Left</option>
-                  <option value="center">Center</option>
-                  <option value="right">Right</option>
-                </select>
-              </Row>
             </>
           )}
           {el.type !== "text" && <SliderRow label="Width" value={(el as OverlayMedia).width} min={0.02} onChange={(n) => set((x) => ((x as OverlayMedia).width = n))} />}
-          <div className="grid grid-cols-2 gap-2">
-            <SliderRow label="X" value={el.x} onChange={(n) => set((x) => (x.x = n))} />
-            <SliderRow label="Y" value={el.y} onChange={(n) => set((x) => (x.y = n))} />
-          </div>
+          <PositionRow
+            el={el}
+            frame={edl.output}
+            onPlace={(place) => set((x) => Object.assign(x, place))}
+          />
           <SliderRow label="Opacity" value={el.opacity ?? 1} onChange={(n) => set((x) => (x.opacity = n))} />
           <div className="grid grid-cols-2 gap-2">
             <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
@@ -2423,6 +2423,80 @@ function Inspector({
         </button>
       )}
     </div>
+  );
+}
+
+// ── overlay position ────────────────────────────────────────────────────────
+
+/** How far from the frame's edge an aligned overlay sits, as a share of it. */
+const EDGE = 0.06;
+
+/**
+ * Place an overlay by intent (left, centre, bottom) instead of coordinates;
+ * dragging it on the canvas stays the fine control. Text moves on both axes.
+ * An image or video overlay moves only sideways here: its height follows the
+ * source's shape, which this panel does not know.
+ */
+function PositionRow({
+  el,
+  frame,
+  onPlace,
+}: {
+  el: OverlayText | OverlayMedia;
+  frame: Edl["output"];
+  onPlace: (place: { x?: number; y?: number; align?: OverlayText["align"] }) => void;
+}) {
+  const isText = el.type === "text";
+  const text = el as OverlayText;
+  const width = isText ? 0 : (el as OverlayMedia).width;
+
+  const horizontal = (side: "left" | "center" | "right") => {
+    if (isText) {
+      onPlace({ align: side, x: side === "left" ? EDGE : side === "center" ? 0.5 : 1 - EDGE });
+    } else {
+      onPlace({ x: side === "left" ? EDGE : side === "center" ? (1 - width) / 2 : 1 - EDGE - width });
+    }
+  };
+
+  const vertical = (side: "top" | "middle" | "bottom") => {
+    const h =
+      blockHeight(text.text, text.fontSize, frame.width, text.fontFamily ?? "sans", !!text.background) / frame.height;
+    const y = side === "top" ? EDGE : side === "middle" ? (1 - h) / 2 : 1 - EDGE - h;
+    onPlace({ y: Math.max(0, Math.min(1, Math.round(y * 1000) / 1000)) });
+  };
+
+  const group = "inline-flex items-center gap-0.5 rounded-sm bg-surface-sunken p-0.5";
+  const cell = "grid place-items-center w-7 h-6 rounded-xs text-muted hover:text-foreground hover:bg-surface";
+
+  return (
+    <Row label="Position">
+      <div className="flex items-center gap-2">
+        <div className={group} role="group" aria-label="Horizontal position">
+          <button className={cell} onClick={() => horizontal("left")} aria-label="Align left" title="Align left">
+            <AlignStartVertical className="w-4 h-4" />
+          </button>
+          <button className={cell} onClick={() => horizontal("center")} aria-label="Centre horizontally" title="Centre horizontally">
+            <AlignCenterVertical className="w-4 h-4" />
+          </button>
+          <button className={cell} onClick={() => horizontal("right")} aria-label="Align right" title="Align right">
+            <AlignEndVertical className="w-4 h-4" />
+          </button>
+        </div>
+        {isText && (
+          <div className={group} role="group" aria-label="Vertical position">
+            <button className={cell} onClick={() => vertical("top")} aria-label="Align top" title="Align top">
+              <AlignStartHorizontal className="w-4 h-4" />
+            </button>
+            <button className={cell} onClick={() => vertical("middle")} aria-label="Centre vertically" title="Centre vertically">
+              <AlignCenterHorizontal className="w-4 h-4" />
+            </button>
+            <button className={cell} onClick={() => vertical("bottom")} aria-label="Align bottom" title="Align bottom">
+              <AlignEndHorizontal className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+      </div>
+    </Row>
   );
 }
 
