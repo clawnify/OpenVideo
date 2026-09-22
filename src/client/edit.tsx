@@ -1279,6 +1279,7 @@ function DriveDialog({
 
   const limited = !!status?.folder;
   const atLimitRoot = trail.length === 1;
+  const atRoot = !limited && here?.id === "root";
 
   return (
     <Dialog
@@ -1338,7 +1339,7 @@ function DriveDialog({
             data-autofocus
           />
 
-          <div className="mt-2 flex gap-3">
+          <div className="mt-2 flex flex-col sm:flex-row gap-3">
             <div className="flex-1 min-w-0 max-h-80 overflow-y-auto -mx-2">
               {files === null ? (
                 /* Loading is the shape of the answer, never a spinner. */
@@ -1357,6 +1358,11 @@ function DriveDialog({
                 </p>
               ) : (
                 <>
+                  {atRoot && files.length === 0 && folders.length === 1 && (
+                    <p className="px-2 pt-1 pb-2 text-fine text-faint">
+                      Nothing here in your own Drive. Files people shared with you are below.
+                    </p>
+                  )}
                   {folders.map((f) => (
                     <button
                       key={f.id}
@@ -1408,7 +1414,7 @@ function DriveDialog({
             </div>
 
             {/* What you picked, before you commit to copying it. */}
-            <div className="w-56 shrink-0">
+            <div className="w-full sm:w-56 shrink-0">
               {picked ? (
                 <div className="space-y-2">
                   <div className="aspect-video rounded-sm bg-surface-sunken grid place-items-center overflow-hidden text-muted">
@@ -1447,7 +1453,12 @@ function DriveDialog({
                   )}
                 </div>
               ) : (
-                <p className="text-fine text-faint">Pick a file to preview it.</p>
+                <div className="space-y-2">
+                  <div className="aspect-video rounded-sm border border-dashed border-border grid place-items-center text-faint">
+                    <ImageIcon className="w-5 h-5" />
+                  </div>
+                  <p className="text-fine text-faint">Pick a file to preview it.</p>
+                </div>
               )}
             </div>
           </div>
