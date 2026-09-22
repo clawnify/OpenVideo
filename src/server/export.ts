@@ -9,7 +9,7 @@
 
 import { get, run } from "./db";
 import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
-import { prepareMedia } from "./media";
+import { mediaState, prepareMedia } from "./media";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -69,9 +69,17 @@ export async function ensureStagedSrc(
   // Footage on the media service is cut where it lies: the edit service reads
   // only the seconds the cut needs, so nothing is staged and no size applies.
   if (asset.media_uid) {
-    const prepared = await prepareMedia(cfg, asset.media_uid);
+    let prepared = await prepareMedia(cfg, asset.media_uid);
     if ("failure" in prepared) {
       return { failure: { error: prepared.failure.error, detail: prepared.failure.detail } };
+    }
+    // The MP4 may still be generating. Wait a little rather than failing the
+    // request and making the person press the button again.
+    for (let i = 0; i < 12 && prepared.media.download?.status !== "ready"; i++) {
+      await new Promise((r) => setTimeout(r, 2500));
+      const state = await mediaState(cfg, asset.media_uid);
+      if ("failure" in state) break;
+      prepared = state;
     }
     if (prepared.media.download?.status !== "ready") {
       return {

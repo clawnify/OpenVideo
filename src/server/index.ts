@@ -210,6 +210,12 @@ app.get("/api/assets/:id/playback", async (c) => {
   }
   const play = await mediaPlayback(cfg, asset.media_uid);
   if ("failure" in play) return c.json(play.failure, 502);
+  // The MP4 the edit service cuts from is made only on request, so ask for it
+  // the moment the clip can play: by the time someone exports or analyses it,
+  // it is usually ready, instead of the first attempt failing.
+  if (state.media.download?.status !== "ready" && state.media.download?.status !== "inprogress") {
+    c.executionCtx.waitUntil(prepareMedia(cfg, asset.media_uid).then(() => {}));
+  }
   // The length the service measured beats the one the picker guessed.
   if (state.media.duration && Math.abs((asset.duration ?? 0) - state.media.duration) > 0.5) {
     await run("UPDATE assets SET duration = ? WHERE id = ?", [state.media.duration, asset.id]);
