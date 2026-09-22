@@ -308,7 +308,15 @@ function FilmStrip({ url, from, to, width, height }: { url: string; from: number
           v.addEventListener("seeked", done);
         });
         if (dead) return;
-        ctx.drawImage(v, i * fw, 0, fw, height);
+        // Fill the cell without distorting the frame: scale to cover, then
+        // take the middle of what does not fit. A 16:9 clip in a narrow cell
+        // was being squeezed sideways.
+        const vw = v.videoWidth || fw;
+        const vh = v.videoHeight || height;
+        const scale = Math.max(fw / vw, height / vh);
+        const sw = Math.min(vw, fw / scale);
+        const sh = Math.min(vh, height / scale);
+        ctx.drawImage(v, (vw - sw) / 2, (vh - sh) / 2, sw, sh, i * fw, 0, fw, height);
       }
     };
     return () => {

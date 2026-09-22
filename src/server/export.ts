@@ -45,6 +45,11 @@ export interface ExportFailure {
  * returns its "file:…" src. Used by exports (every referenced asset) and by
  * footage analysis (one asset at a time).
  */
+/** What the edit service accepts for one staged file (services/staging.ts). */
+const MAX_STAGE_BYTES = 500 * 1024 * 1024;
+
+const mb = (n: number) => `${Math.round(n / (1024 * 1024))} MB`;
+
 export async function ensureStagedSrc(
   assetId: string,
   cfg: ExportConfig,
@@ -55,6 +60,18 @@ export async function ensureStagedSrc(
       failure: {
         error: "asset_not_found",
         detail: `no media-library asset with id "${assetId}" — list assets with GET /api/assets`,
+      },
+    };
+  }
+
+  // The edit service accepts a staged file up to this size. Without the check
+  // the upload dies part-way and the runtime reports a lost connection, which
+  // tells the user nothing about the actual problem.
+  if (asset.size > MAX_STAGE_BYTES) {
+    return {
+      failure: {
+        error: "clip_too_large",
+        detail: `"${asset.name}" is ${mb(asset.size)}; a clip has to be ${mb(MAX_STAGE_BYTES)} or smaller to export or analyse. Trim it, or import a smaller version.`,
       },
     };
   }
