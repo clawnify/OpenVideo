@@ -23,9 +23,11 @@ import {
   Pause,
   Play,
   Plus,
+  Redo2,
   Scissors,
   Sparkles,
   Trash2,
+  Undo2,
   Type as TypeIcon,
   Upload,
   Eye,
@@ -673,6 +675,15 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const [name, setName] = useState(initial.name);
   const [brief, setBrief] = useState(initial.brief ?? "");
   const [edl, setEdl] = useState<Edl>(initial.edl);
+  // Undo history. Every edit already replaces the whole document, so a step
+  // is just the document before it. A stroke (dragging a trim handle) folds
+  // into one step: undo should walk back an action, not a pixel.
+  const edlRef = useRef(edl);
+  edlRef.current = edl;
+  const past = useRef<Edl[]>([]);
+  const future = useRef<Edl[]>([]);
+  const lastEdit = useRef(0);
+  const [, bumpHistory] = useState(0);
   const [assets, setAssets] = useState<Asset[]>(initialAssets);
   const [sel, setSel] = useState<Sel>(null);
   const [tab, setTab] = useState<"media" | "audio" | "text">("media");
@@ -709,13 +720,66 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     return () => clearTimeout(t);
   }, [edl, name, brief, initial.id, initial.edl, initial.name, initial.brief]);
 
-  const update = useCallback((fn: (draft: Edl) => void) => {
-    setEdl((cur) => {
-      const draft = structuredClone(cur);
-      fn(draft);
-      return draft;
-    });
+  /**
+   * Replace the document, remembering the version before it. `coalesce` folds
+   * this edit into the previous step when they belong to the same gesture.
+   */
+  const commit = useCallback((next: Edl, coalesce = false) => {
+    const cur = edlRef.current;
+    if (next === cur) return;
+    const now = Date.now();
+    if (!(coalesce && now - lastEdit.current < 600)) {
+      past.current = [...past.current, cur].slice(-50);
+    }
+    lastEdit.current = now;
+    future.current = [];
+    edlRef.current = next;
+    setEdl(next);
+    bumpHistory((n) => n + 1);
   }, []);
+
+  const update = useCallback(
+    (fn: (draft: Edl) => void, coalesce = false) => {
+      const draft = structuredClone(edlRef.current);
+      fn(draft);
+      commit(draft, coalesce);
+    },
+    [commit],
+  );
+
+  const undo = useCallback(() => {
+    const prev = past.current.pop();
+    if (!prev) return;
+    future.current = [...future.current, edlRef.current];
+    edlRef.current = prev;
+    setEdl(prev);
+    setSel(null);
+    bumpHistory((n) => n + 1);
+  }, []);
+
+  const redo = useCallback(() => {
+    const next = future.current.pop();
+    if (!next) return;
+    past.current = [...past.current, edlRef.current];
+    edlRef.current = next;
+    setEdl(next);
+    setSel(null);
+    bumpHistory((n) => n + 1);
+  }, []);
+
+  // Cmd+Z / Ctrl+Z, and Shift for redo. Ignored while typing.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "z") return;
+      const el = e.target as HTMLElement | null;
+      if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+      e.preventDefault();
+      if (e.shiftKey) redo();
+      else undo();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [undo, redo]);
 
   // ── derived timeline ──────────────────────────────────────────────────────
   const segments = useMemo(() => mainSegments(edl, srcDur), [edl, srcDur]);
@@ -855,6 +919,24 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         </span>
         <div className="flex-1" />
         <button
+          onClick={undo}
+          disabled={past.current.length === 0}
+          title="Undo (Cmd+Z)"
+          aria-label="Undo"
+          className={btnIcon}
+        >
+          <Undo2 className="w-4 h-4" />
+        </button>
+        <button
+          onClick={redo}
+          disabled={future.current.length === 0}
+          title="Redo (Shift+Cmd+Z)"
+          aria-label="Redo"
+          className={btnIcon}
+        >
+          <Redo2 className="w-4 h-4" />
+        </button>
+        <button
           onClick={() => setAutocutOpen(true)}
           className={btnSecondary}
           title="Assemble a cut from several clips with AI"
@@ -896,7 +978,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           setBrief={setBrief}
           onClose={() => setAutocutOpen(false)}
           onApplied={(next) => {
-            setEdl(next);
+            // One step for the whole AI pass: undo puts the cut back as it was.
+            commit(next);
             setSel(null);
             setAutocutOpen(false);
             seek(0);
@@ -1658,7 +1741,8 @@ function Player({
   resolveAsset: (src: string) => Asset | undefined;
   sel: Sel;
   setSel: (s: Sel) => void;
-  update: (fn: (d: Edl) => void) => void;
+  /** `coalesce` folds this edit into the previous undo step (one drag, one step). */
+  update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -1769,7 +1853,7 @@ function Player({
           t.x = Math.round(nx * 1000) / 1000;
           t.y = Math.round(ny * 1000) / 1000;
         }
-      });
+      }, true);
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -1960,7 +2044,8 @@ function Inspector({
   pane: Pane;
   edl: Edl;
   sel: Sel;
-  update: (fn: (d: Edl) => void) => void;
+  /** `coalesce` folds this edit into the previous undo step (one drag, one step). */
+  update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
   srcDur: (src: string) => number | undefined;
   resolveAsset: (src: string) => Asset | undefined;
   segments: ReturnType<typeof mainSegments>;
@@ -2306,7 +2391,8 @@ function TimelinePanel({
   seek: (t: number) => void;
   sel: Sel;
   setSel: (s: Sel) => void;
-  update: (fn: (d: Edl) => void) => void;
+  /** `coalesce` folds this edit into the previous undo step (one drag, one step). */
+  update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
   srcDur: (src: string) => number | undefined;
   resolveAsset: (src: string) => Asset | undefined;
   splitAtPlayhead: () => void;
@@ -2374,7 +2460,7 @@ function TimelinePanel({
             (t as MainVideo).trimEnd = Math.round(ne * 100) / 100;
           }
         }
-      });
+      }, true);
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -2401,7 +2487,7 @@ function TimelinePanel({
         const t = get(d) as { startTime: number; duration?: number };
         if (mode === "move") t.startTime = Math.max(0, Math.round((orig.startTime + ds) * 100) / 100);
         else t.duration = Math.max(0.2, Math.round(((orig.duration ?? 1) + ds) * 100) / 100);
-      });
+      }, true);
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
