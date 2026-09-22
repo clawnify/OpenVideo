@@ -20,6 +20,13 @@ export interface InstructConfig {
   servicesUrl?: string;
 }
 
+/** Watches a clip's window and says which parts of the source to keep. */
+export type ClipAnalyzer = (
+  assetId: string,
+  window: { start: number; end: number } | undefined,
+  focus: string | undefined,
+) => Promise<{ keeps: { start: number; end: number }[]; notes: string } | { error: string }>;
+
 export interface InstructFailure {
   error: string;
   detail: string;
@@ -119,6 +126,19 @@ const OPS = [
     },
   },
   {
+    name: "clean_up_clip",
+    description:
+      "Watch one main-track clip and keep only what should stay: drops dead air, long pauses, false starts, filler and broken moments. You cannot see or hear the footage yourself, so use this for any request about what is said or shown ('cut where needed', 'remove the pauses'). It replaces the clip with the parts worth keeping.",
+    parameters: {
+      type: "object",
+      properties: {
+        clip: { type: "integer" },
+        focus: { type: "string", description: "optional: what to look for, in the user's words" },
+      },
+      required: ["clip"],
+    },
+  },
+  {
     name: "set_aspect",
     description:
       "Change the shape of the finished video: 'landscape' (16:9), 'vertical' (9:16) or 'square'.",
@@ -166,10 +186,11 @@ function apply(draft: Edl, name: string, args: Record<string, unknown>): { said:
       const playing = clip.duration;
       if (playing !== undefined && at >= playing) return { error: "that point is past the end of the clip" };
       const second = { ...clip, id: rid(), trimStart: (clip.trimStart ?? 0) + at } as Clip;
-      if (playing !== undefined) {
-        second.duration = playing - at;
-        clip.duration = at;
-      }
+      if (playing !== undefined) second.duration = playing - at;
+      // The first half plays up to the cut either way. Leaving it without a
+      // duration, as an untrimmed clip has, made it play to the end and the
+      // footage appeared twice.
+      clip.duration = at;
       main.splice(i + 1, 0, second);
       return { said: `Split clip ${i} at ${at.toFixed(1)}s` };
     }
@@ -233,6 +254,43 @@ function apply(draft: Edl, name: string, args: Record<string, unknown>): { said:
   }
 }
 
+/** Run the clip analysis on one clip's window and keep only what it keeps. */
+async function cleanUp(
+  draft: Edl,
+  args: Record<string, unknown>,
+  sourceSeconds: Map<string, number>,
+  analyze?: ClipAnalyzer,
+): Promise<{ said: string } | { error: string }> {
+  if (!analyze) return { error: "clip analysis is not available here" };
+  const i = Number(args.clip);
+  const el = draft.main.elements[i];
+  if (!Number.isInteger(i) || !el) return { error: `there is no clip ${args.clip}` };
+  if (el.type !== "video" || !el.src.startsWith("asset:")) return { error: "only a video from the library can be cleaned up" };
+
+  const start = el.trimStart ?? 0;
+  const length = sourceSeconds.get(el.src);
+  const end =
+    el.duration !== undefined ? start + el.duration : length !== undefined ? length - (el.trimEnd ?? 0) : undefined;
+  const found = await analyze(el.src.slice(6), end !== undefined ? { start, end } : undefined, args.focus as string | undefined);
+  if ("error" in found) return { error: found.error };
+
+  const keeps = found.keeps.filter((k) => k.end - k.start >= 0.1);
+  if (keeps.length === 0) return { error: "it found nothing worth keeping, so the clip was left alone" };
+  const before = end !== undefined ? end - start : null;
+  const after = keeps.reduce((sum, k) => sum + (k.end - k.start), 0);
+  if (keeps.length === 1 && before !== null && before - after < 0.3) {
+    return { said: `Watched clip ${i} and found nothing to cut (${found.notes})` };
+  }
+  const parts = keeps.map((k) => {
+    const part = { ...structuredClone(el), id: rid(), trimStart: k.start, duration: k.end - k.start };
+    delete (part as { trimEnd?: number }).trimEnd;
+    return part;
+  });
+  draft.main.elements.splice(i, 1, ...parts);
+  const removed = before !== null ? ` and removed ${(before - after).toFixed(1)}s` : "";
+  return { said: `Cleaned up clip ${i}: kept ${keeps.length} part${keeps.length > 1 ? "s" : ""}${removed}` };
+}
+
 /** What the model is shown: the cut as a short list, not raw JSON. */
 function describeEdl(edl: Edl, names: Map<string, string>): string {
   const clips = edl.main.elements.map((el, i) => {
@@ -258,6 +316,7 @@ function describeEdl(edl: Edl, names: Map<string, string>): string {
 
 const SYSTEM = [
   "You edit a video by calling the operations you are given. You never write the document yourself.",
+  "You cannot see or hear the footage. For anything that depends on its content (pauses, dead air, filler, 'cut where needed'), call clean_up_clip on each clip concerned.",
   "Clip times (start, seconds) are measured inside the source footage. Text times are measured on the finished video.",
   "Positions on the main track are the order the clips play in.",
   "Make the smallest set of changes that does what was asked, then stop and say in one sentence what you changed.",
@@ -273,6 +332,9 @@ export async function instructEdit(
   instruction: string,
   assetNames: Map<string, string>,
   cfg: InstructConfig,
+  /** Source length in seconds by `asset:<id>`, to know where a clip's window ends. */
+  sourceSeconds: Map<string, number> = new Map(),
+  analyze?: ClipAnalyzer,
 ): Promise<{ edl: Edl; said: string; applied: AppliedOp[] } | { failure: InstructFailure | EdlInvalid }> {
   if (!cfg.openrouterKey) {
     return {
@@ -323,7 +385,11 @@ export async function instructEdit(
     }
 
     messages.push(message as Record<string, unknown>);
-    for (const call of calls) {
+    // Clip numbers refer to the cut as it was when the model asked. A split or
+    // clean-up inserts clips, so resolve each number to the clip itself first
+    // and look up where it is now when its turn comes.
+    const idsThisRound = draft.main.elements.map((el) => el.id);
+    for (const [n, call] of calls.entries()) {
       const name = call.function?.name ?? "";
       let args: Record<string, unknown> = {};
       try {
@@ -331,12 +397,23 @@ export async function instructEdit(
       } catch {
         /* an unparsable argument is reported back as an error below */
       }
-      const out = apply(draft, name, args);
+      if (typeof args.clip === "number") {
+        const id = idsThisRound[args.clip];
+        const now = draft.main.elements.findIndex((el) => el.id === id);
+        args = { ...args, clip: id === undefined ? args.clip : now };
+      }
+      const out =
+        name === "clean_up_clip" ? await cleanUp(draft, args, sourceSeconds, analyze) : apply(draft, name, args);
       if ("said" in out) applied.push(out.said);
+      // The model plans its next round from this, so the last answer carries
+      // the cut as it now stands, positions included.
+      const last = n === calls.length - 1;
       messages.push({
         role: "tool",
         tool_call_id: call.id,
-        content: "said" in out ? `done: ${out.said}` : `could not: ${out.error}`,
+        content:
+          ("said" in out ? `done: ${out.said}` : `could not: ${out.error}`) +
+          (last ? `\n\nThe cut now:\n${describeEdl(draft, assetNames)}` : ""),
       });
     }
   }

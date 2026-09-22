@@ -1469,8 +1469,8 @@ function AskDialog({
           data-autofocus
         />
         <p className="mt-2 text-fine text-faint">
-          It can trim, split, delete, reorder and mute clips, add or remove on-screen text, and switch the video
-          between landscape, vertical and square.
+          It can trim, split, delete, reorder and mute clips, watch a clip and cut its dead air and false starts,
+          add or remove on-screen text, and switch the video between landscape, vertical and square.
         </p>
         {running && <div className="mt-2 text-fine text-muted">Working through the cut…</div>}
         {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
@@ -2278,9 +2278,15 @@ function Inspector({
                     ]
                       .filter(Boolean)
                       .join(" ");
+                    // The part of the source this clip plays now: the analysis
+                    // stays inside it instead of undoing the trims already made.
+                    const seg = segments.find((x) => x.i === sel.i);
+                    const from = (el as MainVideo).trimStart ?? 0;
+                    const window = seg ? { start: from, end: from + seg.dur } : undefined;
                     const r = await api.send<AnalyzeResult>("POST", `/api/assets/${a.id}/analyze`, {
                       mode: "both",
                       ...(context ? { prompt: context } : {}),
+                      ...(window ? { window } : {}),
                     });
                     const keeps = r.cuts.filter((c) => c.keep).sort((x, y) => x.start_ms - y.start_ms);
                     if (keeps.length === 0) {

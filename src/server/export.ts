@@ -274,7 +274,7 @@ const ANALYSIS_SCHEMA = {
   },
 };
 
-function analysisPrompt(mode: string, brief?: string): string {
+function analysisPrompt(mode: string, brief?: string, window?: SourceWindow): string {
   const wants =
     mode === "cuts"
       ? "Propose cuts only; return an empty captions array."
@@ -287,7 +287,12 @@ function analysisPrompt(mode: string, brief?: string): string {
     "Cuts: the segments worth keeping, in playback order, with millisecond start/end timestamps " +
     "(tight in-points and out-points). " +
     "Captions: short on-screen lines matching the spoken content, with millisecond timing. " +
-    `${wants}${brief ? ` Context from the editor (the clip may sit inside a larger project): ${brief}` : ""}`
+    `${wants}${brief ? ` Context from the editor (the clip may sit inside a larger project): ${brief}` : ""}` +
+    (window
+      ? ` Only the part from ${window.start.toFixed(1)}s to ${window.end.toFixed(1)}s of this video is in the edit; ` +
+        "everything outside it has already been cut. Propose segments inside that span only, " +
+        "with timestamps measured from the start of the whole video."
+      : "")
   );
 }
 
@@ -301,9 +306,33 @@ const ANALYSIS_MODEL = "google/gemini-3.7-flash";
  * from the platform, and calls the model directly on the org's OpenRouter key
  * — the model fetches the video itself; no bytes move through this worker.
  */
+/** The part of a source a clip currently plays, in seconds into that source. */
+export interface SourceWindow {
+  start: number;
+  end: number;
+}
+
+/**
+ * Keep an analysis inside the clip's window. The model watches the whole
+ * source; without this, a proposal could reach back before a trim the person
+ * already made and put that footage back.
+ */
+function withinWindow(result: AnalyzeResult, window?: SourceWindow): AnalyzeResult {
+  if (!window) return result;
+  const lo = window.start * 1000;
+  const hi = window.end * 1000;
+  return {
+    ...result,
+    cuts: result.cuts
+      .map((c) => ({ ...c, start_ms: Math.max(c.start_ms, lo), end_ms: Math.min(c.end_ms, hi) }))
+      .filter((c) => c.end_ms - c.start_ms >= 100),
+    captions: result.captions.filter((c) => c.start_ms >= lo && c.start_ms < hi),
+  };
+}
+
 export async function analyzeAsset(
   assetId: string,
-  opts: { mode?: string; prompt?: string },
+  opts: { mode?: string; prompt?: string; window?: SourceWindow },
   cfg: ExportConfig,
 ): Promise<{ result: AnalyzeResult } | { failure: ExportFailure }> {
   if (!cfg.openrouterKey) {
@@ -328,7 +357,7 @@ export async function analyzeAsset(
         {
           role: "user",
           content: [
-            { type: "text", text: analysisPrompt(mode, opts.prompt) },
+            { type: "text", text: analysisPrompt(mode, opts.prompt, opts.window) },
             { type: "video_url", video_url: { url: media.dataUrl } },
           ],
         },
@@ -361,7 +390,7 @@ export async function analyzeAsset(
   if (!parsed || !Array.isArray(parsed.cuts)) {
     return { failure: { error: "analyze_failed", detail: "model returned unparseable output — retry" } };
   }
-  return { result: { ...(parsed as AnalyzeResult), model: ANALYSIS_MODEL } };
+  return { result: withinWindow({ ...(parsed as AnalyzeResult), model: ANALYSIS_MODEL }, opts.window) };
 }
 
 // ── analysis delivery: base64 data URLs over a small proxy ──────────────────
