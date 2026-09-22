@@ -30,6 +30,7 @@ import {
   Undo2,
   Type as TypeIcon,
   Upload,
+  Wand2,
   Eye,
   EyeOff,
   Volume2,
@@ -694,6 +695,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const [playing, setPlaying] = useState(false);
   const [playhead, setPlayhead] = useState(0);
   const [autocutOpen, setAutocutOpen] = useState(false);
+  const [askOpen, setAskOpen] = useState(false);
   const playheadRef = useRef(0);
   // While a video is playing it IS the clock: the wall clock only fills in
   // for stretches with no video (stills, text). Driving the wall clock and
@@ -937,6 +939,13 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           <Redo2 className="w-4 h-4" />
         </button>
         <button
+          onClick={() => setAskOpen(true)}
+          className={btnSecondary}
+          title="Change the cut by describing it"
+        >
+          <Wand2 className="w-4 h-4" /> <span className="hidden sm:inline">Ask</span>
+        </button>
+        <button
           onClick={() => setAutocutOpen(true)}
           className={btnSecondary}
           title="Assemble a cut from several clips with AI"
@@ -969,6 +978,18 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           ))}
         </div>
       </div>
+
+      {askOpen && (
+        <AskDialog
+          projectId={initial.id}
+          onClose={() => setAskOpen(false)}
+          onApplied={(next) => {
+            // One step for the whole instruction, like Auto-cut.
+            commit(next);
+            setSel(null);
+          }}
+        />
+      )}
 
       {autocutOpen && (
         <AutocutModal
@@ -1336,6 +1357,81 @@ function LeftPanel({
         )}
       </div>
     </div>
+  );
+}
+
+// ── ask for a change ────────────────────────────────────────────────────────
+
+/**
+ * Change the cut by asking. The model calls checked operations on the server
+ * rather than writing the document, and the answer says what it did, so an
+ * edit is reviewable instead of a black box. The whole pass is one undo step.
+ */
+function AskDialog({
+  projectId,
+  onClose,
+  onApplied,
+}: {
+  projectId: string;
+  onClose: () => void;
+  onApplied: (edl: Edl) => void;
+}) {
+  const [instruction, setInstruction] = useState("");
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState("");
+
+  const run = async () => {
+    if (!instruction.trim()) return;
+    setRunning(true);
+    setErr("");
+    try {
+      const out = await api.send<{ edl: Edl; said: string; applied: string[] }>(
+        "POST",
+        `/api/projects/${projectId}/instruct`,
+        { instruction: instruction.trim() },
+      );
+      onApplied(out.edl);
+      onClose();
+    } catch (e) {
+      setErr(String((e as Error).message));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <Dialog
+      title="Ask for a change"
+      icon={<Wand2 className="w-4 h-4 text-muted" />}
+      description="Describe the change in your words. It edits the cut you have, one step you can undo."
+      onClose={onClose}
+      footer={
+        <>
+          <button onClick={onClose} className={btnGhost}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button onClick={run} disabled={running || !instruction.trim()} className={btnPrimary}>
+            {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />} Apply
+          </button>
+        </>
+      }
+    >
+      <div className="mt-4">
+        <textarea
+          className={`${inputCls} min-h-16`}
+          placeholder="e.g. drop the first two seconds of clip 1, put the demo first, and add a title that says Spring Open Day for the first 3 seconds"
+          value={instruction}
+          onChange={(e) => setInstruction(e.target.value)}
+          data-autofocus
+        />
+        <p className="mt-2 text-fine text-faint">
+          It can trim, split, delete, reorder and mute clips, add or remove on-screen text, and switch the video
+          between landscape, vertical and square.
+        </p>
+        {running && <div className="mt-2 text-fine text-muted">Working through the cut…</div>}
+        {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
+      </div>
+    </Dialog>
   );
 }
 

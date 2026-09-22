@@ -21,6 +21,7 @@ import {
   withinFolder,
 } from "./drive";
 import { starterEdl, validateEdl, type Edl } from "./edl";
+import { instructEdit } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, resolveEdlSources, runEdit } from "./export";
 
 type Bindings = {
@@ -437,6 +438,41 @@ app.put("/api/projects/:id", async (c) => {
 // redundancy can't be judged one clip at a time) against the project brief.
 // Replaces the main track and adds a captions overlay; other overlay/audio
 // tracks are left untouched.
+/**
+ * Change the cut by asking for it. The model calls a fixed set of checked
+ * operations rather than writing the document, and the whole instruction
+ * lands as one edit, so the editor can undo it in one step.
+ */
+app.post("/api/projects/:id/instruct", async (c) => {
+  const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+
+  const b = await c.req.json<{ instruction?: string }>().catch(() => ({}) as { instruction?: string });
+  const instruction = b.instruction?.trim();
+  if (!instruction) return c.json({ error: "invalid_request", detail: "instruction is required" }, 422);
+
+  const current = validateEdl(JSON.parse(project.edl));
+  if ("invalid" in current) return c.json(current.invalid, 422);
+
+  // The model reads clip names, not asset ids.
+  const names = new Map<string, string>();
+  for (const row of await query<Asset>("SELECT id, name FROM assets")) {
+    names.set(`asset:${row.id}`, row.name);
+  }
+
+  const out = await instructEdit(current.edl, instruction, names, {
+    openrouterKey: c.env.OPENROUTER_API_KEY,
+    servicesUrl: c.env.SERVICES_URL,
+  });
+  if ("failure" in out) return c.json(out.failure, 422);
+
+  await run("UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ?", [
+    JSON.stringify(out.edl),
+    project.id,
+  ]);
+  return c.json({ edl: out.edl, said: out.said, applied: out.applied });
+});
+
 app.post("/api/projects/:id/autocut", async (c) => {
   const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
   if (!project) return c.json({ error: "Project not found" }, 404);
