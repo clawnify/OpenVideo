@@ -1221,6 +1221,19 @@ function LeftPanel({
   const [uploading, setUploading] = useState(false);
   const [uploadErr, setUploadErr] = useState("");
   const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(assets);
+  const [deleting, setDeleting] = useState<Asset | null>(null);
+  const [deleteErr, setDeleteErr] = useState("");
+
+  const deleteAsset = async (a: Asset) => {
+    setDeleteErr("");
+    try {
+      await api.send("DELETE", `/api/assets/${a.id}`);
+      setAssets((prev) => prev.filter((x) => x.id !== a.id));
+    } catch (e) {
+      // Refused while a project still uses it: the message names the projects.
+      setDeleteErr(String((e as Error).message));
+    }
+  };
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1348,12 +1361,25 @@ function LeftPanel({
               }}
             />
             {uploadErr && <div className="text-fine text-danger mb-2">{uploadErr}</div>}
+            {deleteErr && <div className="text-fine text-danger mb-2">{deleteErr}</div>}
+            {deleting && (
+              <ConfirmDialog
+                title={`Delete "${deleting.name}"?`}
+                body="It is removed from the library for everyone in your workspace, and cannot be recovered here. The original in Google Drive, if it came from there, is not touched."
+                onConfirm={() => {
+                  const a = deleting;
+                  setDeleting(null);
+                  void deleteAsset(a);
+                }}
+                onClose={() => setDeleting(null)}
+              />
+            )}
             <div className="space-y-2">
               {list.map((a) => {
                 const preparing = !!a.media_uid && !mediaReady.has(a.id);
                 return (
+                <div key={a.id} className="relative">
                 <button
-                  key={a.id}
                   onClick={() => !preparing && onAdd(a)}
                   disabled={preparing}
                   title={preparing ? "Still being prepared" : "Add to timeline"}
@@ -1382,8 +1408,17 @@ function LeftPanel({
                       <Music className="w-5 h-5 text-track-audio" />
                     </div>
                   )}
-                  <div className="px-2 py-1.5 text-fine truncate text-muted group-hover:text-foreground">{a.name}</div>
+                  <div className="pl-2 pr-8 py-1.5 text-fine truncate text-muted group-hover:text-foreground">{a.name}</div>
                 </button>
+                <button
+                  onClick={() => setDeleting(a)}
+                  className="absolute right-1 bottom-1 grid place-items-center w-6 h-6 rounded-xs text-faint hover:text-danger hover:bg-danger-tint"
+                  aria-label={`Delete ${a.name} from the library`}
+                  title="Delete from the library"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+                </div>
                 );
               })}
               {list.length === 0 && (

@@ -269,6 +269,21 @@ app.delete("/api/assets/:id", async (c) => {
     c.req.param("id"),
   ]);
   if (row) {
+    // Deleting footage a project still uses would leave that project with a
+    // clip pointing at nothing, which fails at export. Say where it is used.
+    const users = await query<{ name: string }>(
+      "SELECT name FROM edit_projects WHERE edl LIKE ?",
+      [`%"asset:${row.id}"%`],
+    );
+    if (users.length > 0) {
+      return c.json(
+        {
+          error: "in_use",
+          detail: `Still used in ${users.map((u) => `"${u.name}"`).join(", ")}. Remove it from ${users.length > 1 ? "those projects" : "that project"} first.`,
+        },
+        409,
+      );
+    }
     // Footage on the media service counts against the org's storage minutes
     // until it is deleted there; dropping only our row left it counting.
     if (row.media_uid) {
