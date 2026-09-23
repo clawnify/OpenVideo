@@ -27,6 +27,17 @@ describe("Ask operations", () => {
     expect(apply(edl(), "delete_clip", { clip: 5 })).toHaveProperty("error");
   });
 
+  it("changes the format the same way the Format picker does", () => {
+    const d = edl();
+    d.overlays = [
+      { id: "t", elements: [{ id: "x", type: "text", text: "Hi", fontSize: 40, startTime: 0, duration: 2, x: 0.5, y: 0.5 }] },
+    ];
+    expect(apply(d, "set_format", { format: "4:5" })).toHaveProperty("said");
+    expect(d.output).toEqual({ width: 1024, height: 1280, fps: 30 });
+    expect(d.overlays[0].elements[0]).toMatchObject({ fontSize: 57 });
+    expect(apply(d, "set_format", { format: "vertical" })).toHaveProperty("error");
+  });
+
   it("clean up replaces a clip with the parts the analysis keeps", async () => {
     const d = edl();
     const out = await cleanUp(d, { clip: 0 }, new Map(), async (_asset, window) => {

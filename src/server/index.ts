@@ -220,7 +220,14 @@ app.get("/api/assets/:id/playback", async (c) => {
   if (state.media.duration && Math.abs((asset.duration ?? 0) - state.media.duration) > 0.5) {
     await run("UPDATE assets SET duration = ? WHERE id = ?", [state.media.duration, asset.id]);
   }
-  return c.json({ ready: true, duration: state.media.duration, ...play.playback });
+  // The source's own frame size, for the format picker's "Original" choices.
+  return c.json({
+    ready: true,
+    duration: state.media.duration,
+    width: state.media.width,
+    height: state.media.height,
+    ...play.playback,
+  });
 });
 
 /**

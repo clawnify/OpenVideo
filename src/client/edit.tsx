@@ -22,6 +22,7 @@ import {
   type ProjectCaptions,
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
+import { FORMAT_PRESETS, parseRatio, presetFor, ratioLabel, reshape, sameShape, sizeFor } from "../shared/format";
 import {
   Captions as CaptionsIcon,
   AlignCenterHorizontal,
@@ -31,6 +32,7 @@ import {
   AlignStartHorizontal,
   AlignStartVertical,
   Check,
+  ChevronDown,
   ChevronRight,
   Cloud,
   Film,
@@ -63,6 +65,12 @@ import {
   Dialog,
   EmptyState,
   Kbd,
+  Command,
+  CommandGroup,
+  CommandItem,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   btnDanger,
   btnGhost,
   btnIcon,
@@ -1609,7 +1617,7 @@ function AskDialog({
         />
         <p className="mt-2 text-fine text-faint">
           It can trim, split, delete, reorder and mute clips, watch a clip and cut its dead air and false starts,
-          add or remove on-screen text, and switch the video between landscape, vertical and square.
+          add or remove on-screen text, and change the format (vertical for Reels, square, 4:5 and the rest).
         </p>
         {running && <div className="mt-2 text-fine text-muted">Working through the cut…</div>}
         {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
@@ -2498,6 +2506,217 @@ function Player({
   );
 }
 
+// ── format ──────────────────────────────────────────────────────────────────
+
+type Shape = { width: number; height: number };
+
+/** Each asset's own frame size, looked up once per page load. */
+const shapeCache = new Map<string, Promise<Shape | null>>();
+
+function shapeOf(a: Asset): Promise<Shape | null> {
+  let found = shapeCache.get(a.id);
+  if (!found) {
+    found = findShape(a).catch(() => null);
+    // Footage still ingesting has no size yet: ask again next time.
+    found.then((shape) => shape || shapeCache.delete(a.id));
+    shapeCache.set(a.id, found);
+  }
+  return found;
+}
+
+async function findShape(a: Asset): Promise<Shape | null> {
+  if (a.media_uid) {
+    const r = await api.get<{ ready: boolean; width?: number | null; height?: number | null }>(`/api/assets/${a.id}/playback`);
+    return r.ready && r.width && r.height ? { width: r.width, height: r.height } : null;
+  }
+  if (isImageAsset(a)) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      img.onerror = () => resolve(null);
+      img.src = assetUrl(a);
+    });
+  }
+  if (!isVideoAsset(a)) return null;
+  // Only the header is read; the element lets go of the file straight after.
+  return new Promise((resolve) => {
+    const v = document.createElement("video");
+    v.preload = "metadata";
+    v.muted = true;
+    const done = (shape: Shape | null) => {
+      v.removeAttribute("src");
+      v.load();
+      resolve(shape);
+    };
+    v.onloadedmetadata = () => done(v.videoWidth && v.videoHeight ? { width: v.videoWidth, height: v.videoHeight } : null);
+    v.onerror = () => done(null);
+    v.src = assetUrl(a);
+  });
+}
+
+function useShapes(assets: Asset[]): Map<string, Shape> {
+  const [shapes, setShapes] = useState(new Map<string, Shape>());
+  const key = assets.map((a) => a.id).join(",");
+  useEffect(() => {
+    let dead = false;
+    for (const a of assets) {
+      shapeOf(a).then((shape) => {
+        if (!dead && shape) setShapes((cur) => (cur.has(a.id) ? cur : new Map(cur).set(a.id, shape)));
+      });
+    }
+    return () => {
+      dead = true;
+    };
+    // The ids are the dependency: the array is rebuilt on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+  return shapes;
+}
+
+/** A shape drawn to scale in a fixed square, so shapes compare at a glance. */
+function ShapeGlyph({ width, height }: Shape) {
+  return (
+    <span className="grid place-items-center w-4 h-4 shrink-0" aria-hidden>
+      <span
+        className="rounded-xs border-[1.5px] border-current"
+        style={{ aspectRatio: `${width} / ${height}`, [width >= height ? "width" : "height"]: "100%" }}
+      />
+    </span>
+  );
+}
+
+/**
+ * The video's shape. The presets cover where videos are posted; "Original"
+ * offers the shapes of the footage on the timeline, so a project can match
+ * its clips. Changing it keeps the resolution and rescales titles and logos
+ * (shared/format.ts, which Ask uses too), as one undo step.
+ */
+function FormatPicker({
+  edl,
+  update,
+  resolveAsset,
+}: {
+  edl: Edl;
+  update: (fn: (d: Edl) => void) => void;
+  resolveAsset: (src: string) => Asset | undefined;
+}) {
+  const [open, setOpen] = useState(false);
+  const frame = edl.output;
+  const clips = useMemo(() => {
+    const seen = new Map<string, Asset>();
+    for (const el of edl.main.elements) {
+      const a = resolveAsset(el.src);
+      if (a && !seen.has(a.id)) seen.set(a.id, a);
+    }
+    return [...seen.values()];
+  }, [edl.main.elements, resolveAsset]);
+  const shapes = useShapes(clips);
+
+  // One choice per distinct shape, named after the first clip that has it.
+  const originals: { shape: Shape; clip: Asset }[] = [];
+  for (const clip of clips) {
+    const shape = shapes.get(clip.id);
+    if (shape && !originals.some((o) => sameShape(o.shape, shape))) originals.push({ shape, clip });
+  }
+
+  const preset = presetFor(frame.width, frame.height);
+  const choose = (shape: Shape) => {
+    setOpen(false);
+    const size = sizeFor(`${shape.width}:${shape.height}`, Math.max(frame.width, frame.height));
+    if (!size || (size.width === frame.width && size.height === frame.height)) return;
+    update((d) => Object.assign(d, reshape(d, size.width, size.height)));
+  };
+
+  const item = (value: string, shape: Shape, name: string, detail: string) => (
+    <CommandItem key={value} value={value} onSelect={() => choose(shape)}>
+      <ShapeGlyph {...shape} />
+      <span className="flex-1 min-w-0">
+        <span className="block truncate">{name}</span>
+        <span className="block truncate text-fine text-faint">{detail}</span>
+      </span>
+      <span className="text-fine text-muted tabular-nums">{ratioLabel(shape.width, shape.height)}</span>
+      <Check className={`w-4 h-4 shrink-0 ${sameShape(shape, frame) ? "" : "invisible"}`} />
+    </CommandItem>
+  );
+
+  return (
+    <Row label="Format">
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button className={`${inputCls} flex items-center gap-2 text-left`}>
+            <ShapeGlyph {...frame} />
+            <span className="flex-1 truncate">{preset ? preset.name : "Custom"}</span>
+            <span className="text-fine text-muted tabular-nums">{ratioLabel(frame.width, frame.height)}</span>
+            <ChevronDown className="w-4 h-4 shrink-0 text-faint" />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent>
+          <Command label="Format">
+            <CommandGroup heading="Presets">
+              {FORMAT_PRESETS.map((p) => {
+                const r = parseRatio(p.ratio)!;
+                return item(`preset ${p.ratio}`, { width: r.w, height: r.h }, p.name, p.hint);
+              })}
+            </CommandGroup>
+            {originals.length > 0 && (
+              <CommandGroup heading="Original">
+                {originals.map(({ shape, clip }) =>
+                  item(`original ${clip.id}`, shape, clip.name, `${shape.width}×${shape.height}`),
+                )}
+              </CommandGroup>
+            )}
+          </Command>
+        </PopoverContent>
+      </Popover>
+    </Row>
+  );
+}
+
+/** A labelled group of buttons. A <label> would pass a click on its text to the first button. */
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="mb-3">
+      <span className="block text-label text-muted mb-1">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+type Fit = "contain" | "cover";
+const FIT_CHOICES: [Fit, string][] = [
+  ["contain", "Fit with bars"],
+  ["cover", "Fill and crop"],
+];
+
+/** Letterbox or fill, for every clip at once: what a change of format usually needs next. */
+function ClipsFit({ edl, update }: { edl: Edl; update: (fn: (d: Edl) => void) => void }) {
+  if (edl.main.elements.length === 0) return null;
+  const fits = new Set(edl.main.elements.map((e) => e.fit ?? "contain"));
+  return (
+    <Field label="How clips fill the frame">
+      <Choice<Fit | "mixed">
+        label="How clips fill the frame"
+        value={fits.size === 1 ? [...fits][0] : "mixed"}
+        options={FIT_CHOICES}
+        onChange={(fit) =>
+          update((d) => {
+            for (const el of d.main.elements) el.fit = fit as Fit;
+          })
+        }
+      />
+    </Field>
+  );
+}
+
+/** Letterbox or fill, for one clip. */
+function ClipFit({ value, onChange }: { value?: Fit; onChange: (fit: Fit) => void }) {
+  return (
+    <Field label="How it fills the frame">
+      <Choice<Fit> label="How it fills the frame" value={value ?? "contain"} options={FIT_CHOICES} onChange={onChange} />
+    </Field>
+  );
+}
+
 // ── inspector ───────────────────────────────────────────────────────────────
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -2564,6 +2783,8 @@ function Inspector({
     if (!sel)
       return (
         <div className="mt-2">
+          <FormatPicker edl={edl} update={update} resolveAsset={resolveAsset} />
+          <ClipsFit edl={edl} update={update} />
           <Row label="Project brief: what is this video for?">
             <textarea
               className={`${inputCls} min-h-20`}
@@ -2576,7 +2797,7 @@ function Inspector({
             The brief anchors every AI action: cuts are only “effective” relative to a goal.
           </p>
           <div className="mt-4 text-fine text-faint text-center tabular-nums">
-            Canvas {edl.output.width}×{edl.output.height} at {edl.output.fps}fps
+            {edl.output.width}×{edl.output.height} at {edl.output.fps}fps
             <br />
             Select a clip to edit it
           </div>
@@ -2599,12 +2820,7 @@ function Inspector({
               ) : (
                 <NumberRow label="Trim end (s)" value={el.trimEnd ?? 0} min={0} onChange={(n) => set((e) => ((e as MainVideo).trimEnd = Math.max(0, n)))} />
               )}
-              <Row label="Fit">
-                <select className={inputCls} value={el.fit ?? "contain"} onChange={(e) => set((x) => ((x as MainVideo).fit = e.target.value as "contain" | "cover"))}>
-                  <option value="contain">Contain (letterbox)</option>
-                  <option value="cover">Cover (fill & crop)</option>
-                </select>
-              </Row>
+              <ClipFit value={el.fit} onChange={(fit) => set((x) => ((x as MainVideo).fit = fit))} />
               <Row label="Clip audio">
                 <button
                   className={`${inputCls} text-left`}
@@ -2683,12 +2899,7 @@ function Inspector({
           ) : (
             <>
               <NumberRow label="Duration (s)" value={el.duration} min={0.1} onChange={(n) => set((e) => ((e as MainImage).duration = Math.max(0.1, n)))} />
-              <Row label="Fit">
-                <select className={inputCls} value={el.fit ?? "contain"} onChange={(e) => set((x) => ((x as MainImage).fit = e.target.value as "contain" | "cover"))}>
-                  <option value="contain">Contain (letterbox)</option>
-                  <option value="cover">Cover (fill & crop)</option>
-                </select>
-              </Row>
+              <ClipFit value={el.fit} onChange={(fit) => set((x) => ((x as MainImage).fit = fit))} />
             </>
           )}
         </>

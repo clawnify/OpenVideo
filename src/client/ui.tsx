@@ -8,6 +8,8 @@
 
 import { useEffect, useRef } from "react";
 import * as RadixContextMenu from "@radix-ui/react-context-menu";
+import * as RadixPopover from "@radix-ui/react-popover";
+import { Command as CommandPrimitive } from "cmdk";
 
 const btnBase =
   "inline-flex items-center gap-1.5 h-7 rounded-sm text-button whitespace-nowrap " +
@@ -200,5 +202,71 @@ export function ContextMenuItem({
     >
       {children}
     </RadixContextMenu.Item>
+  );
+}
+
+// ── dropdown ────────────────────────────────────────────────────────────────
+
+/**
+ * Every dropdown is a popover holding a command list, never a native select:
+ * a select cannot take the tokens or show more than one line per option.
+ * Radix owns placement, focus and dismissal; cmdk owns the arrow keys and
+ * Enter. Add a search input only when the list is longer than a handful.
+ */
+export const Popover = RadixPopover.Root;
+export const PopoverTrigger = RadixPopover.Trigger;
+
+export function PopoverContent({ children }: { children: React.ReactNode }) {
+  return (
+    <RadixPopover.Portal>
+      <RadixPopover.Content
+        align="start"
+        sideOffset={4}
+        collisionPadding={8}
+        className="z-50 w-(--radix-popover-trigger-width) min-w-64 rounded-md bg-surface shadow-float outline-none"
+      >
+        {children}
+      </RadixPopover.Content>
+    </RadixPopover.Portal>
+  );
+}
+
+export function Command({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <CommandPrimitive label={label} loop>
+      <CommandPrimitive.List className="scroll-slim max-h-96 overflow-y-auto p-1">{children}</CommandPrimitive.List>
+    </CommandPrimitive>
+  );
+}
+
+export function CommandGroup({ heading, children }: { heading: string; children: React.ReactNode }) {
+  return (
+    <CommandPrimitive.Group
+      heading={heading}
+      className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:pt-2 [&_[cmdk-group-heading]]:pb-1 [&_[cmdk-group-heading]]:text-fine [&_[cmdk-group-heading]]:text-faint"
+    >
+      {children}
+    </CommandPrimitive.Group>
+  );
+}
+
+export function CommandItem({
+  value,
+  onSelect,
+  children,
+}: {
+  /** Unique within the list: cmdk tracks the highlighted item by it. */
+  value: string;
+  onSelect: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <CommandPrimitive.Item
+      value={value}
+      onSelect={onSelect}
+      className="flex items-center gap-2 min-h-8 px-2 py-1 rounded-sm text-body-sm text-foreground cursor-pointer select-none outline-none data-[selected=true]:bg-surface-sunken"
+    >
+      {children}
+    </CommandPrimitive.Item>
   );
 }
