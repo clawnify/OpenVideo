@@ -72,3 +72,9 @@ CREATE TABLE IF NOT EXISTS app_settings (
 -- Long footage lives on the managed media service instead of this app's
 -- storage; the row then carries the service's id and `key` holds no object.
 ALTER TABLE assets ADD COLUMN media_uid TEXT;
+
+-- The media service's transcript of a clip (WebVTT, cue-timed), fetched once
+-- it is ready. NULL: not fetched yet. '': known to have no speech. Captions are
+-- worked out from it on every preview and export, never stored per caption.
+ALTER TABLE assets ADD COLUMN transcript TEXT;
+ALTER TABLE assets ADD COLUMN transcript_lang TEXT;

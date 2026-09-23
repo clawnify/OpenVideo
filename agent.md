@@ -49,6 +49,8 @@ back as `folders`); a search looks inside that folder only, never the subtree.
 | GET  | `/api/assets/{id}/source` | The asset's bytes, wherever they live (a redirect) |
 | GET  | `/api/assets/{id}/playback` | For long footage: `{ ready, hls, thumbnail, duration }` |
 | GET  | `/api/assets/{id}/frame?t=` | One frame of long footage, as an image |
+| GET  | `/api/assets/{id}/transcript?lang=en` | The clip's transcript for captions → `{ status, vtt? }` |
+| DELETE | `/api/assets/{id}` | Remove from the library; 409 `in_use`, naming the projects, while any project uses it |
 | PUT  | `/api/drive/folder` | `{ folderId }` limits browsing to one folder, `null` clears it |
 | GET  | `/api/projects` | List projects |
 | GET  | `/api/projects/{id}` | Get one (includes the `edl` document and `brief`) |
@@ -126,6 +128,18 @@ explicit `duration`. Text overlays: `fontFamily`
 canvas width, height keeps aspect. Audio elements: `volume` 0..2, `duration`
 defaults to the source's length minus trims. Output duration (sum of the main
 track) maxes at 5 minutes.
+
+**Captions** are a project setting, not overlays: an optional `captions` block,
+`{ "enabled": true, "lang": "en", "style": { "size": 0.055, "position":
+"bottom", "margin": 0.08, "background": true, "color": "#ffffff", "maxChars":
+32 } }` (`size` and `margin` are shares of the frame's height). The words come
+from each clip's transcript and the part of it the clip plays, so captions
+follow every trim, split and reorder; nothing is stored per caption. Only
+footage on the media service (imported from Drive) has a transcript: poll
+`GET /api/assets/{id}/transcript` until `status` is `ready` (`no_speech` for a
+silent clip, `unavailable` for footage in app storage). Languages: en, it, es,
+fr, de, nl, pt, pl, cs, ru, ja, ko. Use text overlays for titles and anything
+placed by hand; don't add captions on footage that already shows subtitles.
 
 ### Worked examples (read → transform → save)
 

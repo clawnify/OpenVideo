@@ -10,7 +10,7 @@ import {
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
-import { deleteMedia, frameUrl, importMedia, mediaPlayback, mediaState, prepareMedia } from "./media";
+import { deleteMedia, frameUrl, importMedia, mediaPlayback, mediaState, mediaTranscript, prepareMedia } from "./media";
 import {
   DRIVE_FILE_ID,
   SHARED_WITH_ME,
@@ -239,6 +239,42 @@ app.get("/api/assets/:id/source", async (c) => {
   return c.redirect(play.playback.download, 302);
 });
 
+/**
+ * A clip's transcript, for captions. Asks the media service for it in `lang`
+ * and keeps it once ready. Footage in app storage has none: only the media
+ * service transcribes.
+ */
+app.get("/api/assets/:id/transcript", async (c) => {
+  const asked = c.req.query("lang") ?? "en";
+  const lang = /^[a-z]{2}(-[A-Z]{2})?$/.test(asked) ? asked : "en";
+  const asset = await get<Asset & { transcript: string | null; transcript_lang: string | null }>(
+    "SELECT * FROM assets WHERE id = ?",
+    [c.req.param("id")],
+  );
+  if (!asset) return c.json({ error: "Not found" }, 404);
+
+  if (asset.transcript !== null && asset.transcript_lang === lang) {
+    return c.json({ status: asset.transcript ? "ready" : "no_speech", vtt: asset.transcript });
+  }
+  if (!asset.media_uid) return c.json({ status: "unavailable" });
+
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  // Idempotent: asks for the transcript the first time, reports on it after.
+  const prepared = await prepareMedia(cfg, asset.media_uid, lang);
+  if ("failure" in prepared) {
+    if (prepared.failure.error === "not_ready") return c.json({ status: "preparing" });
+    return c.json(prepared.failure, 502);
+  }
+  if (prepared.media.no_audio) {
+    await run("UPDATE assets SET transcript = '', transcript_lang = ? WHERE id = ?", [lang, asset.id]);
+    return c.json({ status: "no_speech", vtt: "" });
+  }
+  const vtt = await mediaTranscript(cfg, asset.media_uid, lang);
+  if (vtt === null) return c.json({ status: "transcribing" });
+  await run("UPDATE assets SET transcript = ?, transcript_lang = ? WHERE id = ?", [vtt, lang, asset.id]);
+  return c.json({ status: "ready", vtt });
+});
+
 /** One frame of a media-backed asset, for covers and the timeline. */
 app.get("/api/assets/:id/frame", async (c) => {
   const asset = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
@@ -269,6 +305,21 @@ app.delete("/api/assets/:id", async (c) => {
     c.req.param("id"),
   ]);
   if (row) {
+    // Deleting footage a project still uses would leave that project with a
+    // clip pointing at nothing, which fails at export. Say where it is used.
+    const users = await query<{ name: string }>(
+      "SELECT name FROM edit_projects WHERE edl LIKE ?",
+      [`%"asset:${row.id}"%`],
+    );
+    if (users.length > 0) {
+      return c.json(
+        {
+          error: "in_use",
+          detail: `Still used in ${users.map((u) => `"${u.name}"`).join(", ")}. Remove it from ${users.length > 1 ? "those projects" : "that project"} first.`,
+        },
+        409,
+      );
+    }
     // Footage on the media service counts against the org's storage minutes
     // until it is deleted there; dropping only our row left it counting.
     if (row.media_uid) {

@@ -14,6 +14,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { splitClip } from "../shared/split";
 import {
+  DEFAULT_CAPTIONS,
+  captionText,
+  captionTimeline,
+  type CaptionLine,
+  type CaptionStyle,
+  type ProjectCaptions,
+} from "../shared/captions";
+import { parseVtt, type Cue } from "../shared/transcript";
+import {
+  Captions as CaptionsIcon,
   AlignCenterHorizontal,
   AlignCenterVertical,
   AlignEndHorizontal,
@@ -154,7 +164,11 @@ export interface Edl {
   main: { elements: MainElement[] };
   overlays?: OverlayTrack[];
   audio?: AudioTrack[];
+  /** Project captions, worked out from the clips' transcripts. */
+  captions?: ProjectCaptions;
 }
+
+type RailTab = "media" | "audio" | "text" | "captions";
 
 export interface EditProject {
   id: string;
@@ -429,6 +443,58 @@ function FrameStrip({ asset, from, to, width }: { asset: Asset; from: number; to
   );
 }
 
+/**
+ * Text drawn on the stage: a text overlay or a caption. The same line breaks
+ * and placement the export uses, one centred line per element, so what shows
+ * here is what renders.
+ */
+function TextOnStage({
+  t,
+  frame,
+  scale,
+  selected = false,
+  onPointerDown,
+}: {
+  t: Pick<OverlayText, "text" | "fontSize" | "fontFamily" | "color" | "background" | "opacity" | "align" | "x" | "y">;
+  frame: Edl["output"];
+  scale: number;
+  selected?: boolean;
+  /** Absent for captions, which are placed by the project's style, not dragged. */
+  onPointerDown?: (e: React.PointerEvent) => void;
+}) {
+  const family = t.fontFamily ?? "sans";
+  const lines = wrapLines(t.text, t.fontSize, frame.width, family);
+  const step = lineStep(t.fontSize, !!t.background) / frame.height;
+  const top = fitTop(t.y, blockHeight(t.text, t.fontSize, frame.width, family, !!t.background), frame.height);
+  return (
+    <>
+      {lines.map((line, n) =>
+        line.trim() ? (
+          <div
+            key={n}
+            onPointerDown={onPointerDown}
+            className={`absolute select-none whitespace-pre leading-tight ${onPointerDown ? "cursor-move" : "pointer-events-none"} ${selected ? "outline outline-2 outline-ring" : ""}`}
+            style={{
+              left: `${t.x * 100}%`,
+              top: `${(top + n * step) * 100}%`,
+              transform: t.align === "center" ? "translateX(-50%)" : t.align === "right" ? "translateX(-100%)" : undefined,
+              fontSize: t.fontSize * scale,
+              fontFamily: t.fontFamily === "serif" ? "serif" : t.fontFamily === "mono" ? "monospace" : "Inter, sans-serif",
+              color: t.color ?? DEFAULT_TEXT_COLOR,
+              background: t.background,
+              padding: t.background ? `${0.3 * t.fontSize * scale}px ${0.45 * t.fontSize * scale}px` : undefined,
+              opacity: t.opacity ?? 1,
+              textAlign: t.align ?? "left",
+            }}
+          >
+            {line}
+          </div>
+        ) : null,
+      )}
+    </>
+  );
+}
+
 /** Simple peak waveform for an audio source. */
 function Waveform({ url, width, height }: { url: string; width: number; height: number }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -699,7 +765,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const [, bumpHistory] = useState(0);
   const [assets, setAssets] = useState<Asset[]>(initialAssets);
   const [sel, setSel] = useState<Sel>(null);
-  const [tab, setTab] = useState<"media" | "audio" | "text">("media");
+  const [tab, setTab] = useState<RailTab>("media");
   // Phones and tablets get ONE pane at a time; the four-region grid is a
   // desktop layout. Selection state chooses which pane is on screen.
   const [pane, setPane] = useState<"library" | "canvas" | "inspector">("canvas");
@@ -808,6 +874,24 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   // ── derived timeline ──────────────────────────────────────────────────────
   const segments = useMemo(() => mainSegments(edl, srcDur), [edl, srcDur]);
   const total = segments.reduce((a, s) => a + s.dur, 0);
+
+  // Captions: the transcripts of the videos on the timeline, and the caption
+  // lines they give once laid onto it. Worked out, never stored.
+  const captionIds = useMemo(
+    () => [...new Set(edl.main.elements.filter((e) => e.type === "video" && e.src.startsWith("asset:")).map((e) => e.src.slice(6)))],
+    [edl.main.elements],
+  );
+  const transcripts = useTranscripts(captionIds, edl.captions?.lang ?? "en", !!edl.captions?.enabled || tab === "captions");
+  const captionLayer = useMemo(() => {
+    const cfg = edl.captions;
+    if (!cfg?.enabled) return null;
+    const placed = segments
+      .filter((sg) => sg.el.type === "video" && sg.el.src.startsWith("asset:"))
+      .map((sg) => ({ src: sg.el.src, start: sg.start, dur: sg.dur, trimStart: (sg.el as MainVideo).trimStart ?? 0 }));
+    const cues = new Map<string, Cue[]>();
+    for (const [src, t] of transcripts) if (t.status === "ready") cues.set(src, t.cues);
+    return { lines: captionTimeline(placed, cues, cfg.style.maxChars), style: cfg.style };
+  }, [edl.captions, segments, transcripts]);
 
   // Distinct video clips on the main track, in timeline order — the unit
   // Auto-cut operates on (the arrangement is the user's intent).
@@ -1054,6 +1138,9 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           setAssets={setAssets}
           onAdd={addAssetToTimeline}
           onAddText={addText}
+          edl={edl}
+          update={update}
+          transcripts={transcripts}
         />
         <Player
           pane={pane}
@@ -1063,6 +1150,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           playhead={playhead}
           playheadRef={playheadRef}
           mediaClock={mediaClock}
+          captions={captionLayer}
           playing={playing}
           resolveAsset={resolveAsset}
           sel={sel}
@@ -1209,10 +1297,16 @@ function LeftPanel({
   setAssets,
   onAdd,
   onAddText,
+  edl,
+  update,
+  transcripts,
 }: {
   pane: Pane;
-  tab: "media" | "audio" | "text";
-  setTab: (t: "media" | "audio" | "text") => void;
+  tab: RailTab;
+  setTab: (t: RailTab) => void;
+  edl: Edl;
+  update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
+  transcripts: Map<string, TranscriptState>;
   assets: Asset[];
   setAssets: React.Dispatch<React.SetStateAction<Asset[]>>;
   onAdd: (a: Asset) => void;
@@ -1221,6 +1315,19 @@ function LeftPanel({
   const [uploading, setUploading] = useState(false);
   const [uploadErr, setUploadErr] = useState("");
   const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(assets);
+  const [deleting, setDeleting] = useState<Asset | null>(null);
+  const [deleteErr, setDeleteErr] = useState("");
+
+  const deleteAsset = async (a: Asset) => {
+    setDeleteErr("");
+    try {
+      await api.send("DELETE", `/api/assets/${a.id}`);
+      setAssets((prev) => prev.filter((x) => x.id !== a.id));
+    } catch (e) {
+      // Refused while a project still uses it: the message names the projects.
+      setDeleteErr(String((e as Error).message));
+    }
+  };
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1288,6 +1395,7 @@ function LeftPanel({
             ["media", Film, "Media"],
             ["audio", Music, "Audio"],
             ["text", TypeIcon, "Text"],
+            ["captions", CaptionsIcon, "Captions"],
           ] as const
         ).map(([key, Icon, label]) => (
           <button
@@ -1304,7 +1412,16 @@ function LeftPanel({
         ))}
       </div>
       <div className="flex-1 min-w-0 overflow-y-auto p-3">
-        {tab === "text" ? (
+        {tab === "captions" ? (
+          <CaptionsPanel
+            edl={edl}
+            update={update}
+            transcripts={transcripts}
+            clips={[...new Set(edl.main.elements.filter((e) => e.type === "video" && e.src.startsWith("asset:")).map((e) => e.src.slice(6)))]
+              .map((id) => assets.find((x) => x.id === id))
+              .filter((x): x is Asset => !!x)}
+          />
+        ) : tab === "text" ? (
           <button
             onClick={onAddText}
             className="w-full h-8 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
@@ -1348,17 +1465,30 @@ function LeftPanel({
               }}
             />
             {uploadErr && <div className="text-fine text-danger mb-2">{uploadErr}</div>}
+            {deleteErr && <div className="text-fine text-danger mb-2">{deleteErr}</div>}
+            {deleting && (
+              <ConfirmDialog
+                title={`Delete "${deleting.name}"?`}
+                body="It is removed from the library for everyone in your workspace, and cannot be recovered here. The original in Google Drive, if it came from there, is not touched."
+                onConfirm={() => {
+                  const a = deleting;
+                  setDeleting(null);
+                  void deleteAsset(a);
+                }}
+                onClose={() => setDeleting(null)}
+              />
+            )}
             <div className="space-y-2">
               {list.map((a) => {
                 const preparing = !!a.media_uid && !mediaReady.has(a.id);
                 return (
+                <div key={a.id} className="relative group/tile">
                 <button
-                  key={a.id}
                   onClick={() => !preparing && onAdd(a)}
                   disabled={preparing}
                   title={preparing ? "Still being prepared" : "Add to timeline"}
                   aria-label={`Add ${a.name} to the timeline`}
-                  className="w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group disabled:hover:bg-surface"
+                  className="block w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group disabled:hover:bg-surface"
                 >
                   {isVideoAsset(a) ? (
                     preparing ? (
@@ -1382,8 +1512,20 @@ function LeftPanel({
                       <Music className="w-5 h-5 text-track-audio" />
                     </div>
                   )}
-                  <div className="px-2 py-1.5 text-fine truncate text-muted group-hover:text-foreground">{a.name}</div>
+                  <div className="pl-2 pr-8 py-1.5 text-fine truncate text-muted group-hover:text-foreground">{a.name}</div>
                 </button>
+                {/* Shown on hover or keyboard focus. Screens without hover and
+                    agents (data-hover-only) always see it. */}
+                <button
+                  onClick={() => setDeleting(a)}
+                  data-hover-only
+                  className="absolute right-1 bottom-0.5 grid place-items-center w-6 h-6 rounded-xs text-faint hover:text-danger hover:bg-danger-tint opacity-0 transition-opacity group-hover/tile:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+                  aria-label={`Delete ${a.name} from the library`}
+                  title="Delete from the library"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+                </div>
                 );
               })}
               {list.length === 0 && (
@@ -1541,6 +1683,220 @@ function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<st
   }, [key]);
 
   return { ready, ingesting };
+}
+
+// ── captions ────────────────────────────────────────────────────────────────
+
+interface TranscriptState {
+  status: "loading" | "ready" | "no_speech" | "unavailable" | "preparing" | "transcribing" | "error";
+  cues: Cue[];
+}
+
+/**
+ * The transcripts of the clips on the timeline, in the captions' language.
+ * The media service makes one in minutes, so pending ones are asked again
+ * until they arrive. Footage in app storage has none.
+ */
+function useTranscripts(assetIds: string[], lang: string, active: boolean): Map<string, TranscriptState> {
+  const [states, setStates] = useState<Map<string, TranscriptState>>(new Map());
+  const key = `${lang}|${assetIds.join(",")}`;
+
+  useEffect(() => {
+    if (!active || assetIds.length === 0) return;
+    let dead = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = new Set<string>();
+
+    const pass = async () => {
+      const next = new Map<string, TranscriptState>();
+      let waiting = false;
+      for (const id of assetIds) {
+        if (done.has(id)) continue;
+        try {
+          const r = await api.get<{ status: TranscriptState["status"]; vtt?: string }>(
+            `/api/assets/${id}/transcript?lang=${lang}`,
+          );
+          next.set(`asset:${id}`, { status: r.status, cues: r.vtt ? parseVtt(r.vtt) : [] });
+          if (r.status === "preparing" || r.status === "transcribing") waiting = true;
+          else done.add(id);
+        } catch {
+          next.set(`asset:${id}`, { status: "error", cues: [] });
+        }
+      }
+      if (dead) return;
+      setStates((cur) => new Map([...cur, ...next]));
+      if (waiting) timer = setTimeout(pass, 10_000);
+    };
+    void pass();
+    return () => {
+      dead = true;
+      if (timer) clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, active]);
+
+  return states;
+}
+
+const CAPTION_LANGUAGES: [string, string][] = [
+  ["en", "English"],
+  ["it", "Italiano"],
+  ["es", "Español"],
+  ["fr", "Français"],
+  ["de", "Deutsch"],
+  ["nl", "Nederlands"],
+  ["pt", "Português"],
+  ["pl", "Polski"],
+  ["cs", "Čeština"],
+  ["ru", "Русский"],
+  ["ja", "日本語"],
+  ["ko", "한국어"],
+];
+
+const TRANSCRIPT_LABEL: Record<TranscriptState["status"], string> = {
+  loading: "Checking…",
+  ready: "Transcript ready",
+  no_speech: "No speech found",
+  unavailable: "Uploaded file: no transcript. Import it from Google Drive to transcribe it.",
+  preparing: "Still being prepared…",
+  transcribing: "Transcribing…",
+  error: "Could not load the transcript",
+};
+
+/** One segmented choice, the pattern the panel uses for every setting. */
+function Choice<T extends string | number | boolean>({
+  value,
+  options,
+  onChange,
+  label,
+}: {
+  value: T;
+  options: [T, string][];
+  onChange: (v: T) => void;
+  label: string;
+}) {
+  return (
+    <div className="inline-flex w-full items-center gap-0.5 rounded-sm bg-surface p-0.5 shadow-edge" role="group" aria-label={label}>
+      {options.map(([v, text]) => (
+        <button
+          key={String(v)}
+          onClick={() => onChange(v)}
+          aria-pressed={value === v}
+          className={`flex-1 h-6 rounded-xs text-fine ${value === v ? "bg-surface-sunken text-foreground" : "text-muted hover:text-foreground"}`}
+        >
+          {text}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function CaptionsPanel({
+  edl,
+  update,
+  transcripts,
+  clips,
+}: {
+  edl: Edl;
+  update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
+  transcripts: Map<string, TranscriptState>;
+  clips: Asset[];
+}) {
+  const cfg = edl.captions ?? DEFAULT_CAPTIONS;
+  const set = (patch: Partial<ProjectCaptions>) =>
+    update((d) => {
+      d.captions = { ...(d.captions ?? DEFAULT_CAPTIONS), ...patch };
+    });
+  const setStyle = (patch: Partial<CaptionStyle>) => set({ style: { ...cfg.style, ...patch } });
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-body-sm">Show captions</span>
+        <button
+          role="switch"
+          aria-checked={cfg.enabled}
+          aria-label="Show captions"
+          onClick={() => set({ enabled: !cfg.enabled })}
+          className={`relative w-9 h-5 rounded-full transition-colors ${cfg.enabled ? "bg-primary" : "bg-border"}`}
+        >
+          <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-surface shadow-raised transition-all ${cfg.enabled ? "left-4.5" : "left-0.5"}`} />
+        </button>
+      </div>
+      <p className="text-fine text-faint">
+        Captions come from each clip's transcript, so they follow every trim, split and reorder. One style for the
+        whole video.
+      </p>
+
+      <div>
+        <Zone>Language</Zone>
+        <div className="grid grid-cols-2 gap-1">
+          {CAPTION_LANGUAGES.map(([code, name]) => (
+            <button
+              key={code}
+              onClick={() => set({ lang: code })}
+              aria-pressed={cfg.lang === code}
+              className={`h-7 rounded-xs text-fine truncate px-1 ${cfg.lang === code ? "bg-surface text-foreground shadow-edge" : "text-muted hover:text-foreground"}`}
+            >
+              {name}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <Zone>Style</Zone>
+        <Choice
+          label="Position"
+          value={cfg.style.position}
+          options={[["bottom", "Bottom"], ["top", "Top"]]}
+          onChange={(position) => setStyle({ position })}
+        />
+        <Choice
+          label="Size"
+          value={cfg.style.size}
+          options={[[0.045, "Small"], [0.055, "Medium"], [0.07, "Large"]]}
+          onChange={(size) => setStyle({ size })}
+        />
+        <Choice
+          label="Line length"
+          value={cfg.style.maxChars}
+          options={[[22, "Short"], [32, "Medium"], [44, "Long"]]}
+          onChange={(maxChars) => setStyle({ maxChars })}
+        />
+        <Choice
+          label="Background"
+          value={cfg.style.background}
+          options={[[true, "Box"], [false, "No box"]]}
+          onChange={(background) => setStyle({ background })}
+        />
+        <label className="flex items-center justify-between gap-2 text-fine text-muted">
+          Text color
+          {/* The value is a colour authored into the video, not app chrome. */}
+          <input type="color" className="field p-1 w-16" value={cfg.style.color.slice(0, 7)} onChange={(e) => setStyle({ color: e.target.value })} />
+        </label>
+      </div>
+
+      <div>
+        <Zone>Clips</Zone>
+        {clips.length === 0 ? (
+          <p className="text-fine text-faint">Put a video on the timeline to caption it.</p>
+        ) : (
+          <ul className="space-y-1.5">
+            {clips.map((a) => {
+              const state = transcripts.get(`asset:${a.id}`)?.status ?? "loading";
+              return (
+                <li key={a.id} className="text-fine">
+                  <div className="truncate text-foreground">{a.name}</div>
+                  <div className={state === "ready" ? "text-success" : "text-faint"}>{TRANSCRIPT_LABEL[state]}</div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
 }
 
 /** Search the org's Google Drive and copy picked files into the library. */
@@ -1867,6 +2223,7 @@ function Player({
   playhead,
   playheadRef,
   mediaClock,
+  captions,
   playing,
   resolveAsset,
   sel,
@@ -1881,6 +2238,8 @@ function Player({
   playheadRef: React.MutableRefObject<number>;
   /** Filled here so the master clock can follow the playing video. */
   mediaClock: React.MutableRefObject<(() => number | null) | null>;
+  /** The project's captions, already laid onto the timeline, or null when off. */
+  captions: { lines: CaptionLine[]; style: CaptionStyle } | null;
   playing: boolean;
   resolveAsset: (src: string) => Asset | undefined;
   sel: Sel;
@@ -2058,6 +2417,19 @@ function Player({
             );
           })}
 
+          {/* project captions, under the overlays so a title placed by hand stays on top */}
+          {captions &&
+            captions.lines
+              .filter((line) => playhead >= line.from && playhead < line.to)
+              .map((line, n) => (
+                <TextOnStage
+                  key={`caption-${line.from}-${n}`}
+                  t={captionText(line, captions.style, edl.output, `caption-${n}`)}
+                  frame={edl.output}
+                  scale={scale}
+                />
+              ))}
+
           {/* overlays */}
           {(edl.overlays ?? []).map((track, ti) =>
             track.hidden
@@ -2067,35 +2439,15 @@ function Player({
                   if (!show) return null;
                   const selected = sel?.area === "ovl" && sel.ti === ti && sel.i === i;
                   if (el.type === "text") {
-                    const t = el as OverlayText;
-                    // The same line breaks the export uses: one centred line
-                    // per element, so what shows here is what renders.
-                    const family = t.fontFamily ?? "sans";
-                    const lines = wrapLines(t.text, t.fontSize, edl.output.width, family);
-                    const step = lineStep(t.fontSize, !!t.background) / edl.output.height;
-                    const top = fitTop(t.y, blockHeight(t.text, t.fontSize, edl.output.width, family, !!t.background), edl.output.height);
-                    return lines.map((line, n) =>
-                      line.trim() ? (
-                      <div
-                        key={`${el.id}-${n}`}
+                    return (
+                      <TextOnStage
+                        key={el.id}
+                        t={el as OverlayText}
+                        frame={edl.output}
+                        scale={scale}
+                        selected={selected}
                         onPointerDown={dragOverlay(ti, i)}
-                        className={`absolute cursor-move select-none whitespace-pre leading-tight ${selected ? "outline outline-2 outline-ring" : ""}`}
-                        style={{
-                          left: `${t.x * 100}%`,
-                          top: `${(top + n * step) * 100}%`,
-                          transform: t.align === "center" ? "translateX(-50%)" : t.align === "right" ? "translateX(-100%)" : undefined,
-                          fontSize: t.fontSize * scale,
-                          fontFamily: t.fontFamily === "serif" ? "serif" : t.fontFamily === "mono" ? "monospace" : "Inter, sans-serif",
-                          color: t.color ?? DEFAULT_TEXT_COLOR,
-                          background: t.background,
-                          padding: t.background ? `${0.3 * t.fontSize * scale}px ${0.45 * t.fontSize * scale}px` : undefined,
-                          opacity: t.opacity ?? 1,
-                          textAlign: t.align ?? "left",
-                        }}
-                      >
-                        {line}
-                      </div>
-                      ) : null,
+                      />
                     );
                   }
                   const m = el as OverlayMedia;

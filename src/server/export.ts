@@ -11,6 +11,8 @@ import { get, run } from "./db";
 import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
 import { mediaState, prepareMedia } from "./media";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
+import { captionText, captionTimeline, type PlacedClip } from "../shared/captions";
+import { parseVtt, type Cue } from "../shared/transcript";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -128,6 +130,7 @@ export async function resolveEdlSources(
   edl: Edl,
   cfg: ExportConfig,
 ): Promise<{ edl: Edl } | { failure: ExportFailure }> {
+  edl = await expandCaptions(edl);
   const staged = new Map<string, string>();
   for (const assetId of collectAssetIds(edl)) {
     const res = await ensureStagedSrc(assetId, cfg);
@@ -135,6 +138,48 @@ export async function resolveEdlSources(
     staged.set(assetId, res.src);
   }
   return { edl: layoutText(substituteAssetSrcs(edl, (id) => staged.get(id)!)) };
+}
+
+/**
+ * Turn project captions into ordinary text on their own track, and drop the
+ * `captions` block the render service does not know. Captions are worked out
+ * from each clip's stored transcript and the part of it the clip plays, the
+ * same way the preview works them out.
+ */
+async function expandCaptions(edl: Edl): Promise<Edl> {
+  const { captions, ...rest } = edl;
+  if (!captions?.enabled) return rest as Edl;
+
+  const placed: PlacedClip[] = [];
+  const cues = new Map<string, Cue[]>();
+  let at = 0;
+  for (const el of edl.main.elements) {
+    let plays = el.duration;
+    if (plays === undefined && el.src.startsWith("asset:")) {
+      const row = await get<{ duration: number | null }>("SELECT duration FROM assets WHERE id = ?", [el.src.slice(6)]);
+      plays = row?.duration ? row.duration - (el.trimStart ?? 0) - (el.trimEnd ?? 0) : 0;
+    }
+    plays = Math.max(0, plays ?? 0);
+    if (el.type === "video" && el.src.startsWith("asset:")) {
+      placed.push({ src: el.src, start: at, dur: plays, trimStart: el.trimStart ?? 0 });
+      if (!cues.has(el.src)) {
+        const row = await get<{ transcript: string | null; transcript_lang: string | null }>(
+          "SELECT transcript, transcript_lang FROM assets WHERE id = ?",
+          [el.src.slice(6)],
+        );
+        if (row?.transcript && row.transcript_lang === captions.lang) cues.set(el.src, parseVtt(row.transcript));
+      }
+    }
+    at += plays;
+  }
+
+  const lines = captionTimeline(placed, cues, captions.style.maxChars);
+  if (lines.length === 0) return rest as Edl;
+  const track = {
+    id: "captions",
+    elements: lines.map((line, n) => captionText(line, captions.style, edl.output, `caption-${n}`)),
+  };
+  return { ...rest, overlays: [...(rest.overlays ?? []), track] } as Edl;
 }
 
 /**
