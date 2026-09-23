@@ -138,6 +138,29 @@ const audioTrack = z
   })
   .strict();
 
+/**
+ * Project captions: switched on once and styled once, with the words taken
+ * from each clip's transcript. This app's own addition, like `asset:` sources:
+ * the export expands it into ordinary text and removes it before the document
+ * reaches the render service, whose contract stays as it is.
+ */
+const captionsSchema = z
+  .object({
+    enabled: z.boolean(),
+    lang: z.string().regex(/^[a-z]{2}(-[A-Z]{2})?$/, "a language code such as en or it"),
+    style: z
+      .object({
+        size: z.number().finite().min(0.02).max(0.2),
+        position: z.enum(["bottom", "top"]),
+        margin: z.number().finite().min(0).max(0.5),
+        background: z.boolean(),
+        color: hexColor,
+        maxChars: z.number().int().min(8).max(80),
+      })
+      .strict(),
+  })
+  .strict();
+
 export const edlSchema = z
   .object({
     version: z.literal(1),
@@ -153,6 +176,7 @@ export const edlSchema = z
     main: z.object({ elements: z.array(z.discriminatedUnion("type", [mainVideo, mainImage])) }).strict(),
     overlays: z.array(overlayTrack).max(MAX_TRACKS).optional(),
     audio: z.array(audioTrack).max(MAX_TRACKS).optional(),
+    captions: captionsSchema.optional(),
   })
   .strict();
 

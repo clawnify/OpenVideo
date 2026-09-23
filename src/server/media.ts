@@ -34,6 +34,10 @@ export interface MediaState {
   error: string | null;
   /** Set once `prepare` has been asked for: the MP4 a cut is read from. */
   download?: { status: string; percent: number | null } | null;
+  /** Transcripts generated or in progress, one per language. */
+  captions?: { language: string; status: string }[];
+  /** The video has no sound, so it can have no transcript. */
+  no_audio?: boolean;
 }
 
 export interface MediaPlayback {
@@ -103,10 +107,29 @@ export async function mediaState(cfg: MediaConfig, uid: string): Promise<{ media
   return "failure" in res ? res : { media: res.data };
 }
 
-/** Ask for the MP4 a cut is read from. Idempotent; readiness comes from state. */
-export async function prepareMedia(cfg: MediaConfig, uid: string): Promise<{ media: MediaState } | { failure: MediaFailure }> {
-  const res = await call<MediaState>(cfg, `/${uid}/prepare`, { method: "POST", body: JSON.stringify({}) });
+/**
+ * Ask for the MP4 a cut is read from, and a transcript in `lang` (English
+ * unless said otherwise). Idempotent; readiness comes from state.
+ */
+export async function prepareMedia(
+  cfg: MediaConfig,
+  uid: string,
+  lang?: string,
+): Promise<{ media: MediaState } | { failure: MediaFailure }> {
+  const res = await call<MediaState>(cfg, `/${uid}/prepare`, {
+    method: "POST",
+    body: JSON.stringify(lang ? { captions: lang } : {}),
+  });
   return "failure" in res ? res : { media: res.data };
+}
+
+/** The transcript as WebVTT, or null while it is still being made. */
+export async function mediaTranscript(cfg: MediaConfig, uid: string, lang: string): Promise<string | null> {
+  if (!cfg.token) return null;
+  const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/media/${uid}/captions/${lang}`, {
+    headers: { Authorization: `Bearer ${cfg.token}` },
+  });
+  return res.ok ? res.text() : null;
 }
 
 export async function mediaPlayback(
