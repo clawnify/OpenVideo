@@ -1827,7 +1827,7 @@ function CaptionsPanel({
 
       <div>
         <Zone>Language</Zone>
-        <div className="grid grid-cols-3 gap-1">
+        <div className="grid grid-cols-2 gap-1">
           {CAPTION_LANGUAGES.map(([code, name]) => (
             <button
               key={code}
