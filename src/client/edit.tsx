@@ -1482,13 +1482,13 @@ function LeftPanel({
               {list.map((a) => {
                 const preparing = !!a.media_uid && !mediaReady.has(a.id);
                 return (
-                <div key={a.id} className="relative">
+                <div key={a.id} className="relative group/tile">
                 <button
                   onClick={() => !preparing && onAdd(a)}
                   disabled={preparing}
                   title={preparing ? "Still being prepared" : "Add to timeline"}
                   aria-label={`Add ${a.name} to the timeline`}
-                  className="w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group disabled:hover:bg-surface"
+                  className="block w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group disabled:hover:bg-surface"
                 >
                   {isVideoAsset(a) ? (
                     preparing ? (
@@ -1514,9 +1514,12 @@ function LeftPanel({
                   )}
                   <div className="pl-2 pr-8 py-1.5 text-fine truncate text-muted group-hover:text-foreground">{a.name}</div>
                 </button>
+                {/* Shown on hover or keyboard focus. Screens without hover and
+                    agents (data-hover-only) always see it. */}
                 <button
                   onClick={() => setDeleting(a)}
-                  className="absolute right-1 bottom-1 grid place-items-center w-6 h-6 rounded-xs text-faint hover:text-danger hover:bg-danger-tint"
+                  data-hover-only
+                  className="absolute right-1 bottom-0.5 grid place-items-center w-6 h-6 rounded-xs text-faint hover:text-danger hover:bg-danger-tint opacity-0 transition-opacity group-hover/tile:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
                   aria-label={`Delete ${a.name} from the library`}
                   title="Delete from the library"
                 >
