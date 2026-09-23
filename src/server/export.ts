@@ -9,7 +9,8 @@
 
 import { get, run } from "./db";
 import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
-import { prepareMedia } from "./media";
+import { mediaState, prepareMedia } from "./media";
+import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -69,9 +70,17 @@ export async function ensureStagedSrc(
   // Footage on the media service is cut where it lies: the edit service reads
   // only the seconds the cut needs, so nothing is staged and no size applies.
   if (asset.media_uid) {
-    const prepared = await prepareMedia(cfg, asset.media_uid);
+    let prepared = await prepareMedia(cfg, asset.media_uid);
     if ("failure" in prepared) {
       return { failure: { error: prepared.failure.error, detail: prepared.failure.detail } };
+    }
+    // The MP4 may still be generating. Wait a little rather than failing the
+    // request and making the person press the button again.
+    for (let i = 0; i < 12 && prepared.media.download?.status !== "ready"; i++) {
+      await new Promise((r) => setTimeout(r, 2500));
+      const state = await mediaState(cfg, asset.media_uid);
+      if ("failure" in state) break;
+      prepared = state;
     }
     if (prepared.media.download?.status !== "ready") {
       return {
@@ -125,7 +134,35 @@ export async function resolveEdlSources(
     if ("failure" in res) return res;
     staged.set(assetId, res.src);
   }
-  return { edl: substituteAssetSrcs(edl, (id) => staged.get(id)!) };
+  return { edl: layoutText(substituteAssetSrcs(edl, (id) => staged.get(id)!)) };
+}
+
+/**
+ * Send each line of a wrapped caption as its own element. The render service
+ * draws text without wrapping, and a multi-line element would left-align its
+ * lines; one centred element per line matches what the preview shows, because
+ * both break lines with the same function.
+ */
+type Overlay = NonNullable<Edl["overlays"]>[number]["elements"][number];
+
+function layoutText(edl: Edl): Edl {
+  const { width: W, height: H } = edl.output;
+  return {
+    ...edl,
+    overlays: edl.overlays?.map((track) => ({
+      ...track,
+      elements: track.elements.flatMap((el): Overlay[] => {
+        if (el.type !== "text") return [el];
+        const family = el.fontFamily ?? "sans";
+        const lines = wrapLines(el.text, el.fontSize, W, family);
+        const step = lineStep(el.fontSize, !!el.background) / H;
+        const top = fitTop(el.y, blockHeight(el.text, el.fontSize, W, family, !!el.background), H);
+        return lines
+          .map((line, n) => ({ ...el, id: `${el.id}-l${n}`, text: line, y: Math.min(1, top + n * step) }))
+          .filter((line) => line.text.trim().length > 0);
+      }),
+    })),
+  };
 }
 
 /** Stream one asset from this app's storage to the edit service's staging. */
@@ -266,7 +303,7 @@ const ANALYSIS_SCHEMA = {
   },
 };
 
-function analysisPrompt(mode: string, brief?: string): string {
+function analysisPrompt(mode: string, brief?: string, window?: SourceWindow): string {
   const wants =
     mode === "cuts"
       ? "Propose cuts only; return an empty captions array."
@@ -279,7 +316,14 @@ function analysisPrompt(mode: string, brief?: string): string {
     "Cuts: the segments worth keeping, in playback order, with millisecond start/end timestamps " +
     "(tight in-points and out-points). " +
     "Captions: short on-screen lines matching the spoken content, with millisecond timing. " +
-    `${wants}${brief ? ` Context from the editor (the clip may sit inside a larger project): ${brief}` : ""}`
+    "If the footage already shows subtitles or captions on screen, return an empty captions array: " +
+    "a second set on top would cover the first. " +
+    `${wants}${brief ? ` Context from the editor (the clip may sit inside a larger project): ${brief}` : ""}` +
+    (window
+      ? ` Only the part from ${window.start.toFixed(1)}s to ${window.end.toFixed(1)}s of this video is in the edit; ` +
+        "everything outside it has already been cut. Propose segments inside that span only, " +
+        "with timestamps measured from the start of the whole video."
+      : "")
   );
 }
 
@@ -293,9 +337,43 @@ const ANALYSIS_MODEL = "google/gemini-3.7-flash";
  * from the platform, and calls the model directly on the org's OpenRouter key
  * — the model fetches the video itself; no bytes move through this worker.
  */
+/** The part of a source a clip currently plays, in seconds into that source. */
+export interface SourceWindow {
+  start: number;
+  end: number;
+}
+
+/**
+ * Keep an analysis inside the clip's window. The model watches the whole
+ * source; without this, a proposal could reach back before a trim the person
+ * already made and put that footage back.
+ */
+/** Move every timestamp by `byMs`: from the analysis copy's clock to the source's. */
+export function shiftResult(result: AnalyzeResult, byMs: number): AnalyzeResult {
+  if (!byMs) return result;
+  return {
+    ...result,
+    cuts: result.cuts.map((c) => ({ ...c, start_ms: c.start_ms + byMs, end_ms: c.end_ms + byMs })),
+    captions: result.captions.map((c) => ({ ...c, start_ms: c.start_ms + byMs, end_ms: c.end_ms + byMs })),
+  };
+}
+
+export function withinWindow(result: AnalyzeResult, window?: SourceWindow): AnalyzeResult {
+  if (!window) return result;
+  const lo = window.start * 1000;
+  const hi = window.end * 1000;
+  return {
+    ...result,
+    cuts: result.cuts
+      .map((c) => ({ ...c, start_ms: Math.max(c.start_ms, lo), end_ms: Math.min(c.end_ms, hi) }))
+      .filter((c) => c.end_ms - c.start_ms >= 100),
+    captions: result.captions.filter((c) => c.start_ms >= lo && c.start_ms < hi),
+  };
+}
+
 export async function analyzeAsset(
   assetId: string,
-  opts: { mode?: string; prompt?: string },
+  opts: { mode?: string; prompt?: string; window?: SourceWindow },
   cfg: ExportConfig,
 ): Promise<{ result: AnalyzeResult } | { failure: ExportFailure }> {
   if (!cfg.openrouterKey) {
@@ -307,8 +385,11 @@ export async function analyzeAsset(
     };
   }
 
-  const media = await analysisDataUrl(assetId, cfg);
+  const media = await analysisDataUrl(assetId, cfg, opts.window);
   if ("failure" in media) return media;
+  // Watching a copy cut to the window, the model's clock starts at the window;
+  // watching the whole source, it is told which part is in the edit.
+  const cutToWindow = media.cut;
 
   const mode = ["cuts", "captions", "both"].includes(opts.mode ?? "") ? opts.mode! : "both";
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -320,7 +401,7 @@ export async function analyzeAsset(
         {
           role: "user",
           content: [
-            { type: "text", text: analysisPrompt(mode, opts.prompt) },
+            { type: "text", text: analysisPrompt(mode, opts.prompt, cutToWindow ? undefined : opts.window) },
             { type: "video_url", video_url: { url: media.dataUrl } },
           ],
         },
@@ -353,7 +434,8 @@ export async function analyzeAsset(
   if (!parsed || !Array.isArray(parsed.cuts)) {
     return { failure: { error: "analyze_failed", detail: "model returned unparseable output — retry" } };
   }
-  return { result: { ...(parsed as AnalyzeResult), model: ANALYSIS_MODEL } };
+  const result = shiftResult({ ...(parsed as AnalyzeResult), model: ANALYSIS_MODEL }, media.from * 1000);
+  return { result: withinWindow(result, opts.window) };
 }
 
 // ── analysis delivery: base64 data URLs over a small proxy ──────────────────
@@ -385,10 +467,51 @@ function bytesToBase64(buf: ArrayBuffer): string {
 async function analysisBytes(
   asset: AssetRow,
   cfg: ExportConfig,
-): Promise<{ bytes: ArrayBuffer } | { failure: ExportFailure }> {
-  if (asset.size <= DIRECT_ANALYSIS_BYTES && DIRECT_TYPES.has(asset.content_type)) {
+  window?: SourceWindow,
+): Promise<{ bytes: ArrayBuffer; from: number; cut: boolean } | { failure: ExportFailure }> {
+  if (asset.size > 0 && asset.size <= DIRECT_ANALYSIS_BYTES && DIRECT_TYPES.has(asset.content_type)) {
     const bytes = await getUploadBytes(asset.key);
-    if (bytes) return { bytes };
+    if (bytes) return { bytes, from: 0, cut: false };
+  }
+
+  // Only the part the clip plays. Rendering the whole source refused anything
+  // over 5 minutes, which is every long master on the media service, even
+  // when the clip itself was 20 seconds. Cached per window.
+  if (window) {
+    const key = `proxies/${asset.id}-${Math.round(window.start * 1000)}-${Math.round(window.end * 1000)}.mp4`;
+    let bytes = await getUploadBytes(key);
+    if (!bytes) {
+      const staged = await ensureStagedSrc(asset.id, cfg);
+      if ("failure" in staged) return staged;
+      const proxied = await runEdit(
+        {
+          version: 1,
+          output: { width: 640, height: 360, fps: 24, background: "#000000" },
+          main: {
+            elements: [
+              { id: "p", type: "video", src: staged.src, trimStart: window.start, duration: window.end - window.start },
+            ],
+          },
+          overlays: [],
+          audio: [],
+        } as Edl,
+        { quality: "draft", filename: `proxy-${asset.id}.mp4` },
+        cfg,
+      );
+      if ("failure" in proxied) {
+        const detail = proxied.failure.detail.includes("max is")
+          ? "this clip plays for more than 5 minutes — shorten it before analysis"
+          : `could not build the analysis copy: ${proxied.failure.detail}`;
+        return { failure: { error: "analyze_failed", detail } };
+      }
+      await copyOutput(proxied.result, key);
+      bytes = await getUploadBytes(key);
+    }
+    if (!bytes) return { failure: { error: "analyze_failed", detail: "analysis copy missing — retry" } };
+    if (bytes.byteLength > ANALYSIS_HARD_CAP) {
+      return { failure: { error: "analyze_failed", detail: "clip too long for analysis — shorten it first" } };
+    }
+    return { bytes, from: window.start, cut: true };
   }
 
   if (!asset.proxy_key) {
@@ -422,20 +545,30 @@ async function analysisBytes(
   if (bytes.byteLength > ANALYSIS_HARD_CAP) {
     return { failure: { error: "analyze_failed", detail: "clip too long for analysis — trim it first" } };
   }
-  return { bytes };
+  return { bytes, from: 0, cut: false };
 }
 
+/**
+ * The video the model watches, and where in the source it starts: 0 for the
+ * whole source, the window's start for a copy cut to the clip.
+ */
 async function analysisDataUrl(
   assetId: string,
   cfg: ExportConfig,
-): Promise<{ dataUrl: string; byteLength: number } | { failure: ExportFailure }> {
+  window?: SourceWindow,
+): Promise<{ dataUrl: string; byteLength: number; from: number; cut: boolean } | { failure: ExportFailure }> {
   const asset = await get<AssetRow>("SELECT * FROM assets WHERE id = ?", [assetId]);
   if (!asset) {
     return { failure: { error: "asset_not_found", detail: `no media-library asset with id "${assetId}"` } };
   }
-  const res = await analysisBytes(asset, cfg);
+  const res = await analysisBytes(asset, cfg, window);
   if ("failure" in res) return res;
-  return { dataUrl: `data:video/mp4;base64,${bytesToBase64(res.bytes)}`, byteLength: res.bytes.byteLength };
+  return {
+    dataUrl: `data:video/mp4;base64,${bytesToBase64(res.bytes)}`,
+    byteLength: res.bytes.byteLength,
+    from: res.from,
+    cut: res.cut,
+  };
 }
 
 export interface AutocutSegment {
@@ -524,7 +657,8 @@ export async function autocutAssets(
     `start/end within each clip, tight in/out points), drop dead air, false starts, filler and ` +
     `redundancy across clips, and ORDER the segments for the strongest result — the output order ` +
     `is your sequence array, and it does not have to follow the clip order. Give each segment an ` +
-    `optional short on-screen caption (empty string for none). Keep the total under 240 seconds ` +
+    `optional short on-screen caption (empty string for none; always empty if the footage already ` +
+    `shows subtitles on screen). Keep the total under 240 seconds ` +
     `unless the brief demands otherwise. ` +
     (brief ? `The video's purpose: ${brief}` : `No brief was given — aim for a tight, watchable cut.`);
 

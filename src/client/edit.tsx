@@ -11,7 +11,15 @@
 // debounced PUT; validation errors surface with their JSON pointer.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
+import { splitClip } from "../shared/split";
 import {
+  AlignCenterHorizontal,
+  AlignCenterVertical,
+  AlignEndHorizontal,
+  AlignEndVertical,
+  AlignStartHorizontal,
+  AlignStartVertical,
   Check,
   ChevronRight,
   Cloud,
@@ -38,6 +46,10 @@ import {
 } from "lucide-react";
 import {
   ConfirmDialog,
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
   Dialog,
   EmptyState,
   Kbd,
@@ -706,13 +718,23 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
 
   // ── persistence (debounced) ───────────────────────────────────────────────
   const dirty = useRef(false);
+  // What the server holds. Compared against this, not the document the page
+  // opened with: undo can walk back to that very document, and comparing with
+  // it skipped the save, so the undo showed on screen and never persisted.
+  const saved = useRef({ edl: initial.edl, name: initial.name, brief: initial.brief ?? "" });
   useEffect(() => {
-    if (edl === initial.edl && name === initial.name && brief === (initial.brief ?? "")) return;
+    const last = saved.current;
+    if (edl === last.edl && name === last.name && brief === last.brief) {
+      dirty.current = false;
+      setSaveState("saved");
+      return;
+    }
     dirty.current = true;
     setSaveState("saving");
     const t = setTimeout(async () => {
       try {
         await api.send("PUT", `/api/projects/${initial.id}`, { name, edl, brief });
+        saved.current = { edl, name, brief };
         dirty.current = false;
         setSaveState("saved");
       } catch (e) {
@@ -870,8 +892,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     });
   };
 
-  const splitAtPlayhead = () => {
-    const t = playheadRef.current;
+  /** Cut the main-track clip under `t` in two, both halves the same source. */
+  const splitAt = (t: number) => {
     const seg = segments.find((s) => t > s.start + 0.05 && t < s.start + s.dur - 0.05);
     if (!seg) return;
     const off = t - seg.start;
@@ -882,14 +904,13 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         el.duration = off;
         d.main.elements.splice(seg.i + 1, 0, right);
       } else {
-        const ts = el.trimStart ?? 0;
-        const te = el.trimEnd ?? 0;
-        const right = { ...structuredClone(el), id: rid(), trimStart: ts + off };
-        el.trimEnd = te + (seg.dur - off);
-        d.main.elements.splice(seg.i + 1, 0, right);
+        const halves = splitClip(structuredClone(el), off, seg.dur, rid());
+        if (halves) d.main.elements.splice(seg.i, 1, ...halves);
       }
     });
   };
+
+  const splitAtPlayhead = () => splitAt(playheadRef.current);
 
   const deleteSelected = () => {
     if (!sel) return;
@@ -900,6 +921,21 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     });
     setSel(null);
   };
+
+  // Delete or Backspace removes what is selected, as the trash button does.
+  // Ignored while typing, so editing text never deletes a clip.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Delete" && e.key !== "Backspace") return;
+      const el = e.target as HTMLElement | null;
+      if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+      if (!sel) return;
+      e.preventDefault();
+      deleteSelected();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -1063,6 +1099,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         srcDur={srcDur}
         resolveAsset={resolveAsset}
         splitAtPlayhead={splitAtPlayhead}
+        splitAt={splitAt}
         deleteSelected={deleteSelected}
       />
     </div>
@@ -1183,7 +1220,7 @@ function LeftPanel({
 }) {
   const [uploading, setUploading] = useState(false);
   const [uploadErr, setUploadErr] = useState("");
-  const mediaReady = useMediaReady(assets);
+  const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(assets);
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1326,8 +1363,12 @@ function LeftPanel({
                   {isVideoAsset(a) ? (
                     preparing ? (
                       <div className="w-full h-20 grid place-items-center bg-surface-sunken text-fine text-muted gap-1">
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        Preparing
+                        {mediaIngesting.has(a.id) && (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Preparing
+                          </>
+                        )}
                       </div>
                     ) : a.media_uid ? (
                       <img src={frameUrl(a, 1)} alt="" className="w-full h-20 object-cover bg-black" />
@@ -1425,8 +1466,8 @@ function AskDialog({
           data-autofocus
         />
         <p className="mt-2 text-fine text-faint">
-          It can trim, split, delete, reorder and mute clips, add or remove on-screen text, and switch the video
-          between landscape, vertical and square.
+          It can trim, split, delete, reorder and mute clips, watch a clip and cut its dead air and false starts,
+          add or remove on-screen text, and switch the video between landscape, vertical and square.
         </p>
         {running && <div className="mt-2 text-fine text-muted">Working through the cut…</div>}
         {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
@@ -1464,8 +1505,12 @@ function fmtBytes(n: number | null): string {
  * the library says so and the clip stays out of the timeline until it is.
  * Polls only while something is still pending.
  */
-function useMediaReady(assets: Asset[]): Set<string> {
+function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<string> } {
   const [ready, setReady] = useState<Set<string>>(new Set());
+  // Only what the service has actually reported as not ready yet. Until the
+  // first answer a clip is merely unknown, and calling it "Preparing" flashed
+  // that label on every page load for footage that had long been ready.
+  const [ingesting, setIngesting] = useState<Set<string>>(new Set());
   const pending = assets.filter((a) => a.media_uid && !ready.has(a.id)).map((a) => a.id);
   const key = pending.join(",");
 
@@ -1474,15 +1519,18 @@ function useMediaReady(assets: Asset[]): Set<string> {
     let dead = false;
     const check = async () => {
       const done: string[] = [];
+      const waiting: string[] = [];
       for (const id of key.split(",")) {
         try {
           const r = await api.get<{ ready: boolean }>(`/api/assets/${id}/playback`);
-          if (r.ready) done.push(id);
+          (r.ready ? done : waiting).push(id);
         } catch {
-          /* still ingesting, or a hiccup: ask again on the next pass */
+          /* a hiccup: ask again on the next pass */
         }
       }
-      if (!dead && done.length) setReady((cur) => new Set([...cur, ...done]));
+      if (dead) return;
+      if (done.length) setReady((cur) => new Set([...cur, ...done]));
+      setIngesting(new Set(waiting));
     };
     check();
     const t = setInterval(check, 5000);
@@ -1492,7 +1540,7 @@ function useMediaReady(assets: Asset[]): Set<string> {
     };
   }, [key]);
 
-  return ready;
+  return { ready, ingesting };
 }
 
 /** Search the org's Google Drive and copy picked files into the library. */
@@ -2020,14 +2068,21 @@ function Player({
                   const selected = sel?.area === "ovl" && sel.ti === ti && sel.i === i;
                   if (el.type === "text") {
                     const t = el as OverlayText;
-                    return (
+                    // The same line breaks the export uses: one centred line
+                    // per element, so what shows here is what renders.
+                    const family = t.fontFamily ?? "sans";
+                    const lines = wrapLines(t.text, t.fontSize, edl.output.width, family);
+                    const step = lineStep(t.fontSize, !!t.background) / edl.output.height;
+                    const top = fitTop(t.y, blockHeight(t.text, t.fontSize, edl.output.width, family, !!t.background), edl.output.height);
+                    return lines.map((line, n) =>
+                      line.trim() ? (
                       <div
-                        key={el.id}
+                        key={`${el.id}-${n}`}
                         onPointerDown={dragOverlay(ti, i)}
                         className={`absolute cursor-move select-none whitespace-pre leading-tight ${selected ? "outline outline-2 outline-ring" : ""}`}
                         style={{
                           left: `${t.x * 100}%`,
-                          top: `${t.y * 100}%`,
+                          top: `${(top + n * step) * 100}%`,
                           transform: t.align === "center" ? "translateX(-50%)" : t.align === "right" ? "translateX(-100%)" : undefined,
                           fontSize: t.fontSize * scale,
                           fontFamily: t.fontFamily === "serif" ? "serif" : t.fontFamily === "mono" ? "monospace" : "Inter, sans-serif",
@@ -2038,8 +2093,9 @@ function Player({
                           textAlign: t.align ?? "left",
                         }}
                       >
-                        {t.text}
+                        {line}
                       </div>
+                      ) : null,
                     );
                   }
                   const m = el as OverlayMedia;
@@ -2227,16 +2283,23 @@ function Inspector({
                     ]
                       .filter(Boolean)
                       .join(" ");
+                    // The part of the source this clip plays now: the analysis
+                    // stays inside it instead of undoing the trims already made.
+                    const seg = segments.find((x) => x.i === sel.i);
+                    const from = (el as MainVideo).trimStart ?? 0;
+                    const window = seg ? { start: from, end: from + seg.dur } : undefined;
                     const r = await api.send<AnalyzeResult>("POST", `/api/assets/${a.id}/analyze`, {
-                      mode: "both",
+                      // Cuts only. Captions are their own deliberate step: added
+                      // here they landed on top of subtitles already in the footage.
+                      mode: "cuts",
                       ...(context ? { prompt: context } : {}),
+                      ...(window ? { window } : {}),
                     });
                     const keeps = r.cuts.filter((c) => c.keep).sort((x, y) => x.start_ms - y.start_ms);
                     if (keeps.length === 0) {
                       setAnalyzeMsg("No keep-segments proposed.");
                       return;
                     }
-                    const before = segments.slice(0, segments.findIndex((s) => s.i === sel.i)).reduce((acc, s) => acc + s.dur, 0);
                     update((d) => {
                       const base = d.main.elements[sel.i] as MainVideo;
                       const parts: MainVideo[] = keeps.map((k) => {
@@ -2245,41 +2308,10 @@ function Inspector({
                         return p;
                       });
                       d.main.elements.splice(sel.i, 1, ...parts);
-                      // Captions land on the output timeline: offset each by the
-                      // kept time that precedes it inside this clip.
-                      const caps = r.captions
-                        .map((c) => {
-                          let out = before;
-                          for (const k of keeps) {
-                            if (c.start_ms >= k.end_ms) out += (k.end_ms - k.start_ms) / 1000;
-                            else if (c.start_ms >= k.start_ms) return { c, at: out + (c.start_ms - k.start_ms) / 1000 };
-                            else return null;
-                          }
-                          return null;
-                        })
-                        .filter(Boolean) as { c: AnalyzeResult["captions"][number]; at: number }[];
-                      if (caps.length) {
-                        d.overlays = d.overlays ?? [];
-                        const track: OverlayTrack = { id: rid(), elements: [] };
-                        for (const { c, at } of caps) {
-                          track.elements.push({
-                            id: rid(),
-                            type: "text",
-                            text: c.text,
-                            fontSize: Math.round(edl.output.height * 0.055),
-                            startTime: Math.round(at * 100) / 100,
-                            duration: Math.max(0.4, (c.end_ms - c.start_ms) / 1000),
-                            x: 0.5,
-                            y: 0.82,
-                            align: "center",
-                            color: DEFAULT_TEXT_COLOR,
-                            background: "#000000a0",
-                          });
-                        }
-                        d.overlays.push(track);
-                      }
                     });
-                    setAnalyzeMsg(`Applied ${keeps.length} segment${keeps.length > 1 ? "s" : ""}${r.captions.length ? ` + ${r.captions.length} captions` : ""}.`);
+                    setAnalyzeMsg(
+                      keeps.length === 1 ? "Nothing to cut: the clip was kept whole." : `Kept ${keeps.length} parts.`,
+                    );
                   } catch (e) {
                     setAnalyzeMsg(String((e as Error).message));
                   } finally {
@@ -2341,20 +2373,14 @@ function Inspector({
                   <input className={inputCls} value={el.background ?? ""} placeholder="#00000080" onChange={(e) => set((x) => ((x as OverlayText).background = e.target.value || undefined))} />
                 </Row>
               </div>
-              <Row label="Align">
-                <select className={inputCls} value={el.align ?? "left"} onChange={(e) => set((x) => ((x as OverlayText).align = e.target.value as OverlayText["align"]))}>
-                  <option value="left">Left</option>
-                  <option value="center">Center</option>
-                  <option value="right">Right</option>
-                </select>
-              </Row>
             </>
           )}
           {el.type !== "text" && <SliderRow label="Width" value={(el as OverlayMedia).width} min={0.02} onChange={(n) => set((x) => ((x as OverlayMedia).width = n))} />}
-          <div className="grid grid-cols-2 gap-2">
-            <SliderRow label="X" value={el.x} onChange={(n) => set((x) => (x.x = n))} />
-            <SliderRow label="Y" value={el.y} onChange={(n) => set((x) => (x.y = n))} />
-          </div>
+          <PositionRow
+            el={el}
+            frame={edl.output}
+            onPlace={(place) => set((x) => Object.assign(x, place))}
+          />
           <SliderRow label="Opacity" value={el.opacity ?? 1} onChange={(n) => set((x) => (x.opacity = n))} />
           <div className="grid grid-cols-2 gap-2">
             <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
@@ -2389,6 +2415,80 @@ function Inspector({
         </button>
       )}
     </div>
+  );
+}
+
+// ── overlay position ────────────────────────────────────────────────────────
+
+/** How far from the frame's edge an aligned overlay sits, as a share of it. */
+const EDGE = 0.06;
+
+/**
+ * Place an overlay by intent (left, centre, bottom) instead of coordinates;
+ * dragging it on the canvas stays the fine control. Text moves on both axes.
+ * An image or video overlay moves only sideways here: its height follows the
+ * source's shape, which this panel does not know.
+ */
+function PositionRow({
+  el,
+  frame,
+  onPlace,
+}: {
+  el: OverlayText | OverlayMedia;
+  frame: Edl["output"];
+  onPlace: (place: { x?: number; y?: number; align?: OverlayText["align"] }) => void;
+}) {
+  const isText = el.type === "text";
+  const text = el as OverlayText;
+  const width = isText ? 0 : (el as OverlayMedia).width;
+
+  const horizontal = (side: "left" | "center" | "right") => {
+    if (isText) {
+      onPlace({ align: side, x: side === "left" ? EDGE : side === "center" ? 0.5 : 1 - EDGE });
+    } else {
+      onPlace({ x: side === "left" ? EDGE : side === "center" ? (1 - width) / 2 : 1 - EDGE - width });
+    }
+  };
+
+  const vertical = (side: "top" | "middle" | "bottom") => {
+    const h =
+      blockHeight(text.text, text.fontSize, frame.width, text.fontFamily ?? "sans", !!text.background) / frame.height;
+    const y = side === "top" ? EDGE : side === "middle" ? (1 - h) / 2 : 1 - EDGE - h;
+    onPlace({ y: Math.max(0, Math.min(1, Math.round(y * 1000) / 1000)) });
+  };
+
+  const group = "inline-flex items-center gap-0.5 rounded-sm bg-surface-sunken p-0.5";
+  const cell = "grid place-items-center w-7 h-6 rounded-xs text-muted hover:text-foreground hover:bg-surface";
+
+  return (
+    <Row label="Position">
+      <div className="flex items-center gap-2">
+        <div className={group} role="group" aria-label="Horizontal position">
+          <button className={cell} onClick={() => horizontal("left")} aria-label="Align left" title="Align left">
+            <AlignStartVertical className="w-4 h-4" />
+          </button>
+          <button className={cell} onClick={() => horizontal("center")} aria-label="Centre horizontally" title="Centre horizontally">
+            <AlignCenterVertical className="w-4 h-4" />
+          </button>
+          <button className={cell} onClick={() => horizontal("right")} aria-label="Align right" title="Align right">
+            <AlignEndVertical className="w-4 h-4" />
+          </button>
+        </div>
+        {isText && (
+          <div className={group} role="group" aria-label="Vertical position">
+            <button className={cell} onClick={() => vertical("top")} aria-label="Align top" title="Align top">
+              <AlignStartHorizontal className="w-4 h-4" />
+            </button>
+            <button className={cell} onClick={() => vertical("middle")} aria-label="Centre vertically" title="Centre vertically">
+              <AlignCenterHorizontal className="w-4 h-4" />
+            </button>
+            <button className={cell} onClick={() => vertical("bottom")} aria-label="Align bottom" title="Align bottom">
+              <AlignEndHorizontal className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+      </div>
+    </Row>
   );
 }
 
@@ -2457,6 +2557,8 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
 
 const RULER_H = 22;
 const MAIN_H = 52;
+/** Space between neighbouring clips on the main track, in pixels. */
+const CLIP_GAP = 4;
 const ROW_H = 30;
 const HEAD_W = 96;
 
@@ -2475,6 +2577,7 @@ function TimelinePanel({
   srcDur,
   resolveAsset,
   splitAtPlayhead,
+  splitAt,
   deleteSelected,
 }: {
   pane: Pane;
@@ -2492,12 +2595,28 @@ function TimelinePanel({
   srcDur: (src: string) => number | undefined;
   resolveAsset: (src: string) => Asset | undefined;
   splitAtPlayhead: () => void;
+  /** Split the main-track clip under a timeline time (right-click "Split here"). */
+  splitAt: (t: number) => void;
   deleteSelected: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(40); // px per second
-  const width = Math.max(300, (total || 10) * zoom + 60);
+  // The visible width of the track area. The ruler and every row reach at
+  // least this far, so a short or empty project does not stop mid-screen.
+  const [viewW, setViewW] = useState(0);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () => setViewW(el.clientWidth);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const width = Math.max(300, (total || 10) * zoom + 60, viewW - HEAD_W);
   const dragMain = useRef<{ from: number; over: number } | null>(null);
+  // Timeline seconds under the last right-click, for "Split here".
+  const menuAt = useRef(0);
   const [, bump] = useState(0);
 
   const timeAt = (clientX: number) => {
@@ -2597,9 +2716,9 @@ function TimelinePanel({
     const stepOptions = [0.5, 1, 2, 5, 10, 30, 60];
     const step = stepOptions.find((s) => s * zoom >= 42) ?? 60;
     const out: number[] = [];
-    for (let t = 0; t <= (total || 10) + step; t += step) out.push(Math.round(t * 100) / 100);
+    for (let t = 0; t <= width / zoom; t += step) out.push(Math.round(t * 100) / 100);
     return out;
-  }, [zoom, total]);
+  }, [zoom, width]);
 
   return (
     <div className={`${pane === "canvas" ? "flex" : "hidden"} lg:flex h-64 shrink-0 border-t border-border bg-surface flex-col`}>
@@ -2657,11 +2776,21 @@ function TimelinePanel({
             {segments.map((seg) => {
               const a = resolveAsset(seg.el.src);
               const selected = sel?.area === "main" && sel.i === seg.i;
-              const w = Math.max(10, seg.dur * zoom);
+              // A gap between clips, taken from the right edge so the ruler
+              // stays exact. Without it the two halves of a split fused into
+              // one strip; each piece should read as its own video.
+              const w = Math.max(8, seg.dur * zoom - CLIP_GAP);
               return (
+                <ContextMenu key={seg.el.id}>
+                <ContextMenuTrigger asChild>
                 <div
-                  key={seg.el.id}
                   draggable
+                  onContextMenu={(e) => {
+                    // Where the right-click landed, in timeline seconds.
+                    const box = e.currentTarget.getBoundingClientRect();
+                    menuAt.current = seg.start + (e.clientX - box.left) / zoom;
+                    setSel({ area: "main", i: seg.i });
+                  }}
                   onDragStart={() => (dragMain.current = { from: seg.i, over: seg.i })}
                   onDragOver={(e) => {
                     e.preventDefault();
@@ -2711,6 +2840,24 @@ function TimelinePanel({
                   <div onPointerDown={trimDrag(seg.i, "l")} className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize bg-white/0 hover:bg-white/30" />
                   <div onPointerDown={trimDrag(seg.i, "r")} className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize bg-white/0 hover:bg-white/30" />
                 </div>
+                </ContextMenuTrigger>
+                <ContextMenuContent>
+                  <ContextMenuItem onSelect={() => splitAt(menuAt.current)}>
+                    <Scissors className="w-4 h-4" /> Split here
+                  </ContextMenuItem>
+                  <ContextMenuItem
+                    danger
+                    onSelect={() => {
+                      update((d) => {
+                        d.main.elements.splice(seg.i, 1);
+                      });
+                      setSel(null);
+                    }}
+                  >
+                    <Trash2 className="w-4 h-4" /> Delete clip
+                  </ContextMenuItem>
+                </ContextMenuContent>
+                </ContextMenu>
               );
             })}
           </TrackRow>

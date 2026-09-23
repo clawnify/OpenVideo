@@ -192,8 +192,16 @@ even cleanup isn't blind:
 
 ```
 POST /api/assets/{id}/analyze
-{ "mode": "cuts" | "captions" | "both", "prompt": "optional brief, e.g. keep only the demo moments" }
+{ "mode": "cuts" | "captions" | "both", "prompt": "optional brief, e.g. keep only the demo moments",
+  "window": { "start": 5, "end": 25 } }
 ```
+
+`window` (optional, seconds into the source) is the part of the source the clip
+plays. Pass it: the model then watches only that part, which is also what lets a
+short clip cut from a long master be analysed at all (a clip that itself plays
+longer than 5 minutes is refused), and every returned timestamp stays inside it,
+so applying the result never brings back footage already trimmed away.
+Timestamps are always in source time, whether or not a window was given.
 
 A multimodal model watches the clip and returns, in a few seconds:
 

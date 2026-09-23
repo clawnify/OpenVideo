@@ -10,7 +10,7 @@ import {
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
-import { frameUrl, importMedia, mediaPlayback, mediaState, prepareMedia } from "./media";
+import { deleteMedia, frameUrl, importMedia, mediaPlayback, mediaState, prepareMedia } from "./media";
 import {
   DRIVE_FILE_ID,
   SHARED_WITH_ME,
@@ -210,6 +210,12 @@ app.get("/api/assets/:id/playback", async (c) => {
   }
   const play = await mediaPlayback(cfg, asset.media_uid);
   if ("failure" in play) return c.json(play.failure, 502);
+  // The MP4 the edit service cuts from is made only on request, so ask for it
+  // the moment the clip can play: by the time someone exports or analyses it,
+  // it is usually ready, instead of the first attempt failing.
+  if (state.media.download?.status !== "ready" && state.media.download?.status !== "inprogress") {
+    c.executionCtx.waitUntil(prepareMedia(cfg, asset.media_uid).then(() => {}));
+  }
   // The length the service measured beats the one the picker guessed.
   if (state.media.duration && Math.abs((asset.duration ?? 0) - state.media.duration) > 0.5) {
     await run("UPDATE assets SET duration = ? WHERE id = ?", [state.media.duration, asset.id]);
@@ -263,7 +269,13 @@ app.delete("/api/assets/:id", async (c) => {
     c.req.param("id"),
   ]);
   if (row) {
-    await deleteUpload(row.key);
+    // Footage on the media service counts against the org's storage minutes
+    // until it is deleted there; dropping only our row left it counting.
+    if (row.media_uid) {
+      await deleteMedia({ servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN }, row.media_uid);
+    } else {
+      await deleteUpload(row.key);
+    }
     if (row.proxy_key) await deleteUpload(row.proxy_key);
     await run("DELETE FROM assets WHERE id = ?", [row.id]);
   }
@@ -280,13 +292,20 @@ app.post("/api/assets/:id/analyze", async (c) => {
       503,
     );
   }
-  const b = (await c.req.json<{ mode?: string; prompt?: string }>().catch(() => ({}))) as {
+  const b = (await c.req.json<{ mode?: string; prompt?: string; window?: { start?: number; end?: number } }>().catch(() => ({}))) as {
     mode?: string;
     prompt?: string;
+    window?: { start?: number; end?: number };
   };
+  // The part of the source the clip plays now, so proposals stay inside it.
+  const w = b.window;
+  const window =
+    w && Number.isFinite(w.start) && Number.isFinite(w.end) && (w.end as number) > (w.start as number)
+      ? { start: Math.max(0, w.start as number), end: w.end as number }
+      : undefined;
   const res = await analyzeAsset(
     c.req.param("id"),
-    { mode: b.mode, prompt: b.prompt },
+    { mode: b.mode, prompt: b.prompt, window },
     {
       servicesUrl: c.env.SERVICES_URL,
       token: c.env.CLAWNIFY_TOKEN,
@@ -454,16 +473,38 @@ app.post("/api/projects/:id/instruct", async (c) => {
   const current = validateEdl(JSON.parse(project.edl));
   if ("invalid" in current) return c.json(current.invalid, 422);
 
-  // The model reads clip names, not asset ids.
+  // The model reads clip names, not asset ids; lengths say where a clip ends.
   const names = new Map<string, string>();
-  for (const row of await query<Asset>("SELECT id, name FROM assets")) {
+  const lengths = new Map<string, number>();
+  for (const row of await query<Asset>("SELECT id, name, duration FROM assets")) {
     names.set(`asset:${row.id}`, row.name);
+    if (row.duration) lengths.set(`asset:${row.id}`, row.duration);
   }
 
-  const out = await instructEdit(current.edl, instruction, names, {
-    openrouterKey: c.env.OPENROUTER_API_KEY,
+  const analysisCfg = {
     servicesUrl: c.env.SERVICES_URL,
-  });
+    token: c.env.CLAWNIFY_TOKEN ?? "",
+    openrouterKey: c.env.OPENROUTER_API_KEY,
+  };
+  const out = await instructEdit(
+    current.edl,
+    instruction,
+    names,
+    { openrouterKey: c.env.OPENROUTER_API_KEY, servicesUrl: c.env.SERVICES_URL },
+    lengths,
+    // What the model uses to act on what is in the footage.
+    async (assetId, window, focus) => {
+      const r = await analyzeAsset(assetId, { mode: "cuts", prompt: focus, window }, analysisCfg);
+      if ("failure" in r) return { error: r.failure.detail };
+      return {
+        keeps: r.result.cuts
+          .filter((cut) => cut.keep)
+          .sort((a, b) => a.start_ms - b.start_ms)
+          .map((cut) => ({ start: cut.start_ms / 1000, end: cut.end_ms / 1000 })),
+        notes: r.result.notes,
+      };
+    },
+  );
   if ("failure" in out) return c.json(out.failure, 422);
 
   await run("UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ?", [
