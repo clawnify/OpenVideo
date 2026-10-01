@@ -52,6 +52,12 @@ const clipBase = {
 
 const fit = z.enum(["contain", "cover"]);
 
+/** Which part of a filled (cover) frame is kept, as CSS object-position: 0
+ *  keeps the left/top edge, 1 the right/bottom. Ignored on contain. */
+const anchor = z
+  .object({ x: z.number().finite().min(0).max(1), y: z.number().finite().min(0).max(1) })
+  .strict();
+
 const mainVideo = z
   .object({
     ...clipBase,
@@ -64,6 +70,7 @@ const mainVideo = z
     sourceAudio: z.boolean().optional(),
     volume: z.number().finite().min(0).max(2).optional(),
     fit: fit.optional(),
+    anchor: anchor.optional(),
   })
   .strict();
 
@@ -73,6 +80,7 @@ const mainImage = z
     type: z.literal("image"),
     duration: seconds.min(0.05).max(MAX_OUTPUT_SECONDS),
     fit: fit.optional(),
+    anchor: anchor.optional(),
   })
   .strict();
 

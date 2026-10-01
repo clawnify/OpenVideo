@@ -121,7 +121,9 @@ source's head/tail; video clips also accept `duration` — **play N seconds from
 source's length (prefer it when working from analysis timestamps:
 `trimStart: start_ms/1000, duration: (end_ms-start_ms)/1000`); `fit` is
 `"contain"` (letterbox on the background color, default) or `"cover"` (fill
-and crop); `sourceAudio: false` mutes a clip's own sound; images need an
+and crop); on a `"cover"` clip, `anchor: { x, y }` (0..1, default 0.5/0.5)
+picks which part stays in frame, as CSS object-position does: `x: 0` keeps
+the left edge, `x: 1` the right, and only the side that spills over moves; `sourceAudio: false` mutes a clip's own sound; images need an
 explicit `duration`. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
 `background` (`#RRGGBBAA` works). Media overlays: `width` as a fraction of

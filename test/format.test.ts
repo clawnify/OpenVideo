@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { presetFor, ratioLabel, ratioOf, reshape, sameShape, sizeFor } from "../src/shared/format";
+import { CENTRE, coverOverflow, dragAnchor, presetFor, ratioLabel, ratioOf, reshape, sameShape, sizeFor } from "../src/shared/format";
 
 describe("ratioOf", () => {
   it("names a shape by its reduced ratio, whatever the resolution", () => {
@@ -113,5 +113,32 @@ describe("reshape", () => {
     const el = reshape(bleeding, 1280, 1280).overlays[0].elements[0];
     expect(el.x + el.width).toBeGreaterThan(1);
     expect(el.x).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("reframing a filled clip", () => {
+  const landscape = { width: 1920, height: 1080 };
+  const vertical = { width: 720, height: 1280 };
+
+  it("knows a landscape clip spills over the sides of a vertical frame, not the top", () => {
+    const o = coverOverflow(landscape, vertical);
+    // Scaled to 1280 tall it is 2275.6 wide: 1555.6 more than the frame.
+    expect(o.x).toBeCloseTo(1555.6 / 720, 2);
+    expect(o.y).toBe(0);
+  });
+
+  it("dragging right shows more of the left, and stops at the edge", () => {
+    const o = coverOverflow(landscape, vertical);
+    const moved = dragAnchor(CENTRE, 0.5, 0, o);
+    expect(moved.x).toBeLessThan(0.5);
+    expect(moved.y).toBe(0.5);
+    expect(dragAnchor(CENTRE, 10, 0, o).x).toBe(0);
+    expect(dragAnchor(CENTRE, -10, 0, o).x).toBe(1);
+  });
+
+  it("an axis with nothing to show does not move", () => {
+    const o = coverOverflow(landscape, vertical);
+    expect(dragAnchor(CENTRE, 0, 0.3, o)).toEqual(CENTRE);
+    expect(dragAnchor(CENTRE, 0.3, 0.3, coverOverflow(landscape, landscape))).toEqual(CENTRE);
   });
 });

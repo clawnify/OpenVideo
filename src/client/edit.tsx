@@ -22,7 +22,19 @@ import {
   type ProjectCaptions,
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
-import { FORMAT_PRESETS, parseRatio, presetFor, ratioLabel, reshape, sameShape, sizeFor } from "../shared/format";
+import {
+  CENTRE,
+  FORMAT_PRESETS,
+  coverOverflow,
+  dragAnchor,
+  parseRatio,
+  presetFor,
+  ratioLabel,
+  reshape,
+  sameShape,
+  sizeFor,
+  type Anchor,
+} from "../shared/format";
 import {
   Captions as CaptionsIcon,
   AlignCenterHorizontal,
@@ -105,6 +117,8 @@ interface MainVideo {
   sourceAudio?: boolean;
   volume?: number;
   fit?: "contain" | "cover";
+  /** Which part of a filled frame is kept (shared/format.ts). */
+  anchor?: Anchor;
 }
 interface MainImage {
   id: string;
@@ -112,6 +126,7 @@ interface MainImage {
   src: string;
   duration: number;
   fit?: "contain" | "cover";
+  anchor?: Anchor;
 }
 type MainElement = MainVideo | MainImage;
 
@@ -2374,6 +2389,49 @@ function Player({
     window.addEventListener("pointerup", up);
   };
 
+  // A filled clip that is selected and on screen is reframed by dragging it:
+  // the drag slides it across the side that spills over the frame.
+  const selMain = sel?.area === "main" ? edl.main.elements[sel.i] : undefined;
+  const reframable = !!selMain && selMain.fit === "cover" && active?.el.id === selMain.id && active.dur > 0;
+
+  const stagePointerDown = (e: React.PointerEvent) => {
+    if (!reframable || !selMain || sel?.area !== "main") return setSel(null);
+    const i = sel.i;
+    const media = stageRef.current?.querySelector(`[data-clip="${CSS.escape(selMain.id)}"]`);
+    const natural =
+      media instanceof HTMLVideoElement
+        ? { width: media.videoWidth, height: media.videoHeight }
+        : media instanceof HTMLImageElement
+          ? { width: media.naturalWidth, height: media.naturalHeight }
+          : null;
+    // Until the clip has loaded there is no frame to slide.
+    if (!natural?.width || !natural.height) return;
+    e.preventDefault();
+    const overflow = coverOverflow(natural, edl.output);
+    const rect = stageRef.current!.getBoundingClientRect();
+    const from = selMain.anchor ?? CENTRE;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let moved = false;
+    const move = (ev: PointerEvent) => {
+      // A click without a drag still deselects, as it always did.
+      if (!moved && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 3) return;
+      moved = true;
+      const next = dragAnchor(from, (ev.clientX - startX) / rect.width, (ev.clientY - startY) / rect.height, overflow);
+      update((d) => {
+        const el = d.main.elements[i];
+        if (el) el.anchor = next;
+      }, true);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      if (!moved) setSel(null);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
   return (
     <div
       ref={boxRef}
@@ -2382,9 +2440,9 @@ function Player({
       <div style={{ width: fit.w || undefined, height: fit.h || undefined }}>
         <div
           ref={stageRef}
-          className="relative w-full h-full overflow-hidden rounded-md shadow-edge"
+          className={`relative w-full h-full overflow-hidden rounded-md shadow-edge ${reframable ? "cursor-grab active:cursor-grabbing" : ""}`}
           style={{ background: edl.output.background ?? "#000" }}
-          onPointerDown={() => setSel(null)}
+          onPointerDown={stagePointerDown}
         >
           {/* main track media (stacked; active visible) */}
           {segments.map((seg) => {
@@ -2392,9 +2450,12 @@ function Player({
             if (!a) return null;
             const visible = seg === active && seg.dur > 0;
             const fit = seg.el.fit ?? "contain";
+            const at = fit === "cover" ? (seg.el.anchor ?? CENTRE) : CENTRE;
             const common = {
               className: `absolute inset-0 w-full h-full ${visible ? "" : "hidden"}`,
-              style: { objectFit: fit } as React.CSSProperties,
+              // object-position is the export's crop offset, so both frame it alike.
+              style: { objectFit: fit, objectPosition: `${at.x * 100}% ${at.y * 100}%` } as React.CSSProperties,
+              "data-clip": seg.el.id,
             };
             return seg.el.type === "video" ? (
               a.media_uid ? (
@@ -2708,6 +2769,63 @@ function ClipsFit({ edl, update }: { edl: Edl; update: (fn: (d: Edl) => void) =>
   );
 }
 
+/**
+ * Which part of a filled clip stays in frame. Only the side that spills over
+ * the frame can move, so only its three choices are offered; dragging the
+ * clip in the preview is the fine control.
+ */
+function ClipFraming({
+  asset,
+  frame,
+  onChange,
+}: {
+  asset: Asset | undefined;
+  frame: Edl["output"];
+  onChange: (anchor: Anchor) => void;
+}) {
+  const shapes = useShapes(asset ? [asset] : []);
+  const shape = asset && shapes.get(asset.id);
+  if (!shape) return null;
+  const overflow = coverOverflow(shape, frame);
+  const sideways = overflow.x > 0.005;
+  if (!sideways && overflow.y <= 0.005) return null;
+
+  const group = "inline-flex items-center gap-0.5 rounded-sm bg-surface-sunken p-0.5";
+  const cell = "grid place-items-center w-7 h-6 rounded-xs text-muted hover:text-foreground hover:bg-surface";
+  const choices: [number, string, React.ReactNode][] = sideways
+    ? [
+        [0, "Keep the left side", <AlignStartVertical key="l" className="w-4 h-4" />],
+        [0.5, "Keep the middle", <AlignCenterVertical key="c" className="w-4 h-4" />],
+        [1, "Keep the right side", <AlignEndVertical key="r" className="w-4 h-4" />],
+      ]
+    : [
+        [0, "Keep the top", <AlignStartHorizontal key="t" className="w-4 h-4" />],
+        [0.5, "Keep the middle", <AlignCenterHorizontal key="m" className="w-4 h-4" />],
+        [1, "Keep the bottom", <AlignEndHorizontal key="b" className="w-4 h-4" />],
+      ];
+
+  return (
+    <Field label="Framing">
+      <div className="flex items-center gap-2">
+        <div className={group} role="group" aria-label="Framing">
+          {choices.map(([v, label, icon]) => (
+            <button
+              key={label}
+              className={cell}
+              aria-label={label}
+              title={label}
+              onClick={() => onChange(sideways ? { x: v, y: 0.5 } : { x: 0.5, y: v })}
+            >
+              {icon}
+            </button>
+          ))}
+        </div>
+        <span className="text-fine text-faint">or drag it in the preview</span>
+      </div>
+    </Field>
+  );
+}
+
 /** Letterbox or fill, for one clip. */
 function ClipFit({ value, onChange }: { value?: Fit; onChange: (fit: Fit) => void }) {
   return (
@@ -2821,6 +2939,13 @@ function Inspector({
                 <NumberRow label="Trim end (s)" value={el.trimEnd ?? 0} min={0} onChange={(n) => set((e) => ((e as MainVideo).trimEnd = Math.max(0, n)))} />
               )}
               <ClipFit value={el.fit} onChange={(fit) => set((x) => ((x as MainVideo).fit = fit))} />
+              {el.fit === "cover" && (
+                <ClipFraming
+                  asset={resolveAsset(el.src)}
+                  frame={edl.output}
+                  onChange={(anchor) => set((x) => ((x as MainVideo).anchor = anchor))}
+                />
+              )}
               <Row label="Clip audio">
                 <button
                   className={`${inputCls} text-left`}
@@ -2900,6 +3025,13 @@ function Inspector({
             <>
               <NumberRow label="Duration (s)" value={el.duration} min={0.1} onChange={(n) => set((e) => ((e as MainImage).duration = Math.max(0.1, n)))} />
               <ClipFit value={el.fit} onChange={(fit) => set((x) => ((x as MainImage).fit = fit))} />
+              {el.fit === "cover" && (
+                <ClipFraming
+                  asset={resolveAsset(el.src)}
+                  frame={edl.output}
+                  onChange={(anchor) => set((x) => ((x as MainImage).anchor = anchor))}
+                />
+              )}
             </>
           )}
         </>
