@@ -109,7 +109,7 @@ A complete document:
   ],
   "audio": [
     { "id": "music", "elements": [
-      { "id": "bed", "type": "audio", "src": "asset:7d2a5f8c1e4b9036", "startTime": 0, "volume": 0.35 }
+      { "id": "bed", "type": "audio", "src": "asset:7d2a5f8c1e4b9036", "startTime": 0, "volume": 0.35, "fadeIn": 1, "fadeOut": 2 }
     ]}
   ]
 }
@@ -128,7 +128,11 @@ explicit `duration`. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
 `background` (`#RRGGBBAA` works). Media overlays: `width` as a fraction of
 canvas width, height keeps aspect. Audio elements: `volume` 0..2, `duration`
-defaults to the source's length minus trims. Output duration (sum of the main
+defaults to the source's length minus trims; `fadeIn` and `fadeOut` are
+seconds (0..30) of ramp from and to silence. The fade-out ends where the clip
+is last heard, which is the end of the video when the clip runs past it, so
+music laid under a shorter cut needs no trimming to end cleanly: set
+`fadeOut: 2` and leave its length alone. Output duration (sum of the main
 track) maxes at 5 minutes.
 
 **Format** (the video's shape) is `output.width` x `output.height`: even

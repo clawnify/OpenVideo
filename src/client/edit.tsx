@@ -22,6 +22,7 @@ import {
   type ProjectCaptions,
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
+import { fadeGain, heardFor } from "../shared/fade";
 import {
   CENTRE,
   FORMAT_PRESETS,
@@ -174,6 +175,9 @@ interface AudioElement {
   trimStart?: number;
   trimEnd?: number;
   volume?: number;
+  /** Seconds of ramp from silence, and to silence where the clip is last heard (shared/fade.ts). */
+  fadeIn?: number;
+  fadeOut?: number;
 }
 interface AudioTrack {
   id: string;
@@ -2302,6 +2306,7 @@ function Player({
   }, [edl.output.width, edl.output.height]);
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
+  const cutLength = segments.reduce((n, s) => n + s.dur, 0);
 
   // The playing video's position on the timeline, for the master clock.
   const activeRef = useRef(active);
@@ -2350,7 +2355,9 @@ function Player({
         const wanted = (el.trimStart ?? 0) + (t - el.startTime);
         if (inWindow && playing && !track.muted) {
           if (Math.abs(a.currentTime - wanted) > 0.25) a.currentTime = wanted;
-          a.volume = Math.min(1, el.volume ?? 1);
+          // The export's afade envelope, so fades sound in the preview as they will in the file.
+          const gain = fadeGain(el, heardFor(el.startTime, dur, cutLength), t - el.startTime);
+          a.volume = Math.min(1, el.volume ?? 1) * gain;
           if (a.paused) a.play().catch(() => {});
         } else if (!a.paused) a.pause();
       }
@@ -2870,6 +2877,46 @@ function SliderRow({ label, value, onChange, min = 0, max = 1, step = 0.01 }: { 
   );
 }
 
+/**
+ * Fade in and out for an audio clip. The fade-out ends where the clip is last
+ * heard, so on music longer than the cut it ends with the video.
+ */
+function AudioFades({
+  el,
+  heard,
+  onChange,
+}: {
+  el: AudioElement;
+  heard: number;
+  onChange: (key: "fadeIn" | "fadeOut", seconds: number) => void;
+}) {
+  // A slider past what is heard would do nothing more, so it stops there.
+  const max = Math.max(0.1, Math.min(10, Math.floor(heard * 10) / 10));
+  const row = (key: "fadeIn" | "fadeOut", label: string) => {
+    const v = Math.min(el[key] ?? 0, max);
+    return (
+      <Row label={`${label} — ${v > 0 ? `${v.toFixed(1)}s` : "off"}`}>
+        <input
+          type="range"
+          className="w-full"
+          aria-label={label}
+          value={v}
+          min={0}
+          max={max}
+          step={0.1}
+          onChange={(e) => onChange(key, Number(e.target.value))}
+        />
+      </Row>
+    );
+  };
+  return (
+    <>
+      {row("fadeIn", "Fade in")}
+      {row("fadeOut", "Fade out")}
+    </>
+  );
+}
+
 function Inspector({
   pane,
   edl,
@@ -3088,10 +3135,13 @@ function Inspector({
     const el = edl.audio?.[sel.ti]?.elements[sel.i];
     if (!el) return null;
     const set = (fn: (e: AudioElement) => void) => update((d) => fn(d.audio![sel.ti].elements[sel.i]));
+    const clipDur = el.duration ?? Math.max(0, (srcDur(el.src) ?? 0) - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
+    const heard = heardFor(el.startTime, clipDur, segments.reduce((n, s) => n + s.dur, 0));
     return (
       <>
         <Zone>Audio</Zone>
         <SliderRow label="Volume" value={el.volume ?? 1} max={2} onChange={(n) => set((x) => (x.volume = n))} />
+        <AudioFades el={el} heard={heard} onChange={(k, n) => set((x) => (x[k] = n > 0 ? n : undefined))} />
         <div className="grid grid-cols-2 gap-2">
           <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
           <NumberRow label="Trim start (s)" value={el.trimStart ?? 0} min={0} onChange={(n) => set((x) => (x.trimStart = Math.max(0, n)))} />
@@ -3625,6 +3675,7 @@ function TimelinePanel({
                     title={a?.name}
                   >
                     {a && <Waveform url={assetUrl(a)} width={Math.round(w)} height={ROW_H - 8} />}
+                    <FadeRamps fadeIn={el.fadeIn} fadeOut={el.fadeOut} heard={heardFor(el.startTime, dur, total)} zoom={zoom} height={ROW_H - 8} />
                     <div onPointerDown={floatDrag("aud", ti, i, "resize")} className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize" />
                   </div>
                 );
@@ -3640,6 +3691,22 @@ function TimelinePanel({
         </div>
       </div>
     </div>
+  );
+}
+
+/** The fade ramps on an audio clip: the part a fade silences is dimmed under a sloped edge. */
+function FadeRamps({ fadeIn, fadeOut, heard, zoom, height }: { fadeIn?: number; fadeOut?: number; heard: number; zoom: number; height: number }) {
+  const fin = Math.min(fadeIn ?? 0, heard) * zoom;
+  const fout = Math.min(fadeOut ?? 0, heard) * zoom;
+  if (fin <= 0 && fout <= 0) return null;
+  const end = heard * zoom;
+  return (
+    <svg className="absolute inset-0 pointer-events-none" width={end} height={height} aria-hidden>
+      {fin > 0 && <polygon points={`0,0 ${fin},0 0,${height}`} className="fill-surface/60" />}
+      {fin > 0 && <line x1={0} y1={height} x2={fin} y2={0} className="stroke-surface" strokeWidth={1} />}
+      {fout > 0 && <polygon points={`${end - fout},0 ${end},0 ${end},${height}`} className="fill-surface/60" />}
+      {fout > 0 && <line x1={end - fout} y1={0} x2={end} y2={height} className="stroke-surface" strokeWidth={1} />}
+    </svg>
   );
 }
 
