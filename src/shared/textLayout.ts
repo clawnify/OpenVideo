@@ -57,6 +57,18 @@ export function blockHeight(
   return (lines - 1) * lineStep(fontSize, boxed) + fontSize * (boxed ? 1.6 : 1.2);
 }
 
+/** Width of a text block in frame pixels: its longest line, plus its box's padding. */
+export function blockWidth(
+  text: string,
+  fontSize: number,
+  frameWidth: number,
+  family: FontFamily = "sans",
+  boxed = false,
+): number {
+  const longest = Math.max(...wrapLines(text, fontSize, frameWidth, family).map((line) => line.length));
+  return longest * fontSize * GLYPH_WIDTH[family] + (boxed ? 0.9 * fontSize : 0);
+}
+
 /** Space kept clear at the frame's bottom edge, as a share of its height. */
 const BOTTOM_MARGIN = 0.03;
 

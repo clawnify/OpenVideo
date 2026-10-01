@@ -129,6 +129,16 @@ canvas width, height keeps aspect. Audio elements: `volume` 0..2, `duration`
 defaults to the source's length minus trims. Output duration (sum of the main
 track) maxes at 5 minutes.
 
+**Format** (the video's shape) is `output.width` x `output.height`: even
+numbers, at most 3840x2160. At the default resolution the presets are 1280x720
+(16:9), 720x1280 (9:16, Reels, TikTok, Shorts), 1280x1280 (1:1), 1024x1280
+(4:5, Instagram feed) and 1280x960 (4:3). To reshape a finished edit, ask for
+it through `/instruct` ("make it vertical"): it applies the editor's own rule,
+which keeps the long side, scales `fontSize` by the change in the short side
+and keeps each logo's size on screen and the side of the frame it sits on.
+Clips keep their `fit`; set `"cover"` on each to fill the new frame instead of
+showing bars.
+
 **Captions** are a project setting, not overlays: an optional `captions` block,
 `{ "enabled": true, "lang": "en", "style": { "size": 0.055, "position":
 "bottom", "margin": 0.08, "background": true, "color": "#ffffff", "maxChars":

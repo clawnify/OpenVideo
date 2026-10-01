@@ -11,6 +11,7 @@
 
 import { MAX_TEXT_CHARS, validateEdl, type Edl, type EdlInvalid } from "./edl";
 import { splitClip } from "../shared/split";
+import { FORMAT_PRESETS, reshape, sizeFor } from "../shared/format";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 const MODEL = "google/gemini-3.7-flash";
@@ -140,22 +141,15 @@ const OPS = [
     },
   },
   {
-    name: "set_aspect",
-    description:
-      "Change the shape of the finished video: 'landscape' (16:9), 'vertical' (9:16) or 'square'.",
+    name: "set_format",
+    description: `Change the shape of the finished video. ${FORMAT_PRESETS.map((p) => `${p.ratio} is ${p.name.toLowerCase()} (${p.hint})`).join("; ")}.`,
     parameters: {
       type: "object",
-      properties: { shape: { type: "string", enum: ["landscape", "vertical", "square"] } },
-      required: ["shape"],
+      properties: { format: { type: "string", enum: FORMAT_PRESETS.map((p) => p.ratio) } },
+      required: ["format"],
     },
   },
 ] as const;
-
-const SHAPES: Record<string, { width: number; height: number }> = {
-  landscape: { width: 1280, height: 720 },
-  vertical: { width: 720, height: 1280 },
-  square: { width: 1080, height: 1080 },
-};
 
 const rid = () => Math.random().toString(36).slice(2, 10);
 
@@ -236,12 +230,13 @@ export function apply(draft: Edl, name: string, args: Record<string, unknown>): 
       track.elements.splice(index, 1);
       return { said: "Removed a text element" };
     }
-    case "set_aspect": {
-      const shape = SHAPES[String(args.shape)];
-      if (!shape) return { error: "shape must be landscape, vertical or square" };
-      draft.output.width = shape.width;
-      draft.output.height = shape.height;
-      return { said: `Set the video to ${args.shape}` };
+    case "set_format": {
+      // The same sizing and the same rescaling as the editor's Format picker.
+      const preset = FORMAT_PRESETS.find((p) => p.ratio === args.format);
+      if (!preset) return { error: `format must be one of ${FORMAT_PRESETS.map((p) => p.ratio).join(", ")}` };
+      const size = sizeFor(preset.ratio, Math.max(draft.output.width, draft.output.height))!;
+      Object.assign(draft, reshape(draft, size.width, size.height));
+      return { said: `Set the video to ${preset.ratio} ${preset.name.toLowerCase()}` };
     }
     default:
       return { error: `no such operation "${name}"` };
