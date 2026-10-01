@@ -178,3 +178,36 @@ function reshapeMedia<T extends ReshapeMedia>(el: T, before: Frame, after: Frame
   const inside = el.x + el.width <= 1.001;
   return { ...el, width: w, x: clamp(round3(x), 0, inside ? inward(1 - w, "down") : 1) };
 }
+
+// ── reframing a filled clip ─────────────────────────────────────────────────
+
+/** Which part of a filled frame is kept, as CSS object-position: 0 keeps the left (top) edge, 1 the right (bottom). */
+export interface Anchor {
+  x: number;
+  y: number;
+}
+
+export const CENTRE: Anchor = { x: 0.5, y: 0.5 };
+
+/**
+ * How far a clip filling the frame overflows it, as a share of the frame on
+ * each axis. One of the two is always 0: a clip fills by its short side and
+ * spills over on the other.
+ */
+export function coverOverflow(src: { width: number; height: number }, frame: { width: number; height: number }): Anchor {
+  const scale = Math.max(frame.width / src.width, frame.height / src.height);
+  return {
+    x: Math.max(0, (src.width * scale - frame.width) / frame.width),
+    y: Math.max(0, (src.height * scale - frame.height) / frame.height),
+  };
+}
+
+/**
+ * The anchor after dragging a filled clip by `dx`, `dy` (shares of the
+ * frame). Dragging right brings more of the clip's left side into view, so
+ * the anchor moves the other way. An axis with nothing to show stays put.
+ */
+export function dragAnchor(from: Anchor, dx: number, dy: number, overflow: Anchor): Anchor {
+  const axis = (a: number, d: number, o: number) => (o > 0.0001 ? clamp(round3(a - d / o), 0, 1) : a);
+  return { x: axis(from.x, dx, overflow.x), y: axis(from.y, dy, overflow.y) };
+}
