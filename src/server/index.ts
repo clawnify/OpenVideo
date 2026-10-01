@@ -10,7 +10,16 @@ import {
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
-import { deleteMedia, frameUrl, importMedia, mediaPlayback, mediaState, mediaTranscript, prepareMedia } from "./media";
+import {
+  deleteMedia,
+  frameUrl,
+  importMedia,
+  mediaPlayback,
+  mediaState,
+  mediaTranscript,
+  openMediaUpload,
+  prepareMedia,
+} from "./media";
 import {
   DRIVE_FILE_ID,
   SHARED_WITH_ME,
@@ -93,6 +102,80 @@ app.post("/api/assets", async (c) => {
   );
   const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
   return c.json(row, 201);
+});
+
+// ── Video uploads, straight to the media service ──────────────────
+// A video is not posted to this app: the browser sends it to the media
+// service itself, resumably, so a clip of any size uploads and gets the same
+// playback, frames and transcript as one imported from Drive. Three steps:
+// open an upload, send the bytes (browser to service), then register the
+// asset. Nothing is written here until the bytes have arrived, so an upload
+// abandoned halfway leaves no row behind.
+
+const MEDIA_UID = /^[0-9a-f]{32}$/;
+
+app.post("/api/assets/uploads", async (c) => {
+  const b = await c.req
+    .json<{ name?: string; size?: number; duration?: number }>()
+    .catch(() => ({}) as { name?: string; size?: number; duration?: number });
+  if (!b.name || !b.size || !Number.isInteger(b.size) || b.size <= 0) {
+    return c.json({ error: "invalid_request", detail: "name and size are required" }, 400);
+  }
+  // An open upload holds its maximum length of the org's footage allowance
+  // until it completes. The browser read the real length from the file, so
+  // reserve that, with room for a probe that is a little short.
+  const maxDuration =
+    typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0
+      ? Math.ceil(b.duration * 1.1 + 30)
+      : undefined;
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const opened = await openMediaUpload(cfg, b.size, b.name, maxDuration);
+  // media_unavailable (local dev) tells the browser to post the file here instead.
+  if ("failure" in opened) return c.json(opened.failure, opened.failure.error === "media_unavailable" ? 503 : 422);
+  return c.json({ uid: opened.id, upload_url: opened.uploadUrl }, 201);
+});
+
+app.post("/api/assets/media", async (c) => {
+  const b = await c.req
+    .json<{ uid?: string; name?: string; type?: string; size?: number; duration?: number }>()
+    .catch(() => ({}) as { uid?: string; name?: string; type?: string; size?: number; duration?: number });
+  if (!b.uid || !MEDIA_UID.test(b.uid) || !b.name) {
+    return c.json({ error: "invalid_request", detail: "uid and name are required" }, 400);
+  }
+  // Registering twice (a retried request) returns the first row.
+  const existing = await get<Asset>("SELECT * FROM assets WHERE media_uid = ?", [b.uid]);
+  if (existing) return c.json(existing, 200);
+  // The service answers only for this org's own videos, so this is also the
+  // check that the id is ours to register.
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const state = await mediaState(cfg, b.uid);
+  if ("failure" in state) return c.json(state.failure, 404);
+  const duration =
+    typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0 ? b.duration : state.media.duration;
+  const size = typeof b.size === "number" && Number.isInteger(b.size) && b.size > 0 ? b.size : 0;
+  const res = await run(
+    "INSERT INTO assets (key, name, content_type, size, duration, media_uid) VALUES (?, ?, ?, ?, ?, ?)",
+    [`media/${b.uid}`, b.name.slice(0, 200), b.type?.startsWith("video/") ? b.type : "video/mp4", size, duration ?? null, b.uid],
+  );
+  const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
+  return c.json(row, 201);
+});
+
+// A cancelled upload: drop it on the service, so its reservation stops
+// counting against the org. Only one still waiting for its bytes: finished
+// footage goes through DELETE /api/assets/:id, which checks the projects
+// first, and footage another app in the org keeps is not this app's to drop.
+app.delete("/api/assets/uploads/:uid", async (c) => {
+  const uid = c.req.param("uid");
+  if (!MEDIA_UID.test(uid)) return c.json({ error: "Not found" }, 404);
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const state = await mediaState(cfg, uid);
+  if ("failure" in state) return c.json({ ok: true });
+  if (state.media.state !== "pendingupload" || (await get<Asset>("SELECT id FROM assets WHERE media_uid = ?", [uid]))) {
+    return c.json({ error: "upload_finished", detail: "that upload has finished, so it is not cancelled" }, 409);
+  }
+  await deleteMedia(cfg, uid);
+  return c.json({ ok: true });
 });
 
 // ── Google Drive (a source for the media library) ──────────────────
