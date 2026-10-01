@@ -2694,15 +2694,26 @@ function FormatPicker({
     update((d) => Object.assign(d, reshape(d, size.width, size.height)));
   };
 
+  // The current shape, as the one entry it matches: a preset first, then a clip's own shape.
+  const chosenPreset = FORMAT_PRESETS.find((p) => {
+    const r = parseRatio(p.ratio)!;
+    return sameShape({ width: r.w, height: r.h }, frame);
+  });
+  const chosenOriginal = originals.find((o) => sameShape(o.shape, frame));
+  const chosenKey = chosenPreset
+    ? `preset ${chosenPreset.ratio}`
+    : chosenOriginal
+      ? `original ${chosenOriginal.clip.id}`
+      : undefined;
+
   const item = (value: string, shape: Shape, name: string, detail: string) => (
-    <CommandItem key={value} value={value} onSelect={() => choose(shape)}>
+    <CommandItem key={value} value={value} chosen={value === chosenKey} onSelect={() => choose(shape)}>
       <ShapeGlyph {...shape} />
       <span className="flex-1 min-w-0">
         <span className="block truncate">{name}</span>
         <span className="block truncate text-fine text-faint">{detail}</span>
       </span>
       <span className="text-fine text-muted tabular-nums">{ratioLabel(shape.width, shape.height)}</span>
-      <Check className={`w-4 h-4 shrink-0 ${sameShape(shape, frame) ? "" : "invisible"}`} />
     </CommandItem>
   );
 
@@ -2710,14 +2721,14 @@ function FormatPicker({
     <Row label="Format">
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
-          <SelectTrigger className="w-full">
+          <SelectTrigger kind="field">
             <ShapeGlyph {...frame} />
             <span className="flex-1 truncate">{preset ? preset.name : "Custom"}</span>
             <span className="text-fine text-muted tabular-nums">{ratioLabel(frame.width, frame.height)}</span>
           </SelectTrigger>
         </PopoverTrigger>
         <PopoverContent>
-          <Command label="Format">
+          <Command label="Format" chosen={chosenKey}>
             <CommandGroup heading="Presets">
               {FORMAT_PRESETS.map((p) => {
                 const r = parseRatio(p.ratio)!;
@@ -2757,18 +2768,19 @@ function FontPicker({
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <SelectTrigger className="w-full">
+        <SelectTrigger kind="field">
           <span className="flex-1 truncate" style={{ fontFamily: current.css }}>
             {current.name}
           </span>
         </SelectTrigger>
       </PopoverTrigger>
       <PopoverContent>
-        <Command label="Font">
+        <Command label="Font" chosen={current.value}>
           {FONTS.map((f) => (
             <CommandItem
               key={f.value}
               value={f.value}
+              chosen={f.value === value}
               onSelect={() => {
                 onChange(f.value);
                 setOpen(false);
@@ -2777,7 +2789,6 @@ function FontPicker({
               <span className="flex-1" style={{ fontFamily: f.css }}>
                 {f.name}
               </span>
-              <Check className={`w-4 h-4 shrink-0 ${f.value === value ? "" : "invisible"}`} />
             </CommandItem>
           ))}
         </Command>
@@ -3251,16 +3262,17 @@ function QualityPicker({ value, onChange }: { value: string; onChange: (q: strin
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <SelectTrigger className="hidden sm:flex h-7 w-auto" aria-label="Export quality">
+        <SelectTrigger kind="view" className="max-sm:hidden" aria-label="Export quality">
           {current.name}
         </SelectTrigger>
       </PopoverTrigger>
       <PopoverContent>
-        <Command label="Export quality">
+        <Command label="Export quality" chosen={current.value}>
           {QUALITIES.map((q) => (
             <CommandItem
               key={q.value}
               value={q.value}
+              chosen={q.value === value}
               onSelect={() => {
                 onChange(q.value);
                 setOpen(false);
@@ -3270,7 +3282,6 @@ function QualityPicker({ value, onChange }: { value: string; onChange: (q: strin
                 <span className="block">{q.name}</span>
                 <span className="block text-fine text-faint">{q.hint}</span>
               </span>
-              <Check className={`w-4 h-4 shrink-0 ${q.value === value ? "" : "invisible"}`} />
             </CommandItem>
           ))}
         </Command>

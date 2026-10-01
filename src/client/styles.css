@@ -208,27 +208,6 @@
     0 4px 12px -2px rgb(24 41 75 / 0.16);
 }
 
-/* The face of a dropdown (from Supabase's dashboard pickers): no border. The
-   edge is inset shadows (a hairline ring, a faint top line, a heavier bottom
-   line) over a very soft drop, so the control sits slightly raised. It goes
-   through the shadow utility, so a focus ring still draws on top of it. Grey
-   on hover and while its list is open. */
-@utility raised-surface {
-  --raised-shadow:
-    0 1px 3px 0 rgb(0 0 0 / 0.04), inset 0 1px 0 0 rgb(0 0 0 / 0.025), inset 0 -1px 0 0 rgb(0 0 0 / 0.035),
-    inset 0 0 0 1px rgb(0 0 0 / 0.095);
-  @apply bg-surface text-foreground shadow-[var(--raised-shadow)];
-  &:hover,
-  &[data-state="open"] {
-    @apply bg-surface-sunken;
-  }
-  @media (prefers-color-scheme: dark) {
-    --raised-shadow:
-      0 1px 3px 0 rgb(0 0 0 / 0.2), inset 0 1px 0 0 rgb(255 255 255 / 0.04), inset 0 -1px 0 0 rgb(0 0 0 / 0.06),
-      inset 0 0 0 1px rgb(255 255 255 / 0.1);
-  }
-}
-
 /* In dark mode the drops disappear and the ring is the whole treatment; the
    background → surface → surface-sunken ladder carries the rest. */
 @media (prefers-color-scheme: dark) {
