@@ -2328,6 +2328,20 @@ function Player({
     if (a) cropped.push(a);
   }
   const shapes = useShapes(cropped);
+  // The decoded frame's own size wins once the element has it: it is the
+  // upright picture the export crops, whatever the media service reports.
+  const [decoded, setDecoded] = useState(new Map<string, Shape>());
+  const noteSize = (id: string) => (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => {
+    const m = e.currentTarget;
+    const width = m instanceof HTMLVideoElement ? m.videoWidth : m.naturalWidth;
+    const height = m instanceof HTMLVideoElement ? m.videoHeight : m.naturalHeight;
+    if (!width || !height) return;
+    setDecoded((cur) => {
+      const was = cur.get(id);
+      return was && was.width === width && was.height === height ? cur : new Map(cur).set(id, { width, height });
+    });
+  };
+  const shapeFor = (a: Asset) => decoded.get(a.id) ?? shapes.get(a.id);
 
   // The playing video's position on the timeline, for the master clock.
   const activeRef = useRef(active);
@@ -2483,7 +2497,7 @@ function Player({
             const visible = seg === active && seg.dur > 0;
             const fit = seg.el.fit ?? "contain";
             const at = fit === "cover" ? (seg.el.anchor ?? CENTRE) : CENTRE;
-            const shape = seg.el.crop ? shapes.get(a.id) : undefined;
+            const shape = seg.el.crop ? shapeFor(a) : undefined;
             // A cropped clip: the box is the kept part, placed as the export
             // places it, and the whole source is drawn inside it and clipped.
             const place = shape ? placeClip(shape, seg.el.crop, edl.output, fit, seg.el.anchor) : undefined;
@@ -2494,6 +2508,8 @@ function Player({
                 : // object-position is the export's crop offset, so both frame it alike.
                   { objectFit: fit, objectPosition: `${at.x * 100}% ${at.y * 100}%` }) as React.CSSProperties,
               "data-clip": seg.el.id,
+              onLoadedMetadata: noteSize(a.id),
+              onLoad: noteSize(a.id),
             };
             // The same wrapper either way, so cropping never reloads the video.
             return (
@@ -2569,7 +2585,7 @@ function Player({
                   const m = el as OverlayMedia;
                   const a = resolveAsset(m.src);
                   if (!a) return null;
-                  const shape = m.crop ? shapes.get(a.id) : undefined;
+                  const shape = m.crop ? shapeFor(a) : undefined;
                   if (shape && m.crop) {
                     const kept = croppedShape(shape, m.crop);
                     const { source } = placeClip(shape, m.crop, kept, "contain");
@@ -2602,9 +2618,9 @@ function Player({
                       style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: m.opacity ?? 1 }}
                     >
                       {m.type === "image" ? (
-                        <img src={assetUrl(a)} className="w-full h-auto pointer-events-none" />
+                        <img src={assetUrl(a)} onLoad={noteSize(a.id)} className="w-full h-auto pointer-events-none" />
                       ) : (
-                        <video src={assetUrl(a)} muted className="w-full h-auto pointer-events-none" />
+                        <video src={assetUrl(a)} onLoadedMetadata={noteSize(a.id)} muted className="w-full h-auto pointer-events-none" />
                       )}
                     </div>
                   );
@@ -3068,7 +3084,16 @@ function CropDialog({
   onClose: () => void;
   onApply: (crop: Crop | undefined) => void;
 }) {
-  const shape = useShapes([asset]).get(asset.id);
+  // As in the preview: the decoded frame's size, once the element has it.
+  const [decoded, setDecoded] = useState<Shape | null>(null);
+  const reported = useShapes([asset]).get(asset.id);
+  const shape = decoded ?? reported;
+  const noteSize = (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => {
+    const m = e.currentTarget;
+    const width = m instanceof HTMLVideoElement ? m.videoWidth : m.naturalWidth;
+    const height = m instanceof HTMLVideoElement ? m.videoHeight : m.naturalHeight;
+    if (width && height && (decoded?.width !== width || decoded?.height !== height)) setDecoded({ width, height });
+  };
   const [crop, setCrop] = useState<Crop>(initial ?? FULL);
   const [ratioKey, setRatioKey] = useState<CropRatio>("free");
   const [t, setT] = useState(span ? Math.min(span.to, Math.max(span.from, startAt)) : 0);
@@ -3191,7 +3216,10 @@ function CropDialog({
                   <MediaVideo
                     asset={asset}
                     elementRef={(v) => (videoRef.current = v)}
-                    onLoadedMetadata={(e) => (e.currentTarget.currentTime = t)}
+                    onLoadedMetadata={(e) => {
+                      e.currentTarget.currentTime = t;
+                      noteSize(e);
+                    }}
                     muted
                     playsInline
                     preload="auto"
@@ -3201,7 +3229,10 @@ function CropDialog({
                   <video
                     ref={videoRef}
                     src={assetUrl(asset)}
-                    onLoadedMetadata={(e) => (e.currentTarget.currentTime = t)}
+                    onLoadedMetadata={(e) => {
+                      e.currentTarget.currentTime = t;
+                      noteSize(e);
+                    }}
                     muted
                     playsInline
                     preload="auto"
@@ -3209,7 +3240,7 @@ function CropDialog({
                   />
                 )
               ) : (
-                <img src={assetUrl(asset)} alt="" {...media} />
+                <img src={assetUrl(asset)} alt="" onLoad={noteSize} {...media} />
               )}
               <div
                 className="absolute pointer-events-none"
