@@ -10,6 +10,7 @@ import { useEffect, useRef } from "react";
 import * as RadixContextMenu from "@radix-ui/react-context-menu";
 import * as RadixPopover from "@radix-ui/react-popover";
 import { Command as CommandPrimitive } from "cmdk";
+import { ChevronDown } from "lucide-react";
 
 const btnBase =
   "inline-flex items-center gap-1.5 h-7 rounded-sm text-button whitespace-nowrap " +
@@ -215,6 +216,28 @@ export function ContextMenuItem({
  */
 export const Popover = RadixPopover.Root;
 export const PopoverTrigger = RadixPopover.Trigger;
+
+/**
+ * The face of every dropdown: raised off the page rather than outlined, with
+ * the chevron at its end. Wrap it in a PopoverTrigger with asChild; Radix sets
+ * data-state="open" on it while the list shows.
+ */
+export function SelectTrigger({
+  className = "",
+  children,
+  ...rest
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & { ref?: React.Ref<HTMLButtonElement> }) {
+  return (
+    <button
+      type="button"
+      className={`raised-surface flex items-center gap-2 h-8 px-3 rounded-sm text-body text-left cursor-pointer outline-none transition-[color,background-color,box-shadow] focus-visible:ring-[3px] focus-visible:ring-accent-tint ${className}`}
+      {...rest}
+    >
+      {children}
+      <ChevronDown className="w-4 h-4 shrink-0 text-muted" strokeWidth={1.5} />
+    </button>
+  );
+}
 
 export function PopoverContent({ children }: { children: React.ReactNode }) {
   return (

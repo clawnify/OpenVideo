@@ -44,7 +44,6 @@ import {
   AlignStartHorizontal,
   AlignStartVertical,
   Check,
-  ChevronDown,
   ChevronRight,
   Cloud,
   Film,
@@ -83,6 +82,7 @@ import {
   Popover,
   PopoverContent,
   PopoverTrigger,
+  SelectTrigger,
   btnDanger,
   btnGhost,
   btnIcon,
@@ -2710,12 +2710,11 @@ function FormatPicker({
     <Row label="Format">
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
-          <button className={`${inputCls} flex items-center gap-2 text-left`}>
+          <SelectTrigger className="w-full">
             <ShapeGlyph {...frame} />
             <span className="flex-1 truncate">{preset ? preset.name : "Custom"}</span>
             <span className="text-fine text-muted tabular-nums">{ratioLabel(frame.width, frame.height)}</span>
-            <ChevronDown className="w-4 h-4 shrink-0 text-faint" />
-          </button>
+          </SelectTrigger>
         </PopoverTrigger>
         <PopoverContent>
           <Command label="Format">
@@ -2736,6 +2735,54 @@ function FormatPicker({
         </PopoverContent>
       </Popover>
     </Row>
+  );
+}
+
+const FONTS: { value: NonNullable<OverlayText["fontFamily"]>; name: string; css: string }[] = [
+  { value: "sans", name: "Sans", css: "Inter, sans-serif" },
+  { value: "serif", name: "Serif", css: "serif" },
+  { value: "mono", name: "Mono", css: "monospace" },
+];
+
+/** A title's typeface, each choice written in its own face. */
+function FontPicker({
+  value,
+  onChange,
+}: {
+  value: NonNullable<OverlayText["fontFamily"]>;
+  onChange: (f: NonNullable<OverlayText["fontFamily"]>) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const current = FONTS.find((f) => f.value === value) ?? FONTS[0];
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <SelectTrigger className="w-full">
+          <span className="flex-1 truncate" style={{ fontFamily: current.css }}>
+            {current.name}
+          </span>
+        </SelectTrigger>
+      </PopoverTrigger>
+      <PopoverContent>
+        <Command label="Font">
+          {FONTS.map((f) => (
+            <CommandItem
+              key={f.value}
+              value={f.value}
+              onSelect={() => {
+                onChange(f.value);
+                setOpen(false);
+              }}
+            >
+              <span className="flex-1" style={{ fontFamily: f.css }}>
+                {f.name}
+              </span>
+              <Check className={`w-4 h-4 shrink-0 ${f.value === value ? "" : "invisible"}`} />
+            </CommandItem>
+          ))}
+        </Command>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -3058,11 +3105,7 @@ function Inspector({
               </Row>
               <NumberRow label="Font size (px)" value={el.fontSize} step={1} min={8} max={400} onChange={(n) => set((x) => ((x as OverlayText).fontSize = Math.round(n)))} />
               <Row label="Font">
-                <select className={inputCls} value={el.fontFamily ?? "sans"} onChange={(e) => set((x) => ((x as OverlayText).fontFamily = e.target.value as OverlayText["fontFamily"]))}>
-                  <option value="sans">Sans</option>
-                  <option value="serif">Serif</option>
-                  <option value="mono">Mono</option>
-                </select>
+                <FontPicker value={el.fontFamily ?? "sans"} onChange={(f) => set((x) => ((x as OverlayText).fontFamily = f))} />
               </Row>
               <div className="grid grid-cols-2 gap-2">
                 <Row label="Color">
@@ -3195,6 +3238,47 @@ function PositionRow({
 
 // ── export controls ─────────────────────────────────────────────────────────
 
+/** The export presets, as the edit service encodes them (crf 30 / 23 / 18). */
+const QUALITIES = [
+  { value: "draft", name: "Draft", hint: "Fastest, to check the cut" },
+  { value: "standard", name: "Standard", hint: "For sharing" },
+  { value: "high", name: "High", hint: "Best quality, slowest" },
+] as const;
+
+function QualityPicker({ value, onChange }: { value: string; onChange: (q: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const current = QUALITIES.find((q) => q.value === value) ?? QUALITIES[1];
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <SelectTrigger className="hidden sm:flex h-7 w-auto" aria-label="Export quality">
+          {current.name}
+        </SelectTrigger>
+      </PopoverTrigger>
+      <PopoverContent>
+        <Command label="Export quality">
+          {QUALITIES.map((q) => (
+            <CommandItem
+              key={q.value}
+              value={q.value}
+              onSelect={() => {
+                onChange(q.value);
+                setOpen(false);
+              }}
+            >
+              <span className="flex-1 min-w-0">
+                <span className="block">{q.name}</span>
+                <span className="block text-fine text-faint">{q.hint}</span>
+              </span>
+              <Check className={`w-4 h-4 shrink-0 ${q.value === value ? "" : "invisible"}`} />
+            </CommandItem>
+          ))}
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 function ExportControls({ projectId, disabled }: { projectId: string; disabled: boolean }) {
   const [quality, setQuality] = useState("standard");
   const [busy, setBusy] = useState(false);
@@ -3237,16 +3321,7 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
           {last.error}
         </span>
       )}
-      <select
-        value={quality}
-        onChange={(e) => setQuality(e.target.value)}
-        aria-label="Export quality"
-        className="field w-auto hidden sm:block"
-      >
-        <option value="draft">Draft</option>
-        <option value="standard">Standard</option>
-        <option value="high">High</option>
-      </select>
+      <QualityPicker value={quality} onChange={setQuality} />
       <button onClick={run} disabled={busy || disabled} className={btnPrimary}>
         {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Film className="w-4 h-4" />} Export
       </button>
