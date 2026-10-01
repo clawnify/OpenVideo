@@ -128,13 +128,14 @@ the left edge, `x: 1` the right, and only the side that spills over moves;
 shares of its width and height (`{ "x": 0.5, "y": 0, "width": 0.5, "height": 1 }`
 is the right half). The crop is cut out first, then fitted or filled like
 footage shot at that size, so a crop of the output's own shape on a `"cover"`
-clip shows exactly the crop. Leave `crop` out to keep the whole frame;
+clip shows exactly the crop. Media overlays take `crop` too (a face cut out
+of a screen recording for a picture-in-picture), and their height follows
+what is kept. Leave `crop` out to keep the whole frame;
 `sourceAudio: false` mutes a clip's own sound; images need an
 explicit `duration`. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
 `background` (`#RRGGBBAA` works). Media overlays: `width` as a fraction of
-canvas width, height keeps the aspect of what is shown; they take `crop` too
-(a face cut out of a screen recording for a picture-in-picture). Audio elements: `volume` 0..2, `duration`
+canvas width, height keeps aspect. Audio elements: `volume` 0..2, `duration`
 defaults to the source's length minus trims. Output duration (sum of the main
 track) maxes at 5 minutes.
 
