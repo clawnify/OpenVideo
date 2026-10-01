@@ -2578,7 +2578,7 @@ function ShapeGlyph({ width, height }: Shape) {
   return (
     <span className="grid place-items-center w-4 h-4 shrink-0" aria-hidden>
       <span
-        className="rounded-xs border-[1.5px] border-current"
+        className="rounded-[2px] border-[1.5px] border-current"
         style={{ aspectRatio: `${width} / ${height}`, [width >= height ? "width" : "height"]: "100%" }}
       />
     </span>
