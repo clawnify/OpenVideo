@@ -714,59 +714,83 @@ app.post("/api/projects/:id/export", async (c) => {
 });
 
 // ── Share by link ────────────────────────────────────────────────────
-// One link per project. It plays the project's latest finished export, so a
-// re-export updates what viewers see; turning it off deletes the token, and
-// turning it on again gives a new address.
+// One link per project, pinned to one finished export. Exporting again does
+// not change what viewers see (drafts are exports too); moving the pin to the
+// newest export is a deliberate step. Turning the link off deletes the token,
+// and turning it on again gives a new address.
 
 interface ShareLink {
   token: string;
   project_id: string;
+  export_id: number;
   created_at: string;
 }
 
-function shareOut(c: { req: { url: string } }, link: ShareLink | undefined) {
-  return link
-    ? { url: new URL(`/s/${link.token}`, c.req.url).toString(), created_at: link.created_at }
-    : { url: null };
+/** The project's newest finished export, which a link is pinned to on create or update. */
+async function latestExport(projectId: string) {
+  return get<Pick<ExportJob, "id" | "output_url" | "updated_at">>(
+    "SELECT id, output_url, updated_at FROM export_jobs WHERE project_id = ? AND status = 'completed' ORDER BY id DESC LIMIT 1",
+    [projectId],
+  );
 }
 
-app.get("/api/projects/:id/share", async (c) => {
-  const link = await get<ShareLink>("SELECT * FROM share_links WHERE project_id = ?", [c.req.param("id")]);
-  return c.json(shareOut(c, link));
-});
+async function shareOut(c: { req: { url: string } }, projectId: string) {
+  const link = await get<ShareLink & { exported_at: string }>(
+    `SELECT s.*, e.updated_at AS exported_at FROM share_links s JOIN export_jobs e ON e.id = s.export_id
+      WHERE s.project_id = ?`,
+    [projectId],
+  );
+  const latest = await latestExport(projectId);
+  if (!link) return { url: null, can_share: Boolean(latest) };
+  return {
+    url: new URL(`/s/${link.token}`, c.req.url).toString(),
+    export_id: link.export_id,
+    exported_at: link.exported_at,
+    // A finished export newer than the one viewers see.
+    newer_export: latest && latest.id !== link.export_id ? latest.id : null,
+    created_at: link.created_at,
+  };
+}
 
+app.get("/api/projects/:id/share", async (c) => c.json(await shareOut(c, c.req.param("id"))));
+
+// Turns the link on, or moves it to the newest export. The token is kept, so
+// the address already sent out keeps working.
 app.put("/api/projects/:id/share", async (c) => {
   const id = c.req.param("id");
   const project = await get<{ id: string }>("SELECT id FROM edit_projects WHERE id = ?", [id]);
   if (!project) return c.json({ error: "Project not found" }, 404);
-  // Idempotent: an existing link is kept, so a second click never breaks one
-  // already sent out.
-  await run("INSERT OR IGNORE INTO share_links (token, project_id) VALUES (?, ?)", [makeShareToken(), id]);
-  const link = await get<ShareLink>("SELECT * FROM share_links WHERE project_id = ?", [id]);
-  return c.json(shareOut(c, link));
+  const latest = await latestExport(id);
+  if (!latest) {
+    return c.json({ error: "nothing_exported", detail: "export the project first; a link plays a finished export" }, 409);
+  }
+  await run(
+    `INSERT INTO share_links (token, project_id, export_id) VALUES (?, ?, ?)
+       ON CONFLICT(project_id) DO UPDATE SET export_id = excluded.export_id`,
+    [makeShareToken(), id, latest.id],
+  );
+  return c.json(await shareOut(c, id));
 });
 
 app.delete("/api/projects/:id/share", async (c) => {
   await run("DELETE FROM share_links WHERE project_id = ?", [c.req.param("id")]);
-  return c.json({ url: null });
+  return c.json({ url: null, can_share: true });
 });
 
 // The public half: the only routes reachable without signing in (clawnify.json
 // `api.public_routes`). A token that matches no row is indistinguishable from
 // one that never existed.
 
-/** The link's project and its latest finished export, if the link is live. */
+/** The link's project and the export it is pinned to, if the link is live. */
 async function sharedExport(token: string) {
-  const link = await get<{ name: string; project_id: string }>(
-    `SELECT p.name, s.project_id FROM share_links s JOIN edit_projects p ON p.id = s.project_id WHERE s.token = ?`,
+  return get<{ name: string; export_id: number; output_url: string | null }>(
+    `SELECT p.name, s.export_id, e.output_url
+       FROM share_links s
+       JOIN edit_projects p ON p.id = s.project_id
+       JOIN export_jobs e ON e.id = s.export_id AND e.status = 'completed'
+      WHERE s.token = ?`,
     [token],
   );
-  if (!link) return null;
-  const job = await get<Pick<ExportJob, "id" | "output_url">>(
-    "SELECT id, output_url FROM export_jobs WHERE project_id = ? AND status = 'completed' ORDER BY id DESC LIMIT 1",
-    [link.project_id],
-  );
-  return { name: link.name, job: job ?? null };
 }
 
 const PUBLIC_HEADERS = { "X-Robots-Tag": "noindex", "Referrer-Policy": "no-referrer" };
@@ -778,20 +802,17 @@ app.get("/s/:token", async (c) => {
   if (!shared) {
     return c.html(notePage("This link doesn't work", "It may have been turned off. Ask whoever sent it for a new one."), 404);
   }
-  if (!shared.job) {
-    return c.html(notePage(shared.name, "This video isn't ready yet. Try again once it has been exported."));
-  }
-  return c.html(sharePage(shared.name, `/s/${encodeURIComponent(c.req.param("token"))}/video?v=${shared.job.id}`));
+  return c.html(sharePage(shared.name, `/s/${encodeURIComponent(c.req.param("token"))}/video?v=${shared.export_id}`));
 });
 
-// `v` names the export the page was rendered with. Only the latest one is
-// served: a stale `v` (re-exported meanwhile) gets a 404 rather than another
-// file's bytes mid-playback, and older cuts are never reachable by guessing ids.
+// `v` names the export the page was rendered with. Only the pinned one is
+// served: a stale `v` (the pin moved meanwhile) gets a 404 rather than another
+// file's bytes mid-playback, and other cuts are never reachable by guessing ids.
 app.get("/s/:token/video", async (c) => {
   const shared = await sharedExport(c.req.param("token"));
-  const key = exportKey(shared?.job?.output_url ?? null);
+  const key = exportKey(shared?.output_url ?? null);
   const v = c.req.query("v");
-  if (!shared?.job || !key || (v !== undefined && v !== String(shared.job.id))) {
+  if (!shared || !key || (v !== undefined && v !== String(shared.export_id))) {
     return c.text("Not found", 404, PUBLIC_HEADERS);
   }
   const download = c.req.query("download") !== undefined;

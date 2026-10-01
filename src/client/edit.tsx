@@ -3197,14 +3197,32 @@ function PositionRow({
 
 // ── share by link ───────────────────────────────────────────────────────────
 
+interface ShareState {
+  url: string | null;
+  /** Off only: whether there is a finished export to share. */
+  can_share?: boolean;
+  /** On only: when the export viewers see finished, and a newer one if any. */
+  exported_at?: string;
+  newer_export?: number | null;
+}
+
+/** "Oct 1, 14:02" from SQLite's space-separated UTC datetime. */
+function fmtWhen(s: string): string {
+  const d = new Date(s.replace(" ", "T") + "Z");
+  return isNaN(d.getTime())
+    ? ""
+    : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
 /**
- * One public link per project, playing its latest finished export. The link
- * is read when the popover opens, so it reflects an export made since.
+ * One public link per project, pinned to one finished export so a later
+ * draft never reaches viewers by accident. The state is read when the popover
+ * opens, so it reflects an export made since.
  */
 function ShareControl({ projectId }: { projectId: string }) {
   const [open, setOpen] = useState(false);
-  const [url, setUrl] = useState<string | null>(null);
-  const [exported, setExported] = useState(true);
+  // null while loading, so no action shows before the real state is known.
+  const [share, setShare] = useState<ShareState | null>(null);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const [confirmOff, setConfirmOff] = useState(false);
@@ -3212,22 +3230,18 @@ function ShareControl({ projectId }: { projectId: string }) {
 
   useEffect(() => {
     if (!open) return;
+    setShare(null);
     setError("");
     setCopied(false);
     setConfirmOff(false);
-    api.get<{ url: string | null }>(`/api/projects/${projectId}/share`).then((s) => setUrl(s.url)).catch(() => {});
-    api
-      .get<ExportJob[]>(`/api/exports?project_id=${projectId}`)
-      .then((j) => setExported(j.some((x) => x.status === "completed")))
-      .catch(() => {});
+    api.get<ShareState>(`/api/projects/${projectId}/share`).then(setShare).catch(() => {});
   }, [open, projectId]);
 
   const change = async (method: "PUT" | "DELETE") => {
     setBusy(true);
     setError("");
     try {
-      const s = await api.send<{ url: string | null }>(method, `/api/projects/${projectId}/share`);
-      setUrl(s.url);
+      setShare(await api.send<ShareState>(method, `/api/projects/${projectId}/share`));
       setCopied(false);
       setConfirmOff(false);
     } catch (e) {
@@ -3237,6 +3251,7 @@ function ShareControl({ projectId }: { projectId: string }) {
     }
   };
 
+  const url = share?.url ?? null;
   const copy = async () => {
     if (!url) return;
     try {
@@ -3259,11 +3274,10 @@ function ShareControl({ projectId }: { projectId: string }) {
           <div className="flex flex-col gap-1">
             <span className="text-body-sm font-medium">Share by link</span>
             <span className="text-fine text-muted">
-              Anyone with the link can watch and download your latest export, without signing in. Exporting
-              again updates what they see.
+              Anyone with the link can watch and download this video, without signing in.
             </span>
           </div>
-          {url ? (
+          {!share ? null : url ? (
             <>
               <div className="flex gap-2">
                 <input
@@ -3278,11 +3292,15 @@ function ShareControl({ projectId }: { projectId: string }) {
                   {copied ? <Check className="w-4 h-4" /> : <Link2 className="w-4 h-4" />} {copied ? "Copied" : "Copy"}
                 </button>
               </div>
-              {!exported && (
-                <span className="text-fine text-muted">
-                  Nothing is exported yet, so the link says the video isn't ready.
-                </span>
-              )}
+              <span className="text-fine text-muted">
+                Plays the export from {fmtWhen(share.exported_at ?? "")}.
+                {share.newer_export ? " You have exported since; viewers still see this one." : ""}
+              </span>
+              {share.newer_export ? (
+                <button onClick={() => change("PUT")} disabled={busy} className={`${btnSecondary} self-start`}>
+                  {busy && <Loader2 className="w-4 h-4 animate-spin" />} Show the newest export
+                </button>
+              ) : null}
               {/* Turning off is final for everyone holding the link (a new one
                   gets a new address), so it asks once, in place. */}
               {confirmOff ? (
@@ -3305,6 +3323,8 @@ function ShareControl({ projectId }: { projectId: string }) {
                 </button>
               )}
             </>
+          ) : share.can_share === false ? (
+            <span className="text-fine text-muted">Export the video first. A link plays a finished export.</span>
           ) : (
             <button onClick={() => change("PUT")} disabled={busy} className={`${btnPrimary} self-start`}>
               {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />} Create link
