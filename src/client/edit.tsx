@@ -3458,8 +3458,18 @@ function TimelinePanel({
       </div>
 
       {/* tracks */}
-      <div ref={scrollRef} className="flex-1 overflow-auto relative">
-        <div style={{ width: width + HEAD_W }} className="relative">
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-auto relative"
+        // A click on the empty timeline (a lane with nothing under the
+        // pointer, or the space below the tracks) lets go of the selection.
+        // Clips and the ruler handle their own presses.
+        onPointerDown={(e) => {
+          const t = e.target as HTMLElement;
+          if (t === e.currentTarget || t.dataset.empty !== undefined) setSel(null);
+        }}
+      >
+        <div style={{ width: width + HEAD_W }} className="relative" data-empty>
           {/* ruler */}
           <div className="sticky top-0 z-20 flex bg-surface" style={{ height: RULER_H }}>
             <div style={{ width: HEAD_W }} className="shrink-0 border-r border-b border-border bg-surface" />
@@ -3656,7 +3666,9 @@ function TrackRow({ label, height, action, children }: { label: string; height: 
         <span className="text-fine text-muted truncate">{label}</span>
         {action}
       </div>
-      <div className="relative flex-1 border-b border-border bg-surface-sunken/50">{children}</div>
+      <div className="relative flex-1 border-b border-border bg-surface-sunken/50" data-empty>
+        {children}
+      </div>
     </div>
   );
 }
