@@ -3559,7 +3559,7 @@ function TimelinePanel({
           <span className="text-faint"> / {fmtTime(total)}</span>
         </span>
         <div className="w-px h-5 bg-border mx-1" />
-        <button onClick={splitAtPlayhead} className={btnIcon} aria-label="Split at playhead" title="Split at playhead (⌘B)">
+        <button onClick={splitAtPlayhead} className={btnIcon} aria-label="Split at playhead" title="Split at playhead (Cmd+B)">
           <Scissors className="w-4 h-4" />
         </button>
         <button onClick={deleteSelected} disabled={!sel} className={btnIcon} aria-label="Delete selected" title="Delete selected">
