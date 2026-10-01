@@ -10,6 +10,7 @@ import { useEffect, useRef } from "react";
 import * as RadixContextMenu from "@radix-ui/react-context-menu";
 import * as RadixPopover from "@radix-ui/react-popover";
 import { Command as CommandPrimitive } from "cmdk";
+import { ChevronDown } from "lucide-react";
 
 const btnBase =
   "inline-flex items-center gap-1.5 h-7 rounded-sm text-button whitespace-nowrap " +
@@ -216,6 +217,34 @@ export function ContextMenuItem({
 export const Popover = RadixPopover.Root;
 export const PopoverTrigger = RadixPopover.Trigger;
 
+/**
+ * The face of a dropdown, in DESIGN.md's two kinds. A select that changes what
+ * the screen shows ("view") is the raised secondary-button shape at 28px and
+ * hugs its label; one that sets a value ("field") keeps the input shape so it
+ * lines up with the fields around it. The chevron is what tells a view select
+ * from a button, so it is always there. Wrap it in a PopoverTrigger (asChild);
+ * Radix sets data-state="open" on it while the list shows.
+ */
+export function SelectTrigger({
+  kind,
+  className = "",
+  children,
+  ...rest
+}: { kind: "view" | "field" } & React.ButtonHTMLAttributes<HTMLButtonElement> & {
+    ref?: React.Ref<HTMLButtonElement>;
+  }) {
+  const face =
+    kind === "view"
+      ? "inline-flex h-7 pl-2 pr-1.5 rounded-sm text-button whitespace-nowrap bg-surface text-foreground shadow-raised hover:bg-surface-sunken data-[state=open]:bg-surface-sunken"
+      : "field flex w-full";
+  return (
+    <button type="button" className={`${face} items-center gap-1.5 text-left cursor-pointer ${className}`} {...rest}>
+      {children}
+      <ChevronDown className="w-4 h-4 shrink-0 text-muted ml-auto" strokeWidth={1.5} />
+    </button>
+  );
+}
+
 export function PopoverContent({
   children,
   align = "start",
@@ -240,9 +269,10 @@ export function PopoverContent({
   );
 }
 
-export function Command({ label, children }: { label: string; children: React.ReactNode }) {
+/** `chosen` is the current option's value: the list opens with it highlighted. */
+export function Command({ label, chosen, children }: { label: string; chosen?: string; children: React.ReactNode }) {
   return (
-    <CommandPrimitive label={label} loop>
+    <CommandPrimitive label={label} loop defaultValue={chosen}>
       <CommandPrimitive.List className="scroll-slim max-h-96 overflow-y-auto p-1">{children}</CommandPrimitive.List>
     </CommandPrimitive>
   );
@@ -262,18 +292,22 @@ export function CommandGroup({ heading, children }: { heading: string; children:
 export function CommandItem({
   value,
   onSelect,
+  chosen = false,
   children,
 }: {
   /** Unique within the list: cmdk tracks the highlighted item by it. */
   value: string;
   onSelect: () => void;
+  /** The current option. It is a highlight in medium weight, never a tick (DESIGN.md). */
+  chosen?: boolean;
   children: React.ReactNode;
 }) {
   return (
     <CommandPrimitive.Item
       value={value}
       onSelect={onSelect}
-      className="flex items-center gap-2 min-h-8 px-2 py-1 rounded-sm text-body-sm text-foreground cursor-pointer select-none outline-none data-[selected=true]:bg-surface-sunken"
+      aria-current={chosen || undefined}
+      className={`flex items-center gap-2 min-h-8 px-2 py-1 rounded-sm text-body-sm text-foreground cursor-pointer select-none outline-none data-[selected=true]:bg-surface-sunken ${chosen ? "bg-surface-sunken font-medium" : ""}`}
     >
       {children}
     </CommandPrimitive.Item>
