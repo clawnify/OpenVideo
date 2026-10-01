@@ -2890,10 +2890,13 @@ function AudioFades({
   heard: number;
   onChange: (key: "fadeIn" | "fadeOut", seconds: number) => void;
 }) {
-  // A slider past what is heard would do nothing more, so it stops there.
-  const max = Math.max(0.1, Math.min(10, Math.floor(heard * 10) / 10));
   const row = (key: "fadeIn" | "fadeOut", label: string) => {
-    const v = Math.min(el[key] ?? 0, max);
+    // Ten seconds covers fades set by hand; a longer one set by an agent widens
+    // the slider rather than being misreported. Past what is heard a fade does
+    // nothing more, so the slider stops there.
+    const set = el[key] ?? 0;
+    const max = Math.max(0.1, Math.floor(Math.min(heard, Math.max(10, set)) * 10) / 10);
+    const v = Math.min(set, max);
     return (
       <Row label={`${label} — ${v > 0 ? `${v.toFixed(1)}s` : "off"}`}>
         <input
@@ -3141,7 +3144,12 @@ function Inspector({
       <>
         <Zone>Audio</Zone>
         <SliderRow label="Volume" value={el.volume ?? 1} max={2} onChange={(n) => set((x) => (x.volume = n))} />
-        <AudioFades el={el} heard={heard} onChange={(k, n) => set((x) => (x[k] = n > 0 ? n : undefined))} />
+        <AudioFades
+          el={el}
+          heard={heard}
+          // One drag, one undo step: commit() folds edits under 600 ms apart.
+          onChange={(k, n) => update((d) => void (d.audio![sel.ti].elements[sel.i][k] = n > 0 ? n : undefined), true)}
+        />
         <div className="grid grid-cols-2 gap-2">
           <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
           <NumberRow label="Trim start (s)" value={el.trimStart ?? 0} min={0} onChange={(n) => set((x) => (x.trimStart = Math.max(0, n)))} />
