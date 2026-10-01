@@ -2389,15 +2389,20 @@ function Player({
     window.addEventListener("pointerup", up);
   };
 
-  // A filled clip that is selected and on screen is reframed by dragging it:
-  // the drag slides it across the side that spills over the frame.
-  const selMain = sel?.area === "main" ? edl.main.elements[sel.i] : undefined;
-  const reframable = !!selMain && selMain.fit === "cover" && active?.el.id === selMain.id && active.dur > 0;
+  // Clicking the picture selects the clip on screen, the way it would in any
+  // editor; pressing on a filled clip and dragging also reframes it, in the
+  // same gesture. Titles stop the event themselves, so they keep their drag.
+  const onScreen = active && active.dur > 0 ? active.el : undefined;
+  const reframable = onScreen?.fit === "cover";
 
   const stagePointerDown = (e: React.PointerEvent) => {
-    if (!reframable || !selMain || sel?.area !== "main") return setSel(null);
-    const i = sel.i;
-    const media = stageRef.current?.querySelector(`[data-clip="${CSS.escape(selMain.id)}"]`);
+    if (!onScreen) return setSel(null);
+    const i = edl.main.elements.findIndex((el) => el.id === onScreen.id);
+    if (i < 0) return setSel(null);
+    if (!(sel?.area === "main" && sel.i === i)) setSel({ area: "main", i });
+    if (!reframable) return;
+
+    const media = stageRef.current?.querySelector(`[data-clip="${CSS.escape(onScreen.id)}"]`);
     const natural =
       media instanceof HTMLVideoElement
         ? { width: media.videoWidth, height: media.videoHeight }
@@ -2409,12 +2414,12 @@ function Player({
     e.preventDefault();
     const overflow = coverOverflow(natural, edl.output);
     const rect = stageRef.current!.getBoundingClientRect();
-    const from = selMain.anchor ?? CENTRE;
+    const from = onScreen.anchor ?? CENTRE;
     const startX = e.clientX;
     const startY = e.clientY;
     let moved = false;
     const move = (ev: PointerEvent) => {
-      // A click without a drag still deselects, as it always did.
+      // A plain click only selects; a few pixels of travel starts the reframe.
       if (!moved && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 3) return;
       moved = true;
       const next = dragAnchor(from, (ev.clientX - startX) / rect.width, (ev.clientY - startY) / rect.height, overflow);
@@ -2426,7 +2431,6 @@ function Player({
     const up = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
-      if (!moved) setSel(null);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
@@ -2436,11 +2440,13 @@ function Player({
     <div
       ref={boxRef}
       className={`${pane === "canvas" ? "grid" : "hidden"} lg:grid flex-1 min-w-0 min-h-0 bg-surface-sunken place-items-center p-4 overflow-hidden`}
+      // The grey around the frame is where a click lets go of the selection.
+      onPointerDown={(e) => e.target === e.currentTarget && setSel(null)}
     >
       <div style={{ width: fit.w || undefined, height: fit.h || undefined }}>
         <div
           ref={stageRef}
-          className={`relative w-full h-full overflow-hidden rounded-md shadow-edge ${reframable ? "cursor-grab active:cursor-grabbing" : ""}`}
+          className={`relative w-full h-full overflow-hidden rounded-md shadow-edge ${reframable ? "cursor-grab active:cursor-grabbing" : onScreen ? "cursor-pointer" : ""}`}
           style={{ background: edl.output.background ?? "#000" }}
           onPointerDown={stagePointerDown}
         >
