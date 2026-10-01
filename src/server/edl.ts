@@ -58,6 +58,18 @@ const anchor = z
   .object({ x: z.number().finite().min(0).max(1), y: z.number().finite().min(0).max(1) })
   .strict();
 
+/** A region of the SOURCE frame, in shares of its width and height, cut out
+ *  before the clip is fitted or filled (shared/crop.ts). */
+const crop = z
+  .object({
+    x: z.number().finite().min(0).max(1),
+    y: z.number().finite().min(0).max(1),
+    width: z.number().finite().min(0.01).max(1),
+    height: z.number().finite().min(0.01).max(1),
+  })
+  .strict()
+  .refine((c) => c.x + c.width <= 1.0001 && c.y + c.height <= 1.0001, "crop must stay inside the frame");
+
 const mainVideo = z
   .object({
     ...clipBase,
@@ -71,6 +83,7 @@ const mainVideo = z
     volume: z.number().finite().min(0).max(2).optional(),
     fit: fit.optional(),
     anchor: anchor.optional(),
+    crop: crop.optional(),
   })
   .strict();
 
@@ -81,6 +94,7 @@ const mainImage = z
     duration: seconds.min(0.05).max(MAX_OUTPUT_SECONDS),
     fit: fit.optional(),
     anchor: anchor.optional(),
+    crop: crop.optional(),
   })
   .strict();
 
@@ -100,8 +114,9 @@ const overlayMedia = z
     ...overlayBase,
     ...clipBase,
     type: z.enum(["video", "image"]),
-    /** Fraction of canvas width; height keeps the source aspect. */
+    /** Fraction of canvas width; height keeps the (cropped) source aspect. */
     width: z.number().finite().min(0.01).max(1),
+    crop: crop.optional(),
   })
   .strict();
 
