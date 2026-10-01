@@ -79,6 +79,7 @@ interface Asset {
 
 app.get("/api/assets", async (c) => {
   const rows = await query<Asset>("SELECT * FROM assets ORDER BY created_at DESC");
+  c.executionCtx.waitUntil(sweepUploads(c.env).catch((err) => console.error("upload sweep:", String(err))));
   return c.json(rows);
 });
 
@@ -109,72 +110,119 @@ app.post("/api/assets", async (c) => {
 // service itself, resumably, so a clip of any size uploads and gets the same
 // playback, frames and transcript as one imported from Drive. Three steps:
 // open an upload, send the bytes (browser to service), then register the
-// asset. Nothing is written here until the bytes have arrived, so an upload
-// abandoned halfway leaves no row behind.
+// asset.
+//
+// Each open upload has a `media_uploads` row from the moment it is opened
+// until it becomes an asset or is dropped. The row is the app's proof that the
+// video is its own, so a cancel or a discard can delete it at any stage, and
+// an upload whose browser went away is still settled: a finished one joins
+// the library, an expired one is deleted (sweepUploads).
 
 const MEDIA_UID = /^[0-9a-f]{32}$/;
 
+interface MediaUpload {
+  uid: string;
+  name: string;
+  content_type: string;
+  size: number;
+  duration: number | null;
+  created_at: string;
+}
+
+function mediaCfg(env: Bindings) {
+  return { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN };
+}
+
+/** Turn an open upload into a library asset. Safe to call twice: the asset key is unique. */
+async function promoteUpload(uid: string): Promise<Asset | null> {
+  await run(
+    `INSERT INTO assets (key, name, content_type, size, duration, media_uid)
+     SELECT 'media/' || uid, name, content_type, size, duration, uid FROM media_uploads WHERE uid = ?
+     ON CONFLICT(key) DO NOTHING`,
+    [uid],
+  );
+  await run("DELETE FROM media_uploads WHERE uid = ?", [uid]);
+  return (await get<Asset>("SELECT * FROM assets WHERE media_uid = ?", [uid])) ?? null;
+}
+
+// An upload link lives 6 hours on the service; past that, a pending upload
+// can never finish.
+const UPLOAD_SETTLE_MINUTES = 10;
+const UPLOAD_EXPIRED_HOURS = 7;
+
+/**
+ * Settle uploads the browser never finished registering (closed tab, lost
+ * connection). Left alone, a finished one would count against the org's
+ * footage allowance while appearing nowhere. Runs after a library listing,
+ * a few rows at a time, and only for rows old enough that no browser is
+ * still working on them.
+ */
+async function sweepUploads(env: Bindings): Promise<void> {
+  const stale = await query<MediaUpload>(
+    `SELECT * FROM media_uploads WHERE created_at < datetime('now', ?) ORDER BY created_at LIMIT 5`,
+    [`-${UPLOAD_SETTLE_MINUTES} minutes`],
+  );
+  for (const up of stale) {
+    const state = await mediaState(mediaCfg(env), up.uid);
+    if ("failure" in state) {
+      if (state.failure.error === "not_found") await run("DELETE FROM media_uploads WHERE uid = ?", [up.uid]);
+      continue;
+    }
+    if (state.media.state !== "pendingupload") {
+      await promoteUpload(up.uid);
+    } else if (Date.parse(up.created_at + "Z") < Date.now() - UPLOAD_EXPIRED_HOURS * 3600_000) {
+      await deleteMedia(mediaCfg(env), up.uid);
+      await run("DELETE FROM media_uploads WHERE uid = ?", [up.uid]);
+    }
+  }
+}
+
 app.post("/api/assets/uploads", async (c) => {
   const b = await c.req
-    .json<{ name?: string; size?: number; duration?: number }>()
-    .catch(() => ({}) as { name?: string; size?: number; duration?: number });
+    .json<{ name?: string; type?: string; size?: number; duration?: number }>()
+    .catch(() => ({}) as { name?: string; type?: string; size?: number; duration?: number });
   if (!b.name || !b.size || !Number.isInteger(b.size) || b.size <= 0) {
     return c.json({ error: "invalid_request", detail: "name and size are required" }, 400);
   }
-  // An open upload holds its maximum length of the org's footage allowance
-  // until it completes. The browser read the real length from the file, so
-  // reserve that, with room for a probe that is a little short.
-  const maxDuration =
-    typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0
-      ? Math.ceil(b.duration * 1.1 + 30)
-      : undefined;
-  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
-  const opened = await openMediaUpload(cfg, b.size, b.name, maxDuration);
+  const duration = typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0 ? b.duration : null;
+  // Until it completes, an upload reserves its maximum length of the
+  // platform's video storage (released when the link expires). The browser
+  // read the real length from the file, so reserve that, with room for a
+  // probe that is a little short: a video longer than this is refused.
+  const maxDuration = duration ? Math.ceil(duration * 1.1 + 30) : undefined;
+  const name = b.name.slice(0, 200);
+  const opened = await openMediaUpload(mediaCfg(c.env), b.size, name, maxDuration);
   // media_unavailable (local dev) tells the browser to post the file here instead.
   if ("failure" in opened) return c.json(opened.failure, opened.failure.error === "media_unavailable" ? 503 : 422);
+  await run("INSERT INTO media_uploads (uid, name, content_type, size, duration) VALUES (?, ?, ?, ?, ?)", [
+    opened.id,
+    name,
+    b.type?.startsWith("video/") ? b.type : "video/mp4",
+    b.size,
+    duration,
+  ]);
   return c.json({ uid: opened.id, upload_url: opened.uploadUrl }, 201);
 });
 
+// The bytes are in: the upload joins the library.
 app.post("/api/assets/media", async (c) => {
-  const b = await c.req
-    .json<{ uid?: string; name?: string; type?: string; size?: number; duration?: number }>()
-    .catch(() => ({}) as { uid?: string; name?: string; type?: string; size?: number; duration?: number });
-  if (!b.uid || !MEDIA_UID.test(b.uid) || !b.name) {
-    return c.json({ error: "invalid_request", detail: "uid and name are required" }, 400);
-  }
-  // Registering twice (a retried request) returns the first row.
-  const existing = await get<Asset>("SELECT * FROM assets WHERE media_uid = ?", [b.uid]);
-  if (existing) return c.json(existing, 200);
-  // The service answers only for this org's own videos, so this is also the
-  // check that the id is ours to register.
-  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
-  const state = await mediaState(cfg, b.uid);
-  if ("failure" in state) return c.json(state.failure, 404);
-  const duration =
-    typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0 ? b.duration : state.media.duration;
-  const size = typeof b.size === "number" && Number.isInteger(b.size) && b.size > 0 ? b.size : 0;
-  const res = await run(
-    "INSERT INTO assets (key, name, content_type, size, duration, media_uid) VALUES (?, ?, ?, ?, ?, ?)",
-    [`media/${b.uid}`, b.name.slice(0, 200), b.type?.startsWith("video/") ? b.type : "video/mp4", size, duration ?? null, b.uid],
-  );
-  const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
-  return c.json(row, 201);
+  const b = await c.req.json<{ uid?: string }>().catch(() => ({}) as { uid?: string });
+  if (!b.uid || !MEDIA_UID.test(b.uid)) return c.json({ error: "invalid_request", detail: "uid is required" }, 400);
+  const asset = await promoteUpload(b.uid);
+  if (!asset) return c.json({ error: "not_found", detail: "no upload with that id was opened here" }, 404);
+  return c.json(asset, 201);
 });
 
-// A cancelled upload: drop it on the service, so its reservation stops
-// counting against the org. Only one still waiting for its bytes: finished
-// footage goes through DELETE /api/assets/:id, which checks the projects
-// first, and footage another app in the org keeps is not this app's to drop.
+// Cancel or discard an upload that has not joined the library, at any stage.
+// Only one this app opened: footage in the library goes through
+// DELETE /api/assets/:id, which checks the projects first.
 app.delete("/api/assets/uploads/:uid", async (c) => {
   const uid = c.req.param("uid");
-  if (!MEDIA_UID.test(uid)) return c.json({ error: "Not found" }, 404);
-  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
-  const state = await mediaState(cfg, uid);
-  if ("failure" in state) return c.json({ ok: true });
-  if (state.media.state !== "pendingupload" || (await get<Asset>("SELECT id FROM assets WHERE media_uid = ?", [uid]))) {
-    return c.json({ error: "upload_finished", detail: "that upload has finished, so it is not cancelled" }, 409);
+  if (!MEDIA_UID.test(uid) || !(await get<MediaUpload>("SELECT uid FROM media_uploads WHERE uid = ?", [uid]))) {
+    return c.json({ error: "not_found", detail: "no open upload with that id" }, 404);
   }
-  await deleteMedia(cfg, uid);
+  await deleteMedia(mediaCfg(c.env), uid);
+  await run("DELETE FROM media_uploads WHERE uid = ?", [uid]);
   return c.json({ ok: true });
 });
 

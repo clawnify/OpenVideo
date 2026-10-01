@@ -78,3 +78,15 @@ ALTER TABLE assets ADD COLUMN media_uid TEXT;
 -- worked out from it on every preview and export, never stored per caption.
 ALTER TABLE assets ADD COLUMN transcript TEXT;
 ALTER TABLE assets ADD COLUMN transcript_lang TEXT;
+
+-- A video upload in flight from a browser to the media service, from the
+-- moment it is opened until it joins the library as an asset, or is
+-- cancelled or expires. It is how the app knows the video is its own.
+CREATE TABLE IF NOT EXISTS media_uploads (
+  uid TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  duration REAL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);

@@ -158,7 +158,7 @@ async function toMediaService(id: string): Promise<boolean> {
     const r = await fetch("/api/assets/uploads", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: job.name, size: job.size, duration: job.duration }),
+      body: JSON.stringify({ name: job.name, type: job.file.type, size: job.size, duration: job.duration }),
     }).catch(() => null);
     if (!find(id)) return true;
     if (r?.status === 503) return false;
@@ -196,7 +196,7 @@ async function toMediaService(id: string): Promise<boolean> {
   const r = await fetch("/api/assets/media", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ uid: job.uid, name: job.name, type: job.file.type, size: job.size, duration: job.duration }),
+    body: JSON.stringify({ uid: job.uid }),
   }).catch(() => null);
   if (!r?.ok) {
     fail(id, "Uploaded, but not added to the library yet. Retry adds it.");
@@ -243,7 +243,10 @@ export function retryUpload(id: string) {
   run(id);
 }
 
-/** Stop an upload and forget it. One still open on the media service is dropped there. */
+/**
+ * Stop an upload and forget it. One opened on the media service is deleted
+ * there, even if its bytes are all in: discarding means not keeping it.
+ */
 export function cancelUpload(id: string) {
   const job = find(id);
   if (!job) return;

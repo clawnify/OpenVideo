@@ -1633,8 +1633,8 @@ function UploadTray({ uploads }: { uploads: UploadItem[] }) {
               <button
                 onClick={() => cancelUpload(u.id)}
                 className="grid place-items-center w-5 h-5 rounded-xs text-faint hover:text-foreground hover:bg-surface-sunken shrink-0"
-                aria-label={u.status === "failed" ? `Dismiss ${u.name}` : `Cancel uploading ${u.name}`}
-                title={u.status === "failed" ? "Dismiss" : "Cancel upload"}
+                aria-label={u.status === "failed" ? `Discard ${u.name}` : `Cancel uploading ${u.name}`}
+                title={u.status === "failed" ? "Discard" : "Cancel upload"}
               >
                 <X className="w-3.5 h-3.5" />
               </button>
