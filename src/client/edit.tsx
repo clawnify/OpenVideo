@@ -50,6 +50,7 @@ import {
   Film,
   Folder,
   Image as ImageIcon,
+  Link2,
   Loader2,
   Music,
   Pause,
@@ -1095,6 +1096,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         >
           <Sparkles className="w-4 h-4" /> <span className="hidden sm:inline">Auto-cut</span>
         </button>
+        <ShareControl projectId={initial.id} />
         <ExportControls projectId={initial.id} disabled={dirty.current || edl.main.elements.length === 0} />
       </div>
 
@@ -3190,6 +3192,128 @@ function PositionRow({
         )}
       </div>
     </Row>
+  );
+}
+
+// ── share by link ───────────────────────────────────────────────────────────
+
+/**
+ * One public link per project, playing its latest finished export. The link
+ * is read when the popover opens, so it reflects an export made since.
+ */
+function ShareControl({ projectId }: { projectId: string }) {
+  const [open, setOpen] = useState(false);
+  const [url, setUrl] = useState<string | null>(null);
+  const [exported, setExported] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [confirmOff, setConfirmOff] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    setError("");
+    setCopied(false);
+    setConfirmOff(false);
+    api.get<{ url: string | null }>(`/api/projects/${projectId}/share`).then((s) => setUrl(s.url)).catch(() => {});
+    api
+      .get<ExportJob[]>(`/api/exports?project_id=${projectId}`)
+      .then((j) => setExported(j.some((x) => x.status === "completed")))
+      .catch(() => {});
+  }, [open, projectId]);
+
+  const change = async (method: "PUT" | "DELETE") => {
+    setBusy(true);
+    setError("");
+    try {
+      const s = await api.send<{ url: string | null }>(method, `/api/projects/${projectId}/share`);
+      setUrl(s.url);
+      setCopied(false);
+      setConfirmOff(false);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async () => {
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+    } catch {
+      setError("Couldn't copy. Select the link and copy it yourself.");
+    }
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button className={btnSecondary} title="Share a link to this video">
+          <Link2 className="w-4 h-4" /> <span className="hidden sm:inline">Share</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" width="w-80">
+        <div className="p-3 flex flex-col gap-3">
+          <div className="flex flex-col gap-1">
+            <span className="text-body-sm font-medium">Share by link</span>
+            <span className="text-fine text-muted">
+              Anyone with the link can watch and download your latest export, without signing in. Exporting
+              again updates what they see.
+            </span>
+          </div>
+          {url ? (
+            <>
+              <div className="flex gap-2">
+                <input
+                  readOnly
+                  value={url}
+                  aria-label="Share link"
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="field flex-1 min-w-0"
+                />
+                {/* Fixed width, so "Copied" does not shift the field. */}
+                <button onClick={copy} className={`${btnPrimary} w-24 justify-center`}>
+                  {copied ? <Check className="w-4 h-4" /> : <Link2 className="w-4 h-4" />} {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+              {!exported && (
+                <span className="text-fine text-muted">
+                  Nothing is exported yet, so the link says the video isn't ready.
+                </span>
+              )}
+              {/* Turning off is final for everyone holding the link (a new one
+                  gets a new address), so it asks once, in place. */}
+              {confirmOff ? (
+                <div className="flex flex-col gap-2">
+                  <span className="text-fine text-muted">
+                    People who have this link will no longer be able to watch. A new link gets a new address.
+                  </span>
+                  <div className="flex gap-2">
+                    <button onClick={() => change("DELETE")} disabled={busy} className={btnDanger}>
+                      {busy && <Loader2 className="w-4 h-4 animate-spin" />} Turn off
+                    </button>
+                    <button onClick={() => setConfirmOff(false)} className={btnGhost}>
+                      Keep link
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button onClick={() => setConfirmOff(true)} className={`${btnGhost} self-start -ml-2`}>
+                  Turn off link
+                </button>
+              )}
+            </>
+          ) : (
+            <button onClick={() => change("PUT")} disabled={busy} className={`${btnPrimary} self-start`}>
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />} Create link
+            </button>
+          )}
+          {error && <span className="text-fine text-danger">{error}</span>}
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }
 

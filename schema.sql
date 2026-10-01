@@ -78,3 +78,12 @@ ALTER TABLE assets ADD COLUMN media_uid TEXT;
 -- worked out from it on every preview and export, never stored per caption.
 ALTER TABLE assets ADD COLUMN transcript TEXT;
 ALTER TABLE assets ADD COLUMN transcript_lang TEXT;
+
+-- A project's share link: anyone with /s/<token> can watch the project's
+-- latest finished export, without signing in. The token is the capability, so
+-- turning the link off deletes the row and turning it on again mints a new one.
+CREATE TABLE IF NOT EXISTS share_links (
+  token TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);

@@ -61,6 +61,9 @@ back as `folders`); a search looks inside that folder only, never the subtree.
 | DELETE | `/api/projects/{id}` | Delete a project and its export history |
 | POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job (blocks until done) |
 | GET  | `/api/exports?project_id={id}` | Export history |
+| GET  | `/api/projects/{id}/share` | The project's share link → `{ url }` (`url: null` when off) |
+| PUT  | `/api/projects/{id}/share` | Turn the link on → `{ url }`; keeps an existing link |
+| DELETE | `/api/projects/{id}/share` | Turn the link off; the address stops working for everyone |
 
 ## The project document (EDL)
 
@@ -269,6 +272,17 @@ same `{ error, detail, path }` shape as validation, so you can fix the EDL and
 export again. Your library media is staged to the edit service automatically
 on first use; you never manage that.
 
+### Sharing
+
+`output_url` only opens for people signed in to this workspace. To send the
+video to anyone else (a client, a reviewer), `PUT /api/projects/{id}/share`
+and give them the returned `url`: a page that plays the project's latest
+completed export, with a Download button, no sign-in. It always shows the
+newest export, so after a re-export the same link plays the new cut. The link
+works before anything is exported (it says the video isn't ready). Only turn
+it off (`DELETE`) when the user asks: it cannot be brought back, and a new
+link gets a new address.
+
 ## Typical flow
 
 1. Get the purpose and set it as the project's `brief` (ask if you don't know).
@@ -276,4 +290,5 @@ on first use; you never manage that.
 3. Several raw clips: `POST /api/projects/{id}/autocut`. One clip: analyze it,
    then write the main track from the keep segments.
 4. Adjust with read → transform → `PUT`, fixing anything validation points at.
-5. Export `draft` to review, then `high` for the final, and share `output_url`.
+5. Export `draft` to review, then `high` for the final. To send it to someone
+   outside the workspace, turn on the share link and give them its `url`.

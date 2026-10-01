@@ -216,14 +216,23 @@ export function ContextMenuItem({
 export const Popover = RadixPopover.Root;
 export const PopoverTrigger = RadixPopover.Trigger;
 
-export function PopoverContent({ children }: { children: React.ReactNode }) {
+export function PopoverContent({
+  children,
+  align = "start",
+  width = "w-(--radix-popover-trigger-width) min-w-64",
+}: {
+  children: React.ReactNode;
+  align?: "start" | "center" | "end";
+  /** Width classes; defaults to the trigger's width, as a dropdown should be. */
+  width?: string;
+}) {
   return (
     <RadixPopover.Portal>
       <RadixPopover.Content
-        align="start"
+        align={align}
         sideOffset={4}
         collisionPadding={8}
-        className="z-50 w-(--radix-popover-trigger-width) min-w-64 rounded-md bg-surface shadow-float outline-none"
+        className={`z-50 ${width} rounded-md bg-surface shadow-float outline-none`}
       >
         {children}
       </RadixPopover.Content>

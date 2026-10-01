@@ -1,12 +1,11 @@
-import { Hono } from "hono";
+import { Hono, type MiddlewareHandler } from "hono";
 import { initDB, query, get, run } from "./db";
 import {
   initUploads,
   putUpload,
   putUploadFromUrl,
-  getUpload,
-  getUploadRange,
   deleteUpload,
+  serveUpload,
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
@@ -23,6 +22,7 @@ import {
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { instructEdit } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, resolveEdlSources, runEdit } from "./export";
+import { exportKey, makeShareToken, notePage, sharePage } from "./share";
 
 type Bindings = {
   DB: D1Database;
@@ -42,11 +42,13 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-app.use("/api/*", async (c, next) => {
+const init: MiddlewareHandler<{ Bindings: Bindings }> = async (c, next) => {
   initDB(c.env);
   initUploads(c.env.UPLOADS);
   await next();
-});
+};
+app.use("/api/*", init);
+app.use("/s/*", init);
 
 app.onError((err, c) => {
   console.error(err);
@@ -374,42 +376,12 @@ app.post("/api/assets/:id/analyze", async (c) => {
   return c.json(res.result);
 });
 
-// Serve any R2 object (uploaded media + exported videos). Range-aware: media
-// elements seek with byte ranges, and metadata probing of moov-at-end files
-// is unusably slow without 206 responses.
+// Serve any R2 object (uploaded media + exported videos), range-aware.
 app.get("/api/uploads/:key", async (c) => {
-  const key = c.req.param("key");
-  const range = c.req.header("Range");
-  const m = range?.match(/^bytes=(\d+)-(\d*)$/);
-
-  if (m) {
-    const start = Number(m[1]);
-    const end = m[2] ? Number(m[2]) : undefined;
-    const obj = await getUploadRange(key, start, end !== undefined ? end - start + 1 : undefined);
-    if (!obj) return c.json({ error: "Not found" }, 404);
-    const last = end !== undefined ? Math.min(end, obj.size - 1) : obj.size - 1;
-    return new Response(obj.data, {
-      status: 206,
-      headers: {
-        "Content-Type": obj.contentType,
-        "Content-Range": `bytes ${start}-${last}/${obj.size}`,
-        "Content-Length": String(last - start + 1),
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "public, max-age=31536000",
-      },
-    });
-  }
-
-  const obj = await getUpload(key);
-  if (!obj) return c.json({ error: "Not found" }, 404);
-  return new Response(obj.data, {
-    headers: {
-      "Content-Type": obj.contentType,
-      "Content-Length": String(obj.size),
-      "Accept-Ranges": "bytes",
-      "Cache-Control": "public, max-age=31536000",
-    },
+  const res = await serveUpload(c.req.param("key"), c.req.header("Range"), {
+    "Cache-Control": "public, max-age=31536000",
   });
+  return res ?? c.json({ error: "Not found" }, 404);
 });
 
 // ── Edit projects (footage EDL) ──────────────────────────────────────
@@ -652,6 +624,7 @@ app.post("/api/projects/:id/autocut", async (c) => {
 
 app.delete("/api/projects/:id", async (c) => {
   const id = c.req.param("id");
+  await run("DELETE FROM share_links WHERE project_id = ?", [id]);
   await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM edit_projects WHERE id = ?", [id]);
   return c.json({ ok: true });
@@ -738,6 +711,96 @@ app.post("/api/projects/:id/export", async (c) => {
 
   const job = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [jobId]);
   return c.json(job, 201);
+});
+
+// ── Share by link ────────────────────────────────────────────────────
+// One link per project. It plays the project's latest finished export, so a
+// re-export updates what viewers see; turning it off deletes the token, and
+// turning it on again gives a new address.
+
+interface ShareLink {
+  token: string;
+  project_id: string;
+  created_at: string;
+}
+
+function shareOut(c: { req: { url: string } }, link: ShareLink | undefined) {
+  return link
+    ? { url: new URL(`/s/${link.token}`, c.req.url).toString(), created_at: link.created_at }
+    : { url: null };
+}
+
+app.get("/api/projects/:id/share", async (c) => {
+  const link = await get<ShareLink>("SELECT * FROM share_links WHERE project_id = ?", [c.req.param("id")]);
+  return c.json(shareOut(c, link));
+});
+
+app.put("/api/projects/:id/share", async (c) => {
+  const id = c.req.param("id");
+  const project = await get<{ id: string }>("SELECT id FROM edit_projects WHERE id = ?", [id]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+  // Idempotent: an existing link is kept, so a second click never breaks one
+  // already sent out.
+  await run("INSERT OR IGNORE INTO share_links (token, project_id) VALUES (?, ?)", [makeShareToken(), id]);
+  const link = await get<ShareLink>("SELECT * FROM share_links WHERE project_id = ?", [id]);
+  return c.json(shareOut(c, link));
+});
+
+app.delete("/api/projects/:id/share", async (c) => {
+  await run("DELETE FROM share_links WHERE project_id = ?", [c.req.param("id")]);
+  return c.json({ url: null });
+});
+
+// The public half: the only routes reachable without signing in (clawnify.json
+// `api.public_routes`). A token that matches no row is indistinguishable from
+// one that never existed.
+
+/** The link's project and its latest finished export, if the link is live. */
+async function sharedExport(token: string) {
+  const link = await get<{ name: string; project_id: string }>(
+    `SELECT p.name, s.project_id FROM share_links s JOIN edit_projects p ON p.id = s.project_id WHERE s.token = ?`,
+    [token],
+  );
+  if (!link) return null;
+  const job = await get<Pick<ExportJob, "id" | "output_url">>(
+    "SELECT id, output_url FROM export_jobs WHERE project_id = ? AND status = 'completed' ORDER BY id DESC LIMIT 1",
+    [link.project_id],
+  );
+  return { name: link.name, job: job ?? null };
+}
+
+const PUBLIC_HEADERS = { "X-Robots-Tag": "noindex", "Referrer-Policy": "no-referrer" };
+
+app.get("/s/:token", async (c) => {
+  c.header("Cache-Control", "no-store");
+  for (const [k, v] of Object.entries(PUBLIC_HEADERS)) c.header(k, v);
+  const shared = await sharedExport(c.req.param("token"));
+  if (!shared) {
+    return c.html(notePage("This link doesn't work", "It may have been turned off. Ask whoever sent it for a new one."), 404);
+  }
+  if (!shared.job) {
+    return c.html(notePage(shared.name, "This video isn't ready yet. Try again once it has been exported."));
+  }
+  return c.html(sharePage(shared.name, `/s/${encodeURIComponent(c.req.param("token"))}/video?v=${shared.job.id}`));
+});
+
+// `v` names the export the page was rendered with. Only the latest one is
+// served: a stale `v` (re-exported meanwhile) gets a 404 rather than another
+// file's bytes mid-playback, and older cuts are never reachable by guessing ids.
+app.get("/s/:token/video", async (c) => {
+  const shared = await sharedExport(c.req.param("token"));
+  const key = exportKey(shared?.job?.output_url ?? null);
+  const v = c.req.query("v");
+  if (!shared?.job || !key || (v !== undefined && v !== String(shared.job.id))) {
+    return c.text("Not found", 404, PUBLIC_HEADERS);
+  }
+  const download = c.req.query("download") !== undefined;
+  const res = await serveUpload(key, c.req.header("Range"), {
+    ...PUBLIC_HEADERS,
+    "Cache-Control": "no-store",
+    ...(download ? { "Content-Disposition": `attachment; filename="${makeKey(shared.name)}.mp4"` } : {}),
+  });
+  return res ?? c.text("Not found", 404, PUBLIC_HEADERS);
 });
 
 // ── helpers ──────────────────────────────────────────────────────────
