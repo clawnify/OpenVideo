@@ -22,7 +22,6 @@ import {
   type ProjectCaptions,
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
-import { cancelUpload, onUploaded, retryUpload, startUpload, useUploads, type UploadItem } from "./uploads";
 import {
   CENTRE,
   FORMAT_PRESETS,
@@ -93,6 +92,7 @@ import {
   card,
   stretch,
 } from "./ui";
+import { cancelUpload, onUploaded, retryUpload, startUpload, useUploads, type UploadItem } from "./uploads";
 
 // ── shared shapes (validated server-side; these are view types) ─────────────
 
