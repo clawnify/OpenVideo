@@ -21,6 +21,7 @@ import {
   withinFolder,
 } from "./drive";
 import { starterEdl, validateEdl, type Edl } from "./edl";
+import { renderKey } from "../shared/renders";
 import { instructEdit } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, resolveEdlSources, runEdit } from "./export";
 
@@ -652,6 +653,16 @@ app.post("/api/projects/:id/autocut", async (c) => {
 
 app.delete("/api/projects/:id", async (c) => {
   const id = c.req.param("id");
+  // Drop each completed export's rendered file from storage before the rows go,
+  // otherwise the renders/*.mp4 objects outlive the only rows that point to them
+  // and are orphaned forever. Best-effort: a storage hiccup must not strand the
+  // project (an unreachable object is a smaller problem than an undeletable one).
+  const jobs = await query<{ output_url: string | null }>(
+    "SELECT output_url FROM export_jobs WHERE project_id = ? AND output_url IS NOT NULL",
+    [id],
+  );
+  const keys = jobs.map((j) => renderKey(j.output_url)).filter((k): k is string => k !== null);
+  if (keys.length) await deleteUpload(keys).catch(() => {});
   await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM edit_projects WHERE id = ?", [id]);
   return c.json({ ok: true });
