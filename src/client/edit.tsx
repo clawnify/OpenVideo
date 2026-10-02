@@ -1044,6 +1044,41 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     return () => window.removeEventListener("keydown", onKey);
   });
 
+  // Transport and edit shortcuts, the ones an editor is expected to answer to:
+  // Space plays or pauses, Cmd/Ctrl+B splits at the playhead, the arrows step
+  // the playhead (a frame, or a second with Shift), Home/End jump to the ends.
+  // Ignored while typing; Space yields to a focused button so it still clicks,
+  // and the arrows leave Cmd/Alt (browser history, word jumps) alone.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+      const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
+      if (e.key === " " && plain) {
+        if (el?.closest("button, a, [role='button']")) return;
+        e.preventDefault();
+        setPlaying((p) => !p);
+      } else if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        splitAtPlayhead();
+      } else if (e.key === "ArrowLeft" && plain) {
+        e.preventDefault();
+        seek(playheadRef.current - (e.shiftKey ? 1 : 1 / edlRef.current.output.fps));
+      } else if (e.key === "ArrowRight" && plain) {
+        e.preventDefault();
+        seek(playheadRef.current + (e.shiftKey ? 1 : 1 / edlRef.current.output.fps));
+      } else if (e.key === "Home" && plain) {
+        e.preventDefault();
+        seek(0);
+      } else if (e.key === "End" && plain) {
+        e.preventDefault();
+        seek(total);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {/* Project bar. The name edits in place — there is no edit mode and no
@@ -3524,7 +3559,7 @@ function TimelinePanel({
           <span className="text-faint"> / {fmtTime(total)}</span>
         </span>
         <div className="w-px h-5 bg-border mx-1" />
-        <button onClick={splitAtPlayhead} className={btnIcon} aria-label="Split at playhead" title="Split at playhead">
+        <button onClick={splitAtPlayhead} className={btnIcon} aria-label="Split at playhead" title="Split at playhead (Cmd+B)">
           <Scissors className="w-4 h-4" />
         </button>
         <button onClick={deleteSelected} disabled={!sel} className={btnIcon} aria-label="Delete selected" title="Delete selected">
