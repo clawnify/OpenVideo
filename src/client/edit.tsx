@@ -23,6 +23,18 @@ import {
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
 import {
+  FULL,
+  cropToRatio,
+  croppedShape,
+  isFull,
+  moveCrop,
+  placeClip,
+  resizeCrop,
+  tidyCrop,
+  type Crop,
+  type Handle,
+} from "../shared/crop";
+import {
   CENTRE,
   FORMAT_PRESETS,
   coverOverflow,
@@ -45,6 +57,7 @@ import {
   AlignStartVertical,
   Check,
   ChevronRight,
+  Crop as CropIcon,
   Cloud,
   Film,
   Folder,
@@ -119,6 +132,8 @@ interface MainVideo {
   fit?: "contain" | "cover";
   /** Which part of a filled frame is kept (shared/format.ts). */
   anchor?: Anchor;
+  /** The part of the source kept, cut out before fitting (shared/crop.ts). */
+  crop?: Crop;
 }
 interface MainImage {
   id: string;
@@ -127,6 +142,7 @@ interface MainImage {
   duration: number;
   fit?: "contain" | "cover";
   anchor?: Anchor;
+  crop?: Crop;
 }
 type MainElement = MainVideo | MainImage;
 
@@ -142,6 +158,7 @@ interface OverlayMedia {
   opacity?: number;
   trimStart?: number;
   trimEnd?: number;
+  crop?: Crop;
 }
 interface OverlayText {
   id: string;
@@ -1191,6 +1208,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           onDelete={deleteSelected}
           brief={brief}
           setBrief={setBrief}
+          playheadRef={playheadRef}
         />
       </div>
 
@@ -2303,6 +2321,28 @@ function Player({
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
 
+  // A cropped clip is placed from its source's own size (shared/crop.ts).
+  const cropped: Asset[] = [];
+  for (const el of [...edl.main.elements, ...(edl.overlays ?? []).flatMap((t) => t.elements)]) {
+    const a = el.type !== "text" && el.crop ? resolveAsset(el.src) : undefined;
+    if (a) cropped.push(a);
+  }
+  const shapes = useShapes(cropped);
+  // The decoded frame's own size wins once the element has it: it is the
+  // upright picture the export crops, whatever the media service reports.
+  const [decoded, setDecoded] = useState(new Map<string, Shape>());
+  const noteSize = (id: string) => (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => {
+    const m = e.currentTarget;
+    const width = m instanceof HTMLVideoElement ? m.videoWidth : m.naturalWidth;
+    const height = m instanceof HTMLVideoElement ? m.videoHeight : m.naturalHeight;
+    if (!width || !height) return;
+    setDecoded((cur) => {
+      const was = cur.get(id);
+      return was && was.width === width && was.height === height ? cur : new Map(cur).set(id, { width, height });
+    });
+  };
+  const shapeFor = (a: Asset) => decoded.get(a.id) ?? shapes.get(a.id);
+
   // The playing video's position on the timeline, for the master clock.
   const activeRef = useRef(active);
   activeRef.current = active;
@@ -2412,7 +2452,7 @@ function Player({
     // Until the clip has loaded there is no frame to slide.
     if (!natural?.width || !natural.height) return;
     e.preventDefault();
-    const overflow = coverOverflow(natural, edl.output);
+    const overflow = coverOverflow(croppedShape(natural, onScreen.crop), edl.output);
     const rect = stageRef.current!.getBoundingClientRect();
     const from = onScreen.anchor ?? CENTRE;
     const startX = e.clientX;
@@ -2457,38 +2497,55 @@ function Player({
             const visible = seg === active && seg.dur > 0;
             const fit = seg.el.fit ?? "contain";
             const at = fit === "cover" ? (seg.el.anchor ?? CENTRE) : CENTRE;
+            const shape = seg.el.crop ? shapeFor(a) : undefined;
+            // A cropped clip: the box is the kept part, placed as the export
+            // places it, and the whole source is drawn inside it and clipped.
+            const place = shape ? placeClip(shape, seg.el.crop, edl.output, fit, seg.el.anchor) : undefined;
             const common = {
-              className: `absolute inset-0 w-full h-full ${visible ? "" : "hidden"}`,
-              // object-position is the export's crop offset, so both frame it alike.
-              style: { objectFit: fit, objectPosition: `${at.x * 100}% ${at.y * 100}%` } as React.CSSProperties,
+              className: place ? "absolute max-w-none" : "absolute inset-0 w-full h-full",
+              style: (place
+                ? { ...pct(place.source), objectFit: "fill" }
+                : // object-position is the export's crop offset, so both frame it alike.
+                  { objectFit: fit, objectPosition: `${at.x * 100}% ${at.y * 100}%` }) as React.CSSProperties,
               "data-clip": seg.el.id,
+              onLoadedMetadata: noteSize(a.id),
+              onLoad: noteSize(a.id),
             };
-            return seg.el.type === "video" ? (
-              a.media_uid ? (
-                <MediaVideo
-                  key={seg.el.id}
-                  asset={a}
-                  elementRef={(v) => {
-                    if (v) videoRefs.current.set(seg.el.id, v);
-                  }}
-                  preload="auto"
-                  playsInline
-                  {...common}
-                />
-              ) : (
-                <video
-                  key={seg.el.id}
-                  ref={(v) => {
-                    if (v) videoRefs.current.set(seg.el.id, v);
-                  }}
-                  src={assetUrl(a)}
-                  preload="auto"
-                  playsInline
-                  {...common}
-                />
-              )
-            ) : (
-              <img key={seg.el.id} src={assetUrl(a)} {...common} />
+            // The same wrapper either way, so cropping never reloads the video.
+            return (
+              <div
+                key={seg.el.id}
+                className={`absolute ${place ? "overflow-hidden" : "inset-0"} ${visible ? "" : "hidden"}`}
+                style={place ? pct(place.box) : undefined}
+              >
+                {seg.el.type === "video" ? (
+                  a.media_uid ? (
+                    <MediaVideo
+                      key={seg.el.id}
+                      asset={a}
+                      elementRef={(v) => {
+                        if (v) videoRefs.current.set(seg.el.id, v);
+                      }}
+                      preload="auto"
+                      playsInline
+                      {...common}
+                    />
+                  ) : (
+                    <video
+                      key={seg.el.id}
+                      ref={(v) => {
+                        if (v) videoRefs.current.set(seg.el.id, v);
+                      }}
+                      src={assetUrl(a)}
+                      preload="auto"
+                      playsInline
+                      {...common}
+                    />
+                  )
+                ) : (
+                  <img key={seg.el.id} src={assetUrl(a)} {...common} />
+                )}
+              </div>
             );
           })}
 
@@ -2528,6 +2585,31 @@ function Player({
                   const m = el as OverlayMedia;
                   const a = resolveAsset(m.src);
                   if (!a) return null;
+                  const shape = m.crop ? shapeFor(a) : undefined;
+                  if (shape && m.crop) {
+                    const kept = croppedShape(shape, m.crop);
+                    const { source } = placeClip(shape, m.crop, kept, "contain");
+                    return (
+                      <div
+                        key={el.id}
+                        onPointerDown={dragOverlay(ti, i)}
+                        className={`absolute cursor-move overflow-hidden ${selected ? "outline outline-2 outline-ring" : ""}`}
+                        style={{
+                          left: `${m.x * 100}%`,
+                          top: `${m.y * 100}%`,
+                          width: `${m.width * 100}%`,
+                          aspectRatio: `${kept.width} / ${kept.height}`,
+                          opacity: m.opacity ?? 1,
+                        }}
+                      >
+                        {m.type === "image" ? (
+                          <img src={assetUrl(a)} className="absolute max-w-none pointer-events-none" style={pct(source)} />
+                        ) : (
+                          <video src={assetUrl(a)} muted className="absolute max-w-none pointer-events-none" style={{ ...pct(source), objectFit: "fill" }} />
+                        )}
+                      </div>
+                    );
+                  }
                   return (
                     <div
                       key={el.id}
@@ -2536,9 +2618,9 @@ function Player({
                       style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: m.opacity ?? 1 }}
                     >
                       {m.type === "image" ? (
-                        <img src={assetUrl(a)} className="w-full h-auto pointer-events-none" />
+                        <img src={assetUrl(a)} onLoad={noteSize(a.id)} className="w-full h-auto pointer-events-none" />
                       ) : (
-                        <video src={assetUrl(a)} muted className="w-full h-auto pointer-events-none" />
+                        <video src={assetUrl(a)} onLoadedMetadata={noteSize(a.id)} muted className="w-full h-auto pointer-events-none" />
                       )}
                     </div>
                   );
@@ -2572,6 +2654,14 @@ function Player({
     </div>
   );
 }
+
+/** A rectangle in shares of its container, as CSS. */
+const pct = (r: { left: number; top: number; width: number; height: number }): React.CSSProperties => ({
+  left: `${r.left * 100}%`,
+  top: `${r.top * 100}%`,
+  width: `${r.width * 100}%`,
+  height: `${r.height * 100}%`,
+});
 
 // ── format ──────────────────────────────────────────────────────────────────
 
@@ -2840,17 +2930,19 @@ function ClipsFit({ edl, update }: { edl: Edl; update: (fn: (d: Edl) => void) =>
  */
 function ClipFraming({
   asset,
+  crop,
   frame,
   onChange,
 }: {
   asset: Asset | undefined;
+  crop: Crop | undefined;
   frame: Edl["output"];
   onChange: (anchor: Anchor) => void;
 }) {
   const shapes = useShapes(asset ? [asset] : []);
   const shape = asset && shapes.get(asset.id);
   if (!shape) return null;
-  const overflow = coverOverflow(shape, frame);
+  const overflow = coverOverflow(croppedShape(shape, crop), frame);
   const sideways = overflow.x > 0.005;
   if (!sideways && overflow.y <= 0.005) return null;
 
@@ -2896,6 +2988,315 @@ function ClipFit({ value, onChange }: { value?: Fit; onChange: (fit: Fit) => voi
     <Field label="How it fills the frame">
       <Choice<Fit> label="How it fills the frame" value={value ?? "contain"} options={FIT_CHOICES} onChange={onChange} />
     </Field>
+  );
+}
+
+// ── crop ────────────────────────────────────────────────────────────────────
+
+/** The shapes a crop can be held to. "frame" is the video's own shape. */
+const CROP_RATIOS = ["free", "frame", "16:9", "9:16", "1:1", "4:5"] as const;
+type CropRatio = (typeof CROP_RATIOS)[number];
+
+const HANDLES: { h: Handle; at: string; cursor: string }[] = [
+  { h: "nw", at: "left-0 top-0", cursor: "nwse-resize" },
+  { h: "n", at: "left-1/2 top-0", cursor: "ns-resize" },
+  { h: "ne", at: "left-full top-0", cursor: "nesw-resize" },
+  { h: "e", at: "left-full top-1/2", cursor: "ew-resize" },
+  { h: "se", at: "left-full top-full", cursor: "nwse-resize" },
+  { h: "s", at: "left-1/2 top-full", cursor: "ns-resize" },
+  { h: "sw", at: "left-0 top-full", cursor: "nesw-resize" },
+  { h: "w", at: "left-0 top-1/2", cursor: "ew-resize" },
+];
+
+/**
+ * The part of the picture a clip keeps. Opens the crop dialog; the crop is
+ * applied before the clip fits or fills the frame, so what is kept is scaled
+ * up the way footage shot at that size would be.
+ */
+function CropField({
+  asset,
+  crop,
+  frame,
+  window,
+  startAt,
+  hint,
+  onChange,
+}: {
+  asset: Asset | undefined;
+  crop: Crop | undefined;
+  frame: Edl["output"];
+  /** The part of a video the clip plays, in source seconds, for the scrubber. */
+  window?: { from: number; to: number };
+  /** Where the scrubber starts: the source second under the playhead. */
+  startAt: () => number;
+  hint: string;
+  onChange: (crop: Crop | undefined) => void;
+}) {
+  const [open, setOpen] = useState<number | null>(null);
+  if (!asset) return null;
+  return (
+    <Field label="Crop">
+      <div className="flex items-center gap-2">
+        <button className={btnSecondary} onClick={() => setOpen(startAt())}>
+          <CropIcon className="w-4 h-4" /> {crop ? "Change crop" : "Crop"}
+        </button>
+        {crop && (
+          <button className={btnGhost} onClick={() => onChange(undefined)}>
+            Remove
+          </button>
+        )}
+      </div>
+      {open !== null && (
+        <CropDialog
+          asset={asset}
+          initial={crop}
+          frame={frame}
+          window={window}
+          startAt={open}
+          hint={hint}
+          onClose={() => setOpen(null)}
+          onApply={(next) => {
+            onChange(next);
+            setOpen(null);
+          }}
+        />
+      )}
+    </Field>
+  );
+}
+
+function CropDialog({
+  asset,
+  initial,
+  frame,
+  window: span,
+  startAt,
+  hint,
+  onClose,
+  onApply,
+}: {
+  asset: Asset;
+  initial: Crop | undefined;
+  frame: Edl["output"];
+  window?: { from: number; to: number };
+  startAt: number;
+  hint: string;
+  onClose: () => void;
+  onApply: (crop: Crop | undefined) => void;
+}) {
+  // As in the preview: the decoded frame's size, once the element has it.
+  const [decoded, setDecoded] = useState<Shape | null>(null);
+  const reported = useShapes([asset]).get(asset.id);
+  const shape = decoded ?? reported;
+  const noteSize = (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => {
+    const m = e.currentTarget;
+    const width = m instanceof HTMLVideoElement ? m.videoWidth : m.naturalWidth;
+    const height = m instanceof HTMLVideoElement ? m.videoHeight : m.naturalHeight;
+    if (width && height && (decoded?.width !== width || decoded?.height !== height)) setDecoded({ width, height });
+  };
+  const [crop, setCrop] = useState<Crop>(initial ?? FULL);
+  const [ratioKey, setRatioKey] = useState<CropRatio>("free");
+  const [t, setT] = useState(span ? Math.min(span.to, Math.max(span.from, startAt)) : 0);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  const ratioOfKey = (key: CropRatio): number | undefined => {
+    if (key === "free") return undefined;
+    if (key === "frame") return frame.width / frame.height;
+    const r = parseRatio(key)!;
+    return r.w / r.h;
+  };
+  const ratio = ratioOfKey(ratioKey);
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (v && v.readyState > 0 && Math.abs(v.currentTime - t) > 0.01) v.currentTime = t;
+  }, [t]);
+
+  const pickRatio = (key: CropRatio) => {
+    setRatioKey(key);
+    const r = ratioOfKey(key);
+    if (r && shape) setCrop(cropToRatio(shape, r, { x: crop.x + crop.width / 2, y: crop.y + crop.height / 2 }));
+  };
+
+  const drag = (handle: Handle | "move") => (e: React.PointerEvent) => {
+    if (!shape) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = boxRef.current!.getBoundingClientRect();
+    const from = crop;
+    const sx = e.clientX;
+    const sy = e.clientY;
+    const move = (ev: PointerEvent) => {
+      const dx = (ev.clientX - sx) / rect.width;
+      const dy = (ev.clientY - sy) / rect.height;
+      setCrop(handle === "move" ? moveCrop(from, dx, dy) : resizeCrop(from, handle, dx, dy, shape, ratio));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  // Arrow keys move the kept area; Shift moves it further.
+  const onKey = (e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? 0.1 : 0.01;
+    const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
+    if (!d) return;
+    e.preventDefault();
+    setCrop((c) => moveCrop(c, d[0], d[1]));
+  };
+
+  const video = isVideoAsset(asset);
+  const media = {
+    className: "absolute inset-0 w-full h-full pointer-events-none",
+    style: { objectFit: "fill" } as React.CSSProperties,
+  };
+  const kept = shape && croppedShape(shape, crop);
+  // "Video 9:16" already says 9:16: don't offer it twice.
+  const isFrameShape = (key: CropRatio) => {
+    const r = key !== "free" && key !== "frame" ? parseRatio(key) : null;
+    return !!r && sameShape({ width: r.w, height: r.h }, frame);
+  };
+  const ratioLabelFor = (key: CropRatio) =>
+    key === "free" ? "Free" : key === "frame" ? `Video ${ratioLabel(frame.width, frame.height)}` : key;
+
+  return (
+    <Dialog
+      title="Crop"
+      icon={<CropIcon className="w-4 h-4 text-muted" />}
+      description={hint}
+      size="lg"
+      onClose={onClose}
+      footer={
+        <>
+          <button
+            className={`${btnGhost} mr-auto`}
+            disabled={isFull(crop)}
+            onClick={() => {
+              setCrop(FULL);
+              setRatioKey("free");
+            }}
+          >
+            Reset
+          </button>
+          <button onClick={onClose} className={btnGhost}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button onClick={() => onApply(tidyCrop(crop))} className={btnPrimary} disabled={!shape} data-autofocus>
+            <Check className="w-4 h-4" /> Done
+          </button>
+        </>
+      }
+    >
+      <div className="mt-4">
+        <Choice<CropRatio>
+          label="Shape"
+          value={ratioKey}
+          options={CROP_RATIOS.filter((k) => !isFrameShape(k)).map((k) => [k, ratioLabelFor(k)])}
+          onChange={pickRatio}
+        />
+      </div>
+      <div className="mt-3 grid place-items-center rounded-md bg-surface-sunken p-3">
+        {shape ? (
+          <div
+            ref={boxRef}
+            className="relative select-none touch-none"
+            style={{
+              aspectRatio: `${shape.width} / ${shape.height}`,
+              width: `min(100%, calc(50vh * ${shape.width / shape.height}))`,
+            }}
+          >
+            {/* The picture and its dimming are clipped; the handles are not, so a corner on the edge stays whole. */}
+            <div className="absolute inset-0 overflow-hidden">
+              {video ? (
+                asset.media_uid ? (
+                  <MediaVideo
+                    asset={asset}
+                    elementRef={(v) => (videoRef.current = v)}
+                    onLoadedMetadata={(e) => {
+                      e.currentTarget.currentTime = t;
+                      noteSize(e);
+                    }}
+                    muted
+                    playsInline
+                    preload="auto"
+                    {...media}
+                  />
+                ) : (
+                  <video
+                    ref={videoRef}
+                    src={assetUrl(asset)}
+                    onLoadedMetadata={(e) => {
+                      e.currentTarget.currentTime = t;
+                      noteSize(e);
+                    }}
+                    muted
+                    playsInline
+                    preload="auto"
+                    {...media}
+                  />
+                )
+              ) : (
+                <img src={assetUrl(asset)} alt="" onLoad={noteSize} {...media} />
+              )}
+              <div
+                className="absolute pointer-events-none"
+                style={{ ...pct({ left: crop.x, top: crop.y, width: crop.width, height: crop.height }), boxShadow: "0 0 0 9999px rgb(0 0 0 / 0.55)" }}
+              />
+            </div>
+            {/* The kept area. */}
+            <div
+              role="group"
+              aria-label="Kept area. Arrow keys move it."
+              tabIndex={0}
+              onKeyDown={onKey}
+              onPointerDown={drag("move")}
+              className="absolute cursor-move outline outline-2 outline-white focus-visible:outline-ring"
+              style={pct({ left: crop.x, top: crop.y, width: crop.width, height: crop.height })}
+            >
+              {HANDLES.map(({ h, at, cursor }) => (
+                <span
+                  key={h}
+                  onPointerDown={drag(h)}
+                  className={`absolute ${at} -translate-x-1/2 -translate-y-1/2 grid place-items-center w-6 h-6`}
+                  style={{ cursor }}
+                  aria-hidden
+                >
+                  <span className="block w-2.5 h-2.5 rounded-xs bg-white shadow-raised" />
+                </span>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 py-16 text-body-sm text-muted">
+            <Loader2 className="w-4 h-4 animate-spin" /> Loading the picture…
+          </div>
+        )}
+      </div>
+      <div className="mt-2 flex items-center gap-3">
+        {video && span && span.to - span.from > 0.05 && (
+          <input
+            type="range"
+            className="flex-1"
+            aria-label="Frame to look at"
+            min={span.from}
+            max={span.to}
+            step={0.01}
+            value={t}
+            onChange={(e) => setT(Number(e.target.value))}
+          />
+        )}
+        {kept && shape && (
+          <span className="ml-auto text-fine text-faint tabular-nums">
+            Keeps {Math.round(kept.width)}×{Math.round(kept.height)} of {shape.width}×{shape.height}
+            {ratio === undefined && !isFull(crop) ? ` (${ratioLabel(Math.round(kept.width), Math.round(kept.height))})` : ""}
+          </span>
+        )}
+      </div>
+    </Dialog>
   );
 }
 
@@ -2945,6 +3346,7 @@ function Inspector({
   onDelete,
   brief,
   setBrief,
+  playheadRef,
 }: {
   pane: Pane;
   edl: Edl;
@@ -2957,6 +3359,8 @@ function Inspector({
   onDelete: () => void;
   brief: string;
   setBrief: (b: string) => void;
+  /** Read when the crop dialog opens, so the inspector need not re-render with the playhead. */
+  playheadRef: React.MutableRefObject<number>;
 }) {
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeMsg, setAnalyzeMsg] = useState("");
@@ -2991,6 +3395,27 @@ function Inspector({
       if (!el) return null;
       const set = (fn: (e: MainElement) => void) => update((d) => fn(d.main.elements[sel.i]));
       const dur = srcDur(el.src);
+      const seg = segments.find((x) => x.i === sel.i);
+      const mainCrop = (clip: MainElement) => {
+        const from = clip.type === "video" ? (clip.trimStart ?? 0) : 0;
+        return (
+          <CropField
+            asset={resolveAsset(clip.src)}
+            crop={clip.crop}
+            frame={edl.output}
+            window={clip.type === "video" && seg ? { from, to: from + seg.dur } : undefined}
+            // The frame under the playhead when it is on this clip, else the clip's first.
+            startAt={() => from + (seg ? Math.min(seg.dur, Math.max(0, playheadRef.current - seg.start)) : 0)}
+            hint="Keep part of the picture. What you keep fills the clip's place in the frame, scaled up the way it fits or fills."
+            onChange={(crop) =>
+              set((x) => {
+                if (crop) x.crop = crop;
+                else delete x.crop;
+              })
+            }
+          />
+        );
+      };
       return (
         <>
           <Zone>{el.type === "video" ? "Video clip" : "Image"}</Zone>
@@ -3006,10 +3431,12 @@ function Inspector({
               {el.fit === "cover" && (
                 <ClipFraming
                   asset={resolveAsset(el.src)}
+                  crop={el.crop}
                   frame={edl.output}
                   onChange={(anchor) => set((x) => ((x as MainVideo).anchor = anchor))}
                 />
               )}
+              {mainCrop(el)}
               <Row label="Clip audio">
                 <button
                   className={`${inputCls} text-left`}
@@ -3092,10 +3519,12 @@ function Inspector({
               {el.fit === "cover" && (
                 <ClipFraming
                   asset={resolveAsset(el.src)}
+                  crop={el.crop}
                   frame={edl.output}
                   onChange={(anchor) => set((x) => ((x as MainImage).anchor = anchor))}
                 />
               )}
+              {mainCrop(el)}
             </>
           )}
         </>
@@ -3131,6 +3560,27 @@ function Inspector({
             </>
           )}
           {el.type !== "text" && <SliderRow label="Width" value={(el as OverlayMedia).width} min={0.02} onChange={(n) => set((x) => ((x as OverlayMedia).width = n))} />}
+          {el.type !== "text" && (
+            <CropField
+              asset={resolveAsset(el.src)}
+              crop={el.crop}
+              frame={edl.output}
+              window={
+                el.type === "video"
+                  ? { from: el.trimStart ?? 0, to: (el.trimStart ?? 0) + el.duration }
+                  : undefined
+              }
+              startAt={() => (el.trimStart ?? 0) + Math.min(el.duration, Math.max(0, playheadRef.current - el.startTime))}
+              hint="Keep part of the picture. It keeps its width on screen, and its height follows what you keep."
+              onChange={(crop) =>
+                set((x) => {
+                  const m = x as OverlayMedia;
+                  if (crop) m.crop = crop;
+                  else delete m.crop;
+                })
+              }
+            />
+          )}
           <PositionRow
             el={el}
             frame={edl.output}

@@ -123,7 +123,15 @@ source's length (prefer it when working from analysis timestamps:
 `"contain"` (letterbox on the background color, default) or `"cover"` (fill
 and crop); on a `"cover"` clip, `anchor: { x, y }` (0..1, default 0.5/0.5)
 picks which part stays in frame, as CSS object-position does: `x: 0` keeps
-the left edge, `x: 1` the right, and only the side that spills over moves; `sourceAudio: false` mutes a clip's own sound; images need an
+the left edge, `x: 1` the right, and only the side that spills over moves;
+`crop: { x, y, width, height }` keeps one rectangle of the source frame, in
+shares of its width and height (`{ "x": 0.5, "y": 0, "width": 0.5, "height": 1 }`
+is the right half). The crop is cut out first, then fitted or filled like
+footage shot at that size, so a crop of the output's own shape on a `"cover"`
+clip shows exactly the crop. Media overlays take `crop` too (a face cut out
+of a screen recording for a picture-in-picture), and their height follows
+what is kept. Leave `crop` out to keep the whole frame;
+`sourceAudio: false` mutes a clip's own sound; images need an
 explicit `duration`. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
 `background` (`#RRGGBBAA` works). Media overlays: `width` as a fraction of
