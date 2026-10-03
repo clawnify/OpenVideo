@@ -60,4 +60,12 @@ describe("captionText", () => {
     const vertical = captionText(line, DEFAULT_CAPTION_STYLE, { width: 720, height: 1280 }, "c1");
     expect(vertical.fontSize).toBe(Math.round(0.055 * 1280));
   });
+
+  it("outlines a caption only when the style asks, in proportion to its size", () => {
+    expect(captionText(line, DEFAULT_CAPTION_STYLE, frame, "c1").stroke).toBeUndefined();
+    const outlined = { ...DEFAULT_CAPTION_STYLE, outline: true };
+    // 0.055 of 720 is a 40px font: a 3px outline. On a vertical video, 70px and 6px.
+    expect(captionText(line, outlined, frame, "c1").stroke).toEqual({ color: "#000000", width: 3 });
+    expect(captionText(line, outlined, { width: 720, height: 1280 }, "c1").stroke).toEqual({ color: "#000000", width: 6 });
+  });
 });

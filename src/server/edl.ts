@@ -20,10 +20,13 @@ export const MAX_SOURCES = 20;
 export const MAX_OUTPUT_SECONDS = 300; // 5 minutes
 export const MAX_TEXT_CHARS = 500;
 export const MAX_TRACKS = 10;
+export const MAX_STROKE_PX = 80; // a fifth of the largest fontSize; drawn at most a fifth of its own (shared/outline.ts)
 
 const hexColor = z
   .string()
   .regex(/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/, "expected #RGB, #RRGGBB or #RRGGBBAA");
+
+const opaqueColor = z.string().regex(/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/, "expected #RGB or #RRGGBB");
 
 // "asset:<id>" (this app's media library), staged "file:…", https URL, or an
 // inline data: URI. Library assets are the normal case.
@@ -115,6 +118,15 @@ const overlayText = z
     color: hexColor.optional(),
     /** Optional boxed background behind the text, e.g. "#00000080". */
     background: hexColor.optional(),
+    /** Optional outline around the letters, `width` px at output resolution.
+     *  Drawn at most a fifth of `fontSize` wide (`drawnStroke`), so shrinking
+     *  the text never makes the document invalid. Opaque only: the preview
+     *  draws it from overlapping copies, which would darken a translucent
+     *  colour where they meet. */
+    stroke: z
+      .object({ color: opaqueColor, width: z.number().int().min(1).max(MAX_STROKE_PX) })
+      .strict()
+      .optional(),
     align: z.enum(["left", "center", "right"]).optional(),
   })
   .strict();
@@ -162,6 +174,8 @@ const captionsSchema = z
         position: z.enum(["bottom", "top"]),
         margin: z.number().finite().min(0).max(0.5),
         background: z.boolean(),
+        /** A dark outline around the letters. Absent on projects made before it existed. */
+        outline: z.boolean().optional(),
         color: hexColor,
         maxChars: z.number().int().min(8).max(80),
       })

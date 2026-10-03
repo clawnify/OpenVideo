@@ -102,6 +102,7 @@ interface ReshapeText {
   fontSize: number;
   fontFamily?: FontFamily;
   background?: string;
+  stroke?: { color: string; width: number };
   align?: "left" | "center" | "right";
   x: number;
 }
@@ -120,6 +121,8 @@ interface Reshapeable {
 
 type Frame = { width: number; height: number };
 
+/** Widest stroke a document can hold; matches the schema's MAX_STROKE_PX. */
+const MAX_STROKE = 80;
 const round3 = (n: number) => Math.round(n * 1000) / 1000;
 /** A bound rounded towards the frame's inside, so rounding never pushes past it. */
 const inward = (n: number, dir: "up" | "down") => (dir === "up" ? Math.ceil(n * 1000) : Math.floor(n * 1000)) / 1000;
@@ -163,7 +166,9 @@ function reshapeText<T extends ReshapeText>(el: T, before: Frame, after: Frame, 
   const now = blockWidth(el.text, fontSize, after.width, family, boxed) / after.width;
   const inside = el.x - lead * was >= -0.001 && el.x + (1 - lead) * was <= 1.001;
   const x = inside ? clamp(el.x, inward(lead * now, "up"), inward(1 - (1 - lead) * now, "down")) : el.x;
-  return { ...el, fontSize, x: clamp(round3(x), 0, 1) };
+  // The outline keeps its weight relative to the letters.
+  const stroke = el.stroke && { ...el.stroke, width: clamp(Math.round(el.stroke.width * scale), 1, MAX_STROKE) };
+  return { ...el, fontSize, ...(stroke ? { stroke } : {}), x: clamp(round3(x), 0, 1) };
 }
 
 /**
