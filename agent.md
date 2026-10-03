@@ -17,13 +17,17 @@ a file as `asset:<id>`. Users upload from the editor's Media panel; you can
 upload with a multipart `POST /api/assets` (field `file`), which returns the
 new asset row.
 
-A video imported from Drive goes to the managed media service rather than this
-app's storage: it can be hours long, the service fetches it from the link
-itself, and the export reads only the seconds a cut needs. Such an asset
-carries `media_uid`, its `size` is 0, and it is not playable until
-`GET /api/assets/{id}/playback` answers `ready`. Everything else (stills,
-sound, uploads) stays in app storage, where a file has to be 500 MB or smaller
-to export.
+A video uploaded in the editor or imported from Drive goes to the managed
+media service rather than this app's storage: it can be hours long (up to
+30 GB), the bytes never pass through this app, and the export reads only the
+seconds a cut needs. Such an asset carries `media_uid` and is not playable
+until `GET /api/assets/{id}/playback` answers `ready`. The editor uploads a
+video in three steps: `POST /api/assets/uploads { name, size, type?, duration? }`
+returns a one-time resumable (tus) `upload_url`, the browser sends the file
+there, and `POST /api/assets/media { uid }` adds it to the library. An upload
+nobody registered is settled on its own: once finished it joins the library,
+and one left unfinished past its 6-hour link is deleted. Stills, sound, and anything posted to `POST /api/assets` stay
+in app storage, where a file has to be 500 MB or smaller to export.
 
 When the org has Google Drive (or Google Workspace) connected, files can also come from Google
 Drive: search with `GET /api/drive/files`, then `POST /api/drive/import` with a
@@ -41,7 +45,10 @@ back as `folders`); a search looks inside that folder only, never the subtree.
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET  | `/api/assets` | List uploaded media |
-| POST | `/api/assets` | Upload one file (multipart, field `file`) → the asset |
+| POST | `/api/assets` | Upload one file into app storage (multipart, field `file`) → the asset |
+| POST | `/api/assets/uploads` | `{ name, size, type?, duration? }` opens a resumable upload of a video on the media service → `{ uid, upload_url }` (503 `media_unavailable` in local dev) |
+| POST | `/api/assets/media` | `{ uid }` adds a finished upload to the library → the asset |
+| DELETE | `/api/assets/uploads/{uid}` | Cancels or discards an upload that has not joined the library |
 | POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
 | GET  | `/api/drive` | Whether Google Drive is connected: `{ connected }` |
 | GET  | `/api/drive/files?kind=media\|audio&q=&page=` | Search the org's Drive, newest first → `{ files, nextPageToken }` |
@@ -147,7 +154,7 @@ showing bars.
 32 } }` (`size` and `margin` are shares of the frame's height). The words come
 from each clip's transcript and the part of it the clip plays, so captions
 follow every trim, split and reorder; nothing is stored per caption. Only
-footage on the media service (imported from Drive) has a transcript: poll
+footage on the media service (uploaded in the editor, or imported from Drive) has a transcript: poll
 `GET /api/assets/{id}/transcript` until `status` is `ready` (`no_speech` for a
 silent clip, `unavailable` for footage in app storage). Languages: en, it, es,
 fr, de, nl, pt, pl, cs, ru, ja, ko. Use text overlays for titles and anything
