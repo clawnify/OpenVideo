@@ -125,7 +125,9 @@ export async function getUploadBytes(key: string): Promise<ArrayBuffer | null> {
   return obj.arrayBuffer();
 }
 
-export async function deleteUpload(key: string): Promise<void> {
+// R2 deletes one key or a batch in a single request (up to 1000 keys), so a
+// caller cleaning up several objects passes the whole array, not a call each.
+export async function deleteUpload(key: string | string[]): Promise<void> {
   await _bucket.delete(key);
 }
 

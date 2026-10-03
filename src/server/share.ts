@@ -12,12 +12,6 @@ export function makeShareToken(): string {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** Storage key of an export, from the `output_url` the export route writes. */
-export function exportKey(outputUrl: string | null): string | null {
-  const m = outputUrl?.match(/^\/api\/uploads\/(.+)$/);
-  return m ? decodeURIComponent(m[1]) : null;
-}
-
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
