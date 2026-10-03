@@ -59,7 +59,8 @@ back as `folders`); a search looks inside that folder only, never the subtree.
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
 | POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied }` |
 | DELETE | `/api/projects/{id}` | Delete a project and its export history |
-| POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job (blocks until done) |
+| POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job, `status: "exporting"` |
+| GET  | `/api/exports/{id}` | One export; read it until it is no longer `exporting` |
 | GET  | `/api/exports?project_id={id}` | Export history |
 
 ## The project document (EDL)
@@ -262,12 +263,19 @@ if the proposal misses the brief.
 
 `POST /api/projects/{id}/export` with optional
 `{ "quality": "draft" | "standard" | "high" }` (draft is fast — use it for
-review cuts, then export `high` for the final). The call blocks (up to a few
-minutes) and returns the job: `status: "completed"` with `output_url`,
-`duration`, `size` — or `status: "failed"` plus a `failure` object with the
-same `{ error, detail, path }` shape as validation, so you can fix the EDL and
-export again. Your library media is staged to the edit service automatically
-on first use; you never manage that.
+review cuts, then export `high` for the final). The call returns once the
+render is submitted, with the job at `status: "exporting"`. The render runs in
+the background, so read `GET /api/exports/{id}` every few seconds until the
+status changes: `"completed"` with `output_url`, `duration` and `size`, or
+`"failed"` with the reason in `error`. Each read is what collects a finished
+render, so keep reading; nothing arrives on its own. A long cut can take
+several minutes, longer if other renders for the org are queued ahead of it.
+
+If the EDL is refused before the render starts, the POST already returns
+`status: "failed"` plus a `failure` object with the same `{ error, detail,
+path }` shape as validation, so you can fix the EDL and export again. Your
+library media is staged to the edit service automatically on first use; you
+never manage that.
 
 ## Typical flow
 
