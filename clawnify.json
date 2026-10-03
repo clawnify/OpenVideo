@@ -17,6 +17,10 @@
     "storage": true,
     "credentials": ["googledrive", "googlesuper"]
   },
+  "api": {
+    "public_routes": [{ "path": "/s/**", "methods": ["GET", "HEAD"] }],
+    "server_routes": ["/s/*"]
+  },
   "deploy": {
     "title": "Deploy your OpenVideo studio",
     "subtitle": "Upload your footage, cut it on a timeline, add text and music, and export to MP4.",

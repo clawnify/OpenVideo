@@ -60,6 +60,17 @@ CREATE TABLE IF NOT EXISTS export_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_export_jobs_project ON export_jobs(project_id);
 
+-- A project's share link: anyone with /s/<token> can watch the export it is
+-- pinned to, without signing in. A later export (a draft, say) never reaches
+-- viewers until someone moves the pin. The token is the capability, so turning
+-- the link off deletes the row and turning it on again mints a new one.
+CREATE TABLE IF NOT EXISTS share_links (
+  token TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL UNIQUE,
+  export_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- App-wide settings, one row per key. Today only `drive_folder`: the Google
 -- Drive folder the picker is limited to, stored as JSON {"id","name"}. Absent
 -- means the whole Drive is browsable.
