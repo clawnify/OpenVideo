@@ -16,7 +16,7 @@ Most editors keep a project in a format built for their own app, not for you or 
 
 - **Timeline editor**: a main track of clips that play end to end, text on overlay tracks (colour, box and outline, for titles and captions alike), music on audio tracks. Trim, split, reorder and zoom, with filmstrips and waveforms.
 - **Live preview**: one master clock plays the cut back in the browser as you edit.
-- **Media library**: upload clips, stills and music, or import them from Google Drive, and use them in any project. Long footage goes to the managed media service, so a multi-gigabyte master plays and exports without passing through the app.
+- **Media library**: upload clips, stills and music, or import them from Google Drive, and use them in any project. Videos go straight to the managed media service, resumably and up to 30 GB, so a multi-gigabyte master plays, gets a transcript and exports without passing through the app. Each upload shows its progress, and one that drops picks up where it stopped.
 - **Formats**: 16:9, 9:16 for Reels, TikTok and Shorts, 1:1, 4:5 and 4:3, or the shape of your own footage. Titles and logos keep their size and place when the shape changes, and clips either fit with bars or fill the frame.
 - **Crop**: keep part of any clip, logo or picture-in-picture, free or held to 16:9, 9:16, 1:1, 4:5 or the video's own shape, with a scrubber to check the subject stays inside. The preview places a cropped clip exactly as the export does.
 - **Captions**: switch them on for the whole video, pick one of twelve languages and one style. The words come from each clip's transcript, so captions follow every trim, split and reorder.

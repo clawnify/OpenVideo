@@ -77,6 +77,7 @@ import {
   Type as TypeIcon,
   Upload,
   Wand2,
+  X,
   Eye,
   EyeOff,
   Volume2,
@@ -106,6 +107,7 @@ import {
   card,
   stretch,
 } from "./ui";
+import { cancelUpload, onUploaded, retryUpload, startUpload, useUploads, type UploadItem } from "./uploads";
 
 // ── shared shapes (validated server-side; these are view types) ─────────────
 
@@ -1398,8 +1400,8 @@ function LeftPanel({
   onAdd: (a: Asset) => void;
   onAddText: () => void;
 }) {
-  const [uploading, setUploading] = useState(false);
-  const [uploadErr, setUploadErr] = useState("");
+  const uploads = useUploads();
+  useEffect(() => onUploaded((a) => setAssets((prev) => (prev.some((x) => x.id === a.id) ? prev : [a, ...prev]))), [setAssets]);
   const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(assets);
   const [deleting, setDeleting] = useState<Asset | null>(null);
   const [deleteErr, setDeleteErr] = useState("");
@@ -1417,56 +1419,6 @@ function LeftPanel({
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
   const fileRef = useRef<HTMLInputElement>(null);
-
-  // Read the media length from the LOCAL file — instant, no server roundtrip,
-  // immune to moov-at-end layouts that make network probing crawl.
-  const probeLocal = (file: File): Promise<number | null> =>
-    new Promise((res) => {
-      if (!/^(video|audio)\//.test(file.type)) return res(null);
-      const url = URL.createObjectURL(file);
-      const media = document.createElement(file.type.startsWith("audio/") ? "audio" : "video");
-      media.preload = "metadata";
-      media.src = url;
-      const done = (d: number | null) => {
-        URL.revokeObjectURL(url);
-        res(d);
-      };
-      media.onloadedmetadata = () => done(Number.isFinite(media.duration) ? media.duration : null);
-      media.onerror = () => done(null);
-      setTimeout(() => done(null), 3_000);
-    });
-
-  const upload = async (file: File) => {
-    setUploading(true);
-    setUploadErr("");
-    try {
-      // Upload first — the duration probe trails behind as a PATCH so a slow
-      // probe can never delay (or appear to swallow) the upload itself.
-      const form = new FormData();
-      form.append("file", file);
-      const r = await fetch("/api/assets", { method: "POST", body: form });
-      if (!r.ok) throw new Error((await errJson(r)).error || "upload failed");
-      const created = (await r.json()) as Asset;
-      setAssets((prev) => [created, ...prev]);
-      probeLocal(file).then((d) => {
-        if (!d) return;
-        fetch(`/api/assets/${created.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ duration: d }),
-        })
-          .then(async (res) => {
-            const row = (await res.json()) as Asset;
-            if (row?.id) setAssets((prev) => prev.map((a) => (a.id === row.id ? row : a)));
-          })
-          .catch(() => {});
-      });
-    } catch (e) {
-      setUploadErr(`${file.name}: ${String((e as Error).message)}`);
-    } finally {
-      setUploading(false);
-    }
-  };
 
   const list =
     tab === "media" ? assets.filter((a) => isVideoAsset(a) || isImageAsset(a)) : tab === "audio" ? assets.filter(isAudioAsset) : [];
@@ -1518,10 +1470,9 @@ function LeftPanel({
           <>
             <button
               onClick={() => fileRef.current?.click()}
-              disabled={uploading}
-              className="w-full h-8 mb-2 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5 disabled:opacity-50"
+              className="w-full h-8 mb-2 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
             >
-              {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />} Upload
+              <Upload className="w-4 h-4" /> Upload
             </button>
             <button
               onClick={() => setDriveOpen(true)}
@@ -1547,10 +1498,10 @@ function LeftPanel({
                 // Reset so re-picking the SAME file fires change again —
                 // without this, retrying an upload silently does nothing.
                 e.target.value = "";
-                for (const f of files) upload(f);
+                for (const f of files) startUpload(f);
               }}
             />
-            {uploadErr && <div className="text-fine text-danger mb-2">{uploadErr}</div>}
+            {uploads.length > 0 && <UploadTray uploads={uploads} />}
             {deleteErr && <div className="text-fine text-danger mb-2">{deleteErr}</div>}
             {deleting && (
               <ConfirmDialog
@@ -1721,6 +1672,64 @@ interface DriveFolder {
   name: string;
 }
 
+/**
+ * Files on their way into the library, one row each: how far along, and a
+ * way to stop it. A failed one says why and offers Retry, which resumes a
+ * video from where it stopped rather than sending it again.
+ */
+function UploadTray({ uploads }: { uploads: UploadItem[] }) {
+  return (
+    <ul className="mb-3 space-y-1.5" aria-label="Uploads">
+      {uploads.map((u) => {
+        const pct = u.size ? Math.min(100, Math.round((u.sent / u.size) * 100)) : 0;
+        return (
+          <li key={u.id} className="rounded-sm bg-surface shadow-edge px-2 py-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="flex-1 min-w-0 truncate text-fine" title={u.name}>
+                {u.name}
+              </span>
+              {u.status === "failed" && (
+                <button onClick={() => retryUpload(u.id)} className="text-fine text-foreground hover:underline shrink-0">
+                  Retry
+                </button>
+              )}
+              <button
+                onClick={() => cancelUpload(u.id)}
+                className="grid place-items-center w-5 h-5 rounded-xs text-faint hover:text-foreground hover:bg-surface-sunken shrink-0"
+                aria-label={u.status === "failed" ? `Discard ${u.name}` : `Cancel uploading ${u.name}`}
+                title={u.status === "failed" ? "Discard" : "Cancel upload"}
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            {u.status === "failed" ? (
+              <p className="text-fine text-danger mt-0.5">{u.error}</p>
+            ) : (
+              <>
+                <div
+                  className="mt-1 h-1 rounded-full bg-border overflow-hidden"
+                  role="progressbar"
+                  aria-label={`Uploading ${u.name}`}
+                  aria-valuenow={pct}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                >
+                  <div className="h-full bg-primary transition-[width]" style={{ width: `${pct}%` }} />
+                </div>
+                <p className="text-fine text-muted mt-0.5 tabular-nums">
+                  {u.status === "finishing"
+                    ? "Adding to the library…"
+                    : `${pct}% of ${fmtBytes(u.size)}`}
+                </p>
+              </>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function fmtBytes(n: number | null): string {
   if (!n) return "";
   if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
@@ -1843,7 +1852,7 @@ const TRANSCRIPT_LABEL: Record<TranscriptState["status"], string> = {
   loading: "Checking…",
   ready: "Transcript ready",
   no_speech: "No speech found",
-  unavailable: "Uploaded file: no transcript. Import it from Google Drive to transcribe it.",
+  unavailable: "Kept in the app's own storage, which has no transcripts. Upload it again to get one.",
   preparing: "Still being prepared…",
   transcribing: "Transcribing…",
   error: "Could not load the transcript",
