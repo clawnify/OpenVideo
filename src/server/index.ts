@@ -1,16 +1,24 @@
-import { Hono } from "hono";
+import { Hono, type MiddlewareHandler } from "hono";
 import { initDB, query, get, run } from "./db";
 import {
   initUploads,
   putUpload,
   putUploadFromUrl,
-  getUpload,
-  getUploadRange,
   deleteUpload,
+  serveUpload,
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
-import { deleteMedia, frameUrl, importMedia, mediaPlayback, mediaState, mediaTranscript, prepareMedia } from "./media";
+import {
+  deleteMedia,
+  frameUrl,
+  importMedia,
+  mediaPlayback,
+  mediaState,
+  mediaTranscript,
+  openMediaUpload,
+  prepareMedia,
+} from "./media";
 import {
   DRIVE_FILE_ID,
   SHARED_WITH_ME,
@@ -24,6 +32,7 @@ import { starterEdl, validateEdl, type Edl } from "./edl";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
 import { instructEdit } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig } from "./export";
+import { makeShareToken, notePage, sharePage } from "./share";
 
 type Bindings = {
   DB: D1Database;
@@ -43,11 +52,13 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-app.use("/api/*", async (c, next) => {
+const init: MiddlewareHandler<{ Bindings: Bindings }> = async (c, next) => {
   initDB(c.env);
   initUploads(c.env.UPLOADS);
   await next();
-});
+};
+app.use("/api/*", init);
+app.use("/s/*", init);
 
 app.onError((err, c) => {
   console.error(err);
@@ -71,6 +82,7 @@ interface Asset {
 
 app.get("/api/assets", async (c) => {
   const rows = await query<Asset>("SELECT * FROM assets ORDER BY created_at DESC");
+  c.executionCtx.waitUntil(sweepUploads(c.env).catch((err) => console.error("upload sweep:", String(err))));
   return c.json(rows);
 });
 
@@ -94,6 +106,127 @@ app.post("/api/assets", async (c) => {
   );
   const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
   return c.json(row, 201);
+});
+
+// ── Video uploads, straight to the media service ──────────────────
+// A video is not posted to this app: the browser sends it to the media
+// service itself, resumably, so a clip of any size uploads and gets the same
+// playback, frames and transcript as one imported from Drive. Three steps:
+// open an upload, send the bytes (browser to service), then register the
+// asset.
+//
+// Each open upload has a `media_uploads` row from the moment it is opened
+// until it becomes an asset or is dropped. The row is the app's proof that the
+// video is its own, so a cancel or a discard can delete it at any stage, and
+// an upload whose browser went away is still settled: a finished one joins
+// the library, an expired one is deleted (sweepUploads).
+
+const MEDIA_UID = /^[0-9a-f]{32}$/;
+
+interface MediaUpload {
+  uid: string;
+  name: string;
+  content_type: string;
+  size: number;
+  duration: number | null;
+  created_at: string;
+}
+
+function mediaCfg(env: Bindings) {
+  return { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN };
+}
+
+/** Turn an open upload into a library asset. Safe to call twice: the asset key is unique. */
+async function promoteUpload(uid: string): Promise<Asset | null> {
+  await run(
+    `INSERT INTO assets (key, name, content_type, size, duration, media_uid)
+     SELECT 'media/' || uid, name, content_type, size, duration, uid FROM media_uploads WHERE uid = ?
+     ON CONFLICT(key) DO NOTHING`,
+    [uid],
+  );
+  await run("DELETE FROM media_uploads WHERE uid = ?", [uid]);
+  return (await get<Asset>("SELECT * FROM assets WHERE media_uid = ?", [uid])) ?? null;
+}
+
+// An upload link lives 6 hours on the service; past that, a pending upload
+// can never finish.
+const UPLOAD_SETTLE_MINUTES = 10;
+const UPLOAD_EXPIRED_HOURS = 7;
+
+/**
+ * Settle uploads the browser never finished registering (closed tab, lost
+ * connection). Left alone, a finished one would count against the org's
+ * footage allowance while appearing nowhere. Runs after a library listing,
+ * a few rows at a time, and only for rows old enough that no browser is
+ * still working on them.
+ */
+async function sweepUploads(env: Bindings): Promise<void> {
+  const stale = await query<MediaUpload>(
+    `SELECT * FROM media_uploads WHERE created_at < datetime('now', ?) ORDER BY created_at LIMIT 5`,
+    [`-${UPLOAD_SETTLE_MINUTES} minutes`],
+  );
+  for (const up of stale) {
+    const state = await mediaState(mediaCfg(env), up.uid);
+    if ("failure" in state) {
+      if (state.failure.error === "not_found") await run("DELETE FROM media_uploads WHERE uid = ?", [up.uid]);
+      continue;
+    }
+    if (state.media.state !== "pendingupload") {
+      await promoteUpload(up.uid);
+    } else if (Date.parse(up.created_at + "Z") < Date.now() - UPLOAD_EXPIRED_HOURS * 3600_000) {
+      await deleteMedia(mediaCfg(env), up.uid);
+      await run("DELETE FROM media_uploads WHERE uid = ?", [up.uid]);
+    }
+  }
+}
+
+app.post("/api/assets/uploads", async (c) => {
+  const b = await c.req
+    .json<{ name?: string; type?: string; size?: number; duration?: number }>()
+    .catch(() => ({}) as { name?: string; type?: string; size?: number; duration?: number });
+  if (!b.name || !b.size || !Number.isInteger(b.size) || b.size <= 0) {
+    return c.json({ error: "invalid_request", detail: "name and size are required" }, 400);
+  }
+  const duration = typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0 ? b.duration : null;
+  // Until it completes, an upload reserves its maximum length of the
+  // platform's video storage (released when the link expires). The browser
+  // read the real length from the file, so reserve that, with room for a
+  // probe that is a little short: a video longer than this is refused.
+  const maxDuration = duration ? Math.ceil(duration * 1.1 + 30) : undefined;
+  const name = b.name.slice(0, 200);
+  const opened = await openMediaUpload(mediaCfg(c.env), b.size, name, maxDuration);
+  // media_unavailable (local dev) tells the browser to post the file here instead.
+  if ("failure" in opened) return c.json(opened.failure, opened.failure.error === "media_unavailable" ? 503 : 422);
+  await run("INSERT INTO media_uploads (uid, name, content_type, size, duration) VALUES (?, ?, ?, ?, ?)", [
+    opened.id,
+    name,
+    b.type?.startsWith("video/") ? b.type : "video/mp4",
+    b.size,
+    duration,
+  ]);
+  return c.json({ uid: opened.id, upload_url: opened.uploadUrl }, 201);
+});
+
+// The bytes are in: the upload joins the library.
+app.post("/api/assets/media", async (c) => {
+  const b = await c.req.json<{ uid?: string }>().catch(() => ({}) as { uid?: string });
+  if (!b.uid || !MEDIA_UID.test(b.uid)) return c.json({ error: "invalid_request", detail: "uid is required" }, 400);
+  const asset = await promoteUpload(b.uid);
+  if (!asset) return c.json({ error: "not_found", detail: "no upload with that id was opened here" }, 404);
+  return c.json(asset, 201);
+});
+
+// Cancel or discard an upload that has not joined the library, at any stage.
+// Only one this app opened: footage in the library goes through
+// DELETE /api/assets/:id, which checks the projects first.
+app.delete("/api/assets/uploads/:uid", async (c) => {
+  const uid = c.req.param("uid");
+  if (!MEDIA_UID.test(uid) || !(await get<MediaUpload>("SELECT uid FROM media_uploads WHERE uid = ?", [uid]))) {
+    return c.json({ error: "not_found", detail: "no open upload with that id" }, 404);
+  }
+  await deleteMedia(mediaCfg(c.env), uid);
+  await run("DELETE FROM media_uploads WHERE uid = ?", [uid]);
+  return c.json({ ok: true });
 });
 
 // ── Google Drive (a source for the media library) ──────────────────
@@ -375,42 +508,12 @@ app.post("/api/assets/:id/analyze", async (c) => {
   return c.json(res.result);
 });
 
-// Serve any R2 object (uploaded media + exported videos). Range-aware: media
-// elements seek with byte ranges, and metadata probing of moov-at-end files
-// is unusably slow without 206 responses.
+// Serve any R2 object (uploaded media + exported videos), range-aware.
 app.get("/api/uploads/:key", async (c) => {
-  const key = c.req.param("key");
-  const range = c.req.header("Range");
-  const m = range?.match(/^bytes=(\d+)-(\d*)$/);
-
-  if (m) {
-    const start = Number(m[1]);
-    const end = m[2] ? Number(m[2]) : undefined;
-    const obj = await getUploadRange(key, start, end !== undefined ? end - start + 1 : undefined);
-    if (!obj) return c.json({ error: "Not found" }, 404);
-    const last = end !== undefined ? Math.min(end, obj.size - 1) : obj.size - 1;
-    return new Response(obj.data, {
-      status: 206,
-      headers: {
-        "Content-Type": obj.contentType,
-        "Content-Range": `bytes ${start}-${last}/${obj.size}`,
-        "Content-Length": String(last - start + 1),
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "public, max-age=31536000",
-      },
-    });
-  }
-
-  const obj = await getUpload(key);
-  if (!obj) return c.json({ error: "Not found" }, 404);
-  return new Response(obj.data, {
-    headers: {
-      "Content-Type": obj.contentType,
-      "Content-Length": String(obj.size),
-      "Accept-Ranges": "bytes",
-      "Cache-Control": "public, max-age=31536000",
-    },
+  const res = await serveUpload(c.req.param("key"), c.req.header("Range"), {
+    "Cache-Control": "public, max-age=31536000",
   });
+  return res ?? c.json({ error: "Not found" }, 404);
 });
 
 // ── Edit projects (footage EDL) ──────────────────────────────────────
@@ -665,6 +768,7 @@ app.delete("/api/projects/:id", async (c) => {
   );
   const keys = jobs.map((j) => renderKey(j.output_url)).filter((k): k is string => k !== null);
   if (keys.length) await deleteUpload(keys).catch(() => {});
+  await run("DELETE FROM share_links WHERE project_id = ?", [id]);
   await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM edit_projects WHERE id = ?", [id]);
   return c.json({ ok: true });
@@ -797,6 +901,117 @@ app.post("/api/projects/:id/export", async (c) => {
 
   const job = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [jobId]);
   return c.json(job, 201);
+});
+
+// ── Share by link ────────────────────────────────────────────────────
+// One link per project, pinned to one finished export. Exporting again does
+// not change what viewers see (drafts are exports too); moving the pin to the
+// newest export is a deliberate step. Turning the link off deletes the token,
+// and turning it on again gives a new address.
+
+interface ShareLink {
+  token: string;
+  project_id: string;
+  export_id: number;
+  created_at: string;
+}
+
+/** The project's newest finished export, which a link is pinned to on create or update. */
+async function latestExport(projectId: string) {
+  return get<Pick<ExportJob, "id" | "output_url" | "updated_at">>(
+    "SELECT id, output_url, updated_at FROM export_jobs WHERE project_id = ? AND status = 'completed' ORDER BY id DESC LIMIT 1",
+    [projectId],
+  );
+}
+
+async function shareOut(c: { req: { url: string } }, projectId: string) {
+  const link = await get<ShareLink & { exported_at: string }>(
+    `SELECT s.*, e.updated_at AS exported_at FROM share_links s JOIN export_jobs e ON e.id = s.export_id
+      WHERE s.project_id = ?`,
+    [projectId],
+  );
+  const latest = await latestExport(projectId);
+  if (!link) return { url: null, can_share: Boolean(latest) };
+  return {
+    url: new URL(`/s/${link.token}`, c.req.url).toString(),
+    export_id: link.export_id,
+    exported_at: link.exported_at,
+    // A finished export newer than the one viewers see.
+    newer_export: latest && latest.id !== link.export_id ? latest.id : null,
+    created_at: link.created_at,
+  };
+}
+
+app.get("/api/projects/:id/share", async (c) => c.json(await shareOut(c, c.req.param("id"))));
+
+// Turns the link on, or moves it to the newest export. The token is kept, so
+// the address already sent out keeps working.
+app.put("/api/projects/:id/share", async (c) => {
+  const id = c.req.param("id");
+  const project = await get<{ id: string }>("SELECT id FROM edit_projects WHERE id = ?", [id]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+  const latest = await latestExport(id);
+  if (!latest) {
+    return c.json({ error: "nothing_exported", detail: "export the project first; a link plays a finished export" }, 409);
+  }
+  await run(
+    `INSERT INTO share_links (token, project_id, export_id) VALUES (?, ?, ?)
+       ON CONFLICT(project_id) DO UPDATE SET export_id = excluded.export_id`,
+    [makeShareToken(), id, latest.id],
+  );
+  return c.json(await shareOut(c, id));
+});
+
+app.delete("/api/projects/:id/share", async (c) => {
+  await run("DELETE FROM share_links WHERE project_id = ?", [c.req.param("id")]);
+  return c.json({ url: null, can_share: true });
+});
+
+// The public half: the only routes reachable without signing in (clawnify.json
+// `api.public_routes`). A token that matches no row is indistinguishable from
+// one that never existed.
+
+/** The link's project and the export it is pinned to, if the link is live. */
+async function sharedExport(token: string) {
+  return get<{ name: string; export_id: number; output_url: string | null }>(
+    `SELECT p.name, s.export_id, e.output_url
+       FROM share_links s
+       JOIN edit_projects p ON p.id = s.project_id
+       JOIN export_jobs e ON e.id = s.export_id AND e.status = 'completed'
+      WHERE s.token = ?`,
+    [token],
+  );
+}
+
+const PUBLIC_HEADERS = { "X-Robots-Tag": "noindex", "Referrer-Policy": "no-referrer" };
+
+app.get("/s/:token", async (c) => {
+  c.header("Cache-Control", "no-store");
+  for (const [k, v] of Object.entries(PUBLIC_HEADERS)) c.header(k, v);
+  const shared = await sharedExport(c.req.param("token"));
+  if (!shared) {
+    return c.html(notePage("This link doesn't work", "It may have been turned off. Ask whoever sent it for a new one."), 404);
+  }
+  return c.html(sharePage(shared.name, `/s/${encodeURIComponent(c.req.param("token"))}/video?v=${shared.export_id}`));
+});
+
+// `v` names the export the page was rendered with. Only the pinned one is
+// served: a stale `v` (the pin moved meanwhile) gets a 404 rather than another
+// file's bytes mid-playback, and other cuts are never reachable by guessing ids.
+app.get("/s/:token/video", async (c) => {
+  const shared = await sharedExport(c.req.param("token"));
+  const key = renderKey(shared?.output_url);
+  const v = c.req.query("v");
+  if (!shared || !key || (v !== undefined && v !== String(shared.export_id))) {
+    return c.text("Not found", 404, PUBLIC_HEADERS);
+  }
+  const download = c.req.query("download") !== undefined;
+  const res = await serveUpload(key, c.req.header("Range"), {
+    ...PUBLIC_HEADERS,
+    "Cache-Control": "no-store",
+    ...(download ? { "Content-Disposition": `attachment; filename="${makeKey(shared.name)}.mp4"` } : {}),
+  });
+  return res ?? c.text("Not found", 404, PUBLIC_HEADERS);
 });
 
 // ── helpers ──────────────────────────────────────────────────────────

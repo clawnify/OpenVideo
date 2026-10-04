@@ -102,6 +102,27 @@ export async function importMedia(
   return "failure" in res ? res : { media: res.data };
 }
 
+/**
+ * Open an upload the browser sends the file to itself, resumably (tus). The
+ * bytes go straight to the service and never pass through this app, so a
+ * phone clip of several gigabytes uploads as easily as a short one.
+ *
+ * Until it completes, an upload holds `maxDurationSeconds` of the org's
+ * storage, so pass the clip's real length when it is known.
+ */
+export async function openMediaUpload(
+  cfg: MediaConfig,
+  size: number,
+  name: string,
+  maxDurationSeconds?: number,
+): Promise<{ id: string; uploadUrl: string } | { failure: MediaFailure }> {
+  const res = await call<{ id: string; upload_url: string }>(cfg, "/uploads", {
+    method: "POST",
+    body: JSON.stringify({ size, name, ...(maxDurationSeconds ? { max_duration_seconds: maxDurationSeconds } : {}) }),
+  });
+  return "failure" in res ? res : { id: res.data.id, uploadUrl: res.data.upload_url };
+}
+
 export async function mediaState(cfg: MediaConfig, uid: string): Promise<{ media: MediaState } | { failure: MediaFailure }> {
   const res = await call<MediaState>(cfg, `/${uid}`);
   return "failure" in res ? res : { media: res.data };

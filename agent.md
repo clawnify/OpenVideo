@@ -17,13 +17,17 @@ a file as `asset:<id>`. Users upload from the editor's Media panel; you can
 upload with a multipart `POST /api/assets` (field `file`), which returns the
 new asset row.
 
-A video imported from Drive goes to the managed media service rather than this
-app's storage: it can be hours long, the service fetches it from the link
-itself, and the export reads only the seconds a cut needs. Such an asset
-carries `media_uid`, its `size` is 0, and it is not playable until
-`GET /api/assets/{id}/playback` answers `ready`. Everything else (stills,
-sound, uploads) stays in app storage, where a file has to be 500 MB or smaller
-to export.
+A video uploaded in the editor or imported from Drive goes to the managed
+media service rather than this app's storage: it can be hours long (up to
+30 GB), the bytes never pass through this app, and the export reads only the
+seconds a cut needs. Such an asset carries `media_uid` and is not playable
+until `GET /api/assets/{id}/playback` answers `ready`. The editor uploads a
+video in three steps: `POST /api/assets/uploads { name, size, type?, duration? }`
+returns a one-time resumable (tus) `upload_url`, the browser sends the file
+there, and `POST /api/assets/media { uid }` adds it to the library. An upload
+nobody registered is settled on its own: once finished it joins the library,
+and one left unfinished past its 6-hour link is deleted. Stills, sound, and anything posted to `POST /api/assets` stay
+in app storage, where a file has to be 500 MB or smaller to export.
 
 When the org has Google Drive (or Google Workspace) connected, files can also come from Google
 Drive: search with `GET /api/drive/files`, then `POST /api/drive/import` with a
@@ -41,7 +45,10 @@ back as `folders`); a search looks inside that folder only, never the subtree.
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET  | `/api/assets` | List uploaded media |
-| POST | `/api/assets` | Upload one file (multipart, field `file`) → the asset |
+| POST | `/api/assets` | Upload one file into app storage (multipart, field `file`) → the asset |
+| POST | `/api/assets/uploads` | `{ name, size, type?, duration? }` opens a resumable upload of a video on the media service → `{ uid, upload_url }` (503 `media_unavailable` in local dev) |
+| POST | `/api/assets/media` | `{ uid }` adds a finished upload to the library → the asset |
+| DELETE | `/api/assets/uploads/{uid}` | Cancels or discards an upload that has not joined the library |
 | POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
 | GET  | `/api/drive` | Whether Google Drive is connected: `{ connected }` |
 | GET  | `/api/drive/files?kind=media\|audio&q=&page=` | Search the org's Drive, newest first → `{ files, nextPageToken }` |
@@ -62,6 +69,9 @@ back as `folders`); a search looks inside that folder only, never the subtree.
 | POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job, `status: "exporting"` |
 | GET  | `/api/exports/{id}` | One export; read it until it is no longer `exporting` |
 | GET  | `/api/exports?project_id={id}` | Export history |
+| GET  | `/api/projects/{id}/share` | The project's share link → `{ url, export_id, newer_export }` (`url: null` when off) |
+| PUT  | `/api/projects/{id}/share` | Turn the link on, or move it to the newest export → `{ url }`; the address stays the same |
+| DELETE | `/api/projects/{id}/share` | Turn the link off; the address stops working for everyone |
 
 ## The project document (EDL)
 
@@ -110,7 +120,7 @@ A complete document:
   ],
   "audio": [
     { "id": "music", "elements": [
-      { "id": "bed", "type": "audio", "src": "asset:7d2a5f8c1e4b9036", "startTime": 0, "volume": 0.35 }
+      { "id": "bed", "type": "audio", "src": "asset:7d2a5f8c1e4b9036", "startTime": 0, "volume": 0.35, "fadeIn": 1, "fadeOut": 2 }
     ]}
   ]
 }
@@ -124,12 +134,28 @@ source's length (prefer it when working from analysis timestamps:
 `"contain"` (letterbox on the background color, default) or `"cover"` (fill
 and crop); on a `"cover"` clip, `anchor: { x, y }` (0..1, default 0.5/0.5)
 picks which part stays in frame, as CSS object-position does: `x: 0` keeps
-the left edge, `x: 1` the right, and only the side that spills over moves; `sourceAudio: false` mutes a clip's own sound; images need an
+the left edge, `x: 1` the right, and only the side that spills over moves;
+`crop: { x, y, width, height }` keeps one rectangle of the source frame, in
+shares of its width and height (`{ "x": 0.5, "y": 0, "width": 0.5, "height": 1 }`
+is the right half). The crop is cut out first, then fitted or filled like
+footage shot at that size, so a crop of the output's own shape on a `"cover"`
+clip shows exactly the crop. Media overlays take `crop` too (a face cut out
+of a screen recording for a picture-in-picture), and their height follows
+what is kept. Leave `crop` out to keep the whole frame;
+`sourceAudio: false` mutes a clip's own sound; images need an
 explicit `duration`. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
-`background` (`#RRGGBBAA` works). Media overlays: `width` as a fraction of
+`background` (`#RRGGBBAA` works), optional `stroke: { "color": "#000000",
+"width": 4 }` for an outline around the letters (opaque colour; `width` in px
+at output resolution, drawn outside them and at most a fifth of `fontSize`,
+since a wider outline fills the letters in; white text with a black stroke
+reads on any footage without a box). Media overlays: `width` as a fraction of
 canvas width, height keeps aspect. Audio elements: `volume` 0..2, `duration`
-defaults to the source's length minus trims. Output duration (sum of the main
+defaults to the source's length minus trims; `fadeIn` and `fadeOut` are
+seconds (0..30) of ramp from and to silence. The fade-out ends where the clip
+is last heard, which is the end of the video when the clip runs past it, so
+music laid under a shorter cut needs no trimming to end cleanly: set
+`fadeOut: 2` and leave its length alone. Output duration (sum of the main
 track) maxes at 5 minutes.
 
 **Format** (the video's shape) is `output.width` x `output.height`: even
@@ -137,18 +163,20 @@ numbers, at most 3840x2160. At the default resolution the presets are 1280x720
 (16:9), 720x1280 (9:16, Reels, TikTok, Shorts), 1280x1280 (1:1), 1024x1280
 (4:5, Instagram feed) and 1280x960 (4:3). To reshape a finished edit, ask for
 it through `/instruct` ("make it vertical"): it applies the editor's own rule,
-which keeps the long side, scales `fontSize` by the change in the short side
+which keeps the long side, scales `fontSize` (and a text `stroke`) by the change in the short side
 and keeps each logo's size on screen and the side of the frame it sits on.
 Clips keep their `fit`; set `"cover"` on each to fill the new frame instead of
 showing bars.
 
 **Captions** are a project setting, not overlays: an optional `captions` block,
 `{ "enabled": true, "lang": "en", "style": { "size": 0.055, "position":
-"bottom", "margin": 0.08, "background": true, "color": "#ffffff", "maxChars":
-32 } }` (`size` and `margin` are shares of the frame's height). The words come
+"bottom", "margin": 0.08, "background": true, "outline": false, "color":
+"#ffffff", "maxChars": 32 } }` (`size` and `margin` are shares of the frame's
+height; `outline` draws a black outline sized to the text, with or without
+the box). The words come
 from each clip's transcript and the part of it the clip plays, so captions
 follow every trim, split and reorder; nothing is stored per caption. Only
-footage on the media service (imported from Drive) has a transcript: poll
+footage on the media service (uploaded in the editor, or imported from Drive) has a transcript: poll
 `GET /api/assets/{id}/transcript` until `status` is `ready` (`no_speech` for a
 silent clip, `unavailable` for footage in app storage). Languages: en, it, es,
 fr, de, nl, pt, pl, cs, ru, ja, ko. Use text overlays for titles and anything
@@ -277,6 +305,19 @@ path }` shape as validation, so you can fix the EDL and export again. Your
 library media is staged to the edit service automatically on first use; you
 never manage that.
 
+### Sharing
+
+`output_url` only opens for people signed in to this workspace. To send the
+video to anyone else (a client, a reviewer), `PUT /api/projects/{id}/share`
+once an export has finished, and give them the returned `url`: a page that plays
+that export, with a Download button, no sign-in. The link is pinned to the
+export that was newest when you called it, so a later draft never reaches
+viewers. After exporting the version they should see, `PUT` again: the same
+address now plays it (`newer_export` in the response tells you one exists).
+With nothing exported the call answers 409 `nothing_exported`. Only turn the
+link off (`DELETE`) when the user asks: it cannot be brought back, and a new
+link gets a new address.
+
 ## Typical flow
 
 1. Get the purpose and set it as the project's `brief` (ask if you don't know).
@@ -284,4 +325,5 @@ never manage that.
 3. Several raw clips: `POST /api/projects/{id}/autocut`. One clip: analyze it,
    then write the main track from the keep segments.
 4. Adjust with read → transform → `PUT`, fixing anything validation points at.
-5. Export `draft` to review, then `high` for the final, and share `output_url`.
+5. Export `draft` to review, then `high` for the final. To send it to someone
+   outside the workspace, turn on the share link and give them its `url`.

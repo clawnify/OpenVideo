@@ -11,6 +11,7 @@ import { get, run } from "./db";
 import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
 import { mediaState, prepareMedia } from "./media";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
+import { drawnStroke } from "../shared/outline";
 import { captionText, captionTimeline, type PlacedClip } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
@@ -202,8 +203,9 @@ function layoutText(edl: Edl): Edl {
         const lines = wrapLines(el.text, el.fontSize, W, family);
         const step = lineStep(el.fontSize, !!el.background) / H;
         const top = fitTop(el.y, blockHeight(el.text, el.fontSize, W, family, !!el.background), H);
+        const stroke = drawnStroke(el.stroke, el.fontSize);
         return lines
-          .map((line, n) => ({ ...el, id: `${el.id}-l${n}`, text: line, y: Math.min(1, top + n * step) }))
+          .map((line, n) => ({ ...el, ...(stroke ? { stroke } : {}), id: `${el.id}-l${n}`, text: line, y: Math.min(1, top + n * step) }))
           .filter((line) => line.text.trim().length > 0);
       }),
     })),

@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { splitClip } from "../shared/split";
+import { drawnStroke, maxStrokeWidth, outlineShadow } from "../shared/outline";
 import {
   DEFAULT_CAPTIONS,
   captionText,
@@ -22,6 +23,19 @@ import {
   type ProjectCaptions,
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
+import { fadeGain, heardFor } from "../shared/fade";
+import {
+  FULL,
+  cropToRatio,
+  croppedShape,
+  isFull,
+  moveCrop,
+  placeClip,
+  resizeCrop,
+  tidyCrop,
+  type Crop,
+  type Handle,
+} from "../shared/crop";
 import {
   CENTRE,
   FORMAT_PRESETS,
@@ -45,10 +59,12 @@ import {
   AlignStartVertical,
   Check,
   ChevronRight,
+  Crop as CropIcon,
   Cloud,
   Film,
   Folder,
   Image as ImageIcon,
+  Link2,
   Loader2,
   Music,
   Pause,
@@ -62,6 +78,7 @@ import {
   Type as TypeIcon,
   Upload,
   Wand2,
+  X,
   Eye,
   EyeOff,
   Volume2,
@@ -91,6 +108,7 @@ import {
   card,
   stretch,
 } from "./ui";
+import { cancelUpload, onUploaded, retryUpload, startUpload, useUploads, type UploadItem } from "./uploads";
 
 // ── shared shapes (validated server-side; these are view types) ─────────────
 
@@ -119,6 +137,8 @@ interface MainVideo {
   fit?: "contain" | "cover";
   /** Which part of a filled frame is kept (shared/format.ts). */
   anchor?: Anchor;
+  /** The part of the source kept, cut out before fitting (shared/crop.ts). */
+  crop?: Crop;
 }
 interface MainImage {
   id: string;
@@ -127,6 +147,7 @@ interface MainImage {
   duration: number;
   fit?: "contain" | "cover";
   anchor?: Anchor;
+  crop?: Crop;
 }
 type MainElement = MainVideo | MainImage;
 
@@ -142,6 +163,7 @@ interface OverlayMedia {
   opacity?: number;
   trimStart?: number;
   trimEnd?: number;
+  crop?: Crop;
 }
 interface OverlayText {
   id: string;
@@ -156,6 +178,8 @@ interface OverlayText {
   fontFamily?: "sans" | "serif" | "mono";
   color?: string;
   background?: string;
+  /** Outline around the letters, `width` px at output resolution. */
+  stroke?: { color: string; width: number };
   align?: "left" | "center" | "right";
 }
 type OverlayElement = OverlayMedia | OverlayText;
@@ -174,6 +198,9 @@ interface AudioElement {
   trimStart?: number;
   trimEnd?: number;
   volume?: number;
+  /** Seconds of ramp from silence, and to silence where the clip is last heard (shared/fade.ts). */
+  fadeIn?: number;
+  fadeOut?: number;
 }
 interface AudioTrack {
   id: string;
@@ -248,6 +275,8 @@ const api = {
 // defaults for a caption, and the design tokens do not apply inside a frame.
 const DEFAULT_TEXT_COLOR = "#ffffff";
 const DEFAULT_TEXT_BOX = "#00000080";
+/** What the Stroke controls start from: a black outline at 0 px is "none". */
+const DEFAULT_TEXT_STROKE = { color: "#000000", width: 4 };
 
 const rid = () => Math.random().toString(36).slice(2, 10);
 /**
@@ -478,7 +507,7 @@ function TextOnStage({
   selected = false,
   onPointerDown,
 }: {
-  t: Pick<OverlayText, "text" | "fontSize" | "fontFamily" | "color" | "background" | "opacity" | "align" | "x" | "y">;
+  t: Pick<OverlayText, "text" | "fontSize" | "fontFamily" | "color" | "background" | "stroke" | "opacity" | "align" | "x" | "y">;
   frame: Edl["output"];
   scale: number;
   selected?: boolean;
@@ -489,6 +518,7 @@ function TextOnStage({
   const lines = wrapLines(t.text, t.fontSize, frame.width, family);
   const step = lineStep(t.fontSize, !!t.background) / frame.height;
   const top = fitTop(t.y, blockHeight(t.text, t.fontSize, frame.width, family, !!t.background), frame.height);
+  const stroke = drawnStroke(t.stroke, t.fontSize);
   return (
     <>
       {lines.map((line, n) =>
@@ -506,6 +536,8 @@ function TextOnStage({
               color: t.color ?? DEFAULT_TEXT_COLOR,
               background: t.background,
               padding: t.background ? `${0.3 * t.fontSize * scale}px ${0.45 * t.fontSize * scale}px` : undefined,
+              // Round-joined, like the export's; see shared/outline.ts.
+              textShadow: stroke ? outlineShadow(stroke.width * scale, stroke.color) : undefined,
               opacity: t.opacity ?? 1,
               textAlign: t.align ?? "left",
             }}
@@ -1044,6 +1076,41 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     return () => window.removeEventListener("keydown", onKey);
   });
 
+  // Transport and edit shortcuts, the ones an editor is expected to answer to:
+  // Space plays or pauses, Cmd/Ctrl+B splits at the playhead, the arrows step
+  // the playhead (a frame, or a second with Shift), Home/End jump to the ends.
+  // Ignored while typing; Space yields to a focused button so it still clicks,
+  // and the arrows leave Cmd/Alt (browser history, word jumps) alone.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+      const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
+      if (e.key === " " && plain) {
+        if (el?.closest("button, a, [role='button']")) return;
+        e.preventDefault();
+        setPlaying((p) => !p);
+      } else if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        splitAtPlayhead();
+      } else if (e.key === "ArrowLeft" && plain) {
+        e.preventDefault();
+        seek(playheadRef.current - (e.shiftKey ? 1 : 1 / edlRef.current.output.fps));
+      } else if (e.key === "ArrowRight" && plain) {
+        e.preventDefault();
+        seek(playheadRef.current + (e.shiftKey ? 1 : 1 / edlRef.current.output.fps));
+      } else if (e.key === "Home" && plain) {
+        e.preventDefault();
+        seek(0);
+      } else if (e.key === "End" && plain) {
+        e.preventDefault();
+        seek(total);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {/* Project bar. The name edits in place — there is no edit mode and no
@@ -1095,6 +1162,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         >
           <Sparkles className="w-4 h-4" /> <span className="hidden sm:inline">Auto-cut</span>
         </button>
+        <ShareControl projectId={initial.id} />
         <ExportControls projectId={initial.id} disabled={dirty.current || edl.main.elements.length === 0} />
       </div>
 
@@ -1191,6 +1259,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           onDelete={deleteSelected}
           brief={brief}
           setBrief={setBrief}
+          playheadRef={playheadRef}
         />
       </div>
 
@@ -1335,8 +1404,8 @@ function LeftPanel({
   onAdd: (a: Asset) => void;
   onAddText: () => void;
 }) {
-  const [uploading, setUploading] = useState(false);
-  const [uploadErr, setUploadErr] = useState("");
+  const uploads = useUploads();
+  useEffect(() => onUploaded((a) => setAssets((prev) => (prev.some((x) => x.id === a.id) ? prev : [a, ...prev]))), [setAssets]);
   const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(assets);
   const [deleting, setDeleting] = useState<Asset | null>(null);
   const [deleteErr, setDeleteErr] = useState("");
@@ -1354,56 +1423,6 @@ function LeftPanel({
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
   const fileRef = useRef<HTMLInputElement>(null);
-
-  // Read the media length from the LOCAL file — instant, no server roundtrip,
-  // immune to moov-at-end layouts that make network probing crawl.
-  const probeLocal = (file: File): Promise<number | null> =>
-    new Promise((res) => {
-      if (!/^(video|audio)\//.test(file.type)) return res(null);
-      const url = URL.createObjectURL(file);
-      const media = document.createElement(file.type.startsWith("audio/") ? "audio" : "video");
-      media.preload = "metadata";
-      media.src = url;
-      const done = (d: number | null) => {
-        URL.revokeObjectURL(url);
-        res(d);
-      };
-      media.onloadedmetadata = () => done(Number.isFinite(media.duration) ? media.duration : null);
-      media.onerror = () => done(null);
-      setTimeout(() => done(null), 3_000);
-    });
-
-  const upload = async (file: File) => {
-    setUploading(true);
-    setUploadErr("");
-    try {
-      // Upload first — the duration probe trails behind as a PATCH so a slow
-      // probe can never delay (or appear to swallow) the upload itself.
-      const form = new FormData();
-      form.append("file", file);
-      const r = await fetch("/api/assets", { method: "POST", body: form });
-      if (!r.ok) throw new Error((await errJson(r)).error || "upload failed");
-      const created = (await r.json()) as Asset;
-      setAssets((prev) => [created, ...prev]);
-      probeLocal(file).then((d) => {
-        if (!d) return;
-        fetch(`/api/assets/${created.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ duration: d }),
-        })
-          .then(async (res) => {
-            const row = (await res.json()) as Asset;
-            if (row?.id) setAssets((prev) => prev.map((a) => (a.id === row.id ? row : a)));
-          })
-          .catch(() => {});
-      });
-    } catch (e) {
-      setUploadErr(`${file.name}: ${String((e as Error).message)}`);
-    } finally {
-      setUploading(false);
-    }
-  };
 
   const list =
     tab === "media" ? assets.filter((a) => isVideoAsset(a) || isImageAsset(a)) : tab === "audio" ? assets.filter(isAudioAsset) : [];
@@ -1455,10 +1474,9 @@ function LeftPanel({
           <>
             <button
               onClick={() => fileRef.current?.click()}
-              disabled={uploading}
-              className="w-full h-8 mb-2 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5 disabled:opacity-50"
+              className="w-full h-8 mb-2 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
             >
-              {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />} Upload
+              <Upload className="w-4 h-4" /> Upload
             </button>
             <button
               onClick={() => setDriveOpen(true)}
@@ -1484,10 +1502,10 @@ function LeftPanel({
                 // Reset so re-picking the SAME file fires change again —
                 // without this, retrying an upload silently does nothing.
                 e.target.value = "";
-                for (const f of files) upload(f);
+                for (const f of files) startUpload(f);
               }}
             />
-            {uploadErr && <div className="text-fine text-danger mb-2">{uploadErr}</div>}
+            {uploads.length > 0 && <UploadTray uploads={uploads} />}
             {deleteErr && <div className="text-fine text-danger mb-2">{deleteErr}</div>}
             {deleting && (
               <ConfirmDialog
@@ -1658,6 +1676,64 @@ interface DriveFolder {
   name: string;
 }
 
+/**
+ * Files on their way into the library, one row each: how far along, and a
+ * way to stop it. A failed one says why and offers Retry, which resumes a
+ * video from where it stopped rather than sending it again.
+ */
+function UploadTray({ uploads }: { uploads: UploadItem[] }) {
+  return (
+    <ul className="mb-3 space-y-1.5" aria-label="Uploads">
+      {uploads.map((u) => {
+        const pct = u.size ? Math.min(100, Math.round((u.sent / u.size) * 100)) : 0;
+        return (
+          <li key={u.id} className="rounded-sm bg-surface shadow-edge px-2 py-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="flex-1 min-w-0 truncate text-fine" title={u.name}>
+                {u.name}
+              </span>
+              {u.status === "failed" && (
+                <button onClick={() => retryUpload(u.id)} className="text-fine text-foreground hover:underline shrink-0">
+                  Retry
+                </button>
+              )}
+              <button
+                onClick={() => cancelUpload(u.id)}
+                className="grid place-items-center w-5 h-5 rounded-xs text-faint hover:text-foreground hover:bg-surface-sunken shrink-0"
+                aria-label={u.status === "failed" ? `Discard ${u.name}` : `Cancel uploading ${u.name}`}
+                title={u.status === "failed" ? "Discard" : "Cancel upload"}
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            {u.status === "failed" ? (
+              <p className="text-fine text-danger mt-0.5">{u.error}</p>
+            ) : (
+              <>
+                <div
+                  className="mt-1 h-1 rounded-full bg-border overflow-hidden"
+                  role="progressbar"
+                  aria-label={`Uploading ${u.name}`}
+                  aria-valuenow={pct}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                >
+                  <div className="h-full bg-primary transition-[width]" style={{ width: `${pct}%` }} />
+                </div>
+                <p className="text-fine text-muted mt-0.5 tabular-nums">
+                  {u.status === "finishing"
+                    ? "Adding to the library…"
+                    : `${pct}% of ${fmtBytes(u.size)}`}
+                </p>
+              </>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function fmtBytes(n: number | null): string {
   if (!n) return "";
   if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
@@ -1780,7 +1856,7 @@ const TRANSCRIPT_LABEL: Record<TranscriptState["status"], string> = {
   loading: "Checking…",
   ready: "Transcript ready",
   no_speech: "No speech found",
-  unavailable: "Uploaded file: no transcript. Import it from Google Drive to transcribe it.",
+  unavailable: "Kept in the app's own storage, which has no transcripts. Upload it again to get one.",
   preparing: "Still being prepared…",
   transcribing: "Transcribing…",
   error: "Could not load the transcript",
@@ -1892,6 +1968,12 @@ function CaptionsPanel({
           value={cfg.style.background}
           options={[[true, "Box"], [false, "No box"]]}
           onChange={(background) => setStyle({ background })}
+        />
+        <Choice
+          label="Outline"
+          value={!!cfg.style.outline}
+          options={[[true, "Outline"], [false, "No outline"]]}
+          onChange={(outline) => setStyle({ outline })}
         />
         <label className="flex items-center justify-between gap-2 text-fine text-muted">
           Text color
@@ -2302,6 +2384,29 @@ function Player({
   }, [edl.output.width, edl.output.height]);
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
+  const cutLength = segments.reduce((n, s) => n + s.dur, 0);
+
+  // A cropped clip is placed from its source's own size (shared/crop.ts).
+  const cropped: Asset[] = [];
+  for (const el of [...edl.main.elements, ...(edl.overlays ?? []).flatMap((t) => t.elements)]) {
+    const a = el.type !== "text" && el.crop ? resolveAsset(el.src) : undefined;
+    if (a) cropped.push(a);
+  }
+  const shapes = useShapes(cropped);
+  // The decoded frame's own size wins once the element has it: it is the
+  // upright picture the export crops, whatever the media service reports.
+  const [decoded, setDecoded] = useState(new Map<string, Shape>());
+  const noteSize = (id: string) => (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => {
+    const m = e.currentTarget;
+    const width = m instanceof HTMLVideoElement ? m.videoWidth : m.naturalWidth;
+    const height = m instanceof HTMLVideoElement ? m.videoHeight : m.naturalHeight;
+    if (!width || !height) return;
+    setDecoded((cur) => {
+      const was = cur.get(id);
+      return was && was.width === width && was.height === height ? cur : new Map(cur).set(id, { width, height });
+    });
+  };
+  const shapeFor = (a: Asset) => decoded.get(a.id) ?? shapes.get(a.id);
 
   // The playing video's position on the timeline, for the master clock.
   const activeRef = useRef(active);
@@ -2350,7 +2455,9 @@ function Player({
         const wanted = (el.trimStart ?? 0) + (t - el.startTime);
         if (inWindow && playing && !track.muted) {
           if (Math.abs(a.currentTime - wanted) > 0.25) a.currentTime = wanted;
-          a.volume = Math.min(1, el.volume ?? 1);
+          // The export's afade envelope, so fades sound in the preview as they will in the file.
+          const gain = fadeGain(el, heardFor(el.startTime, dur, cutLength), t - el.startTime);
+          a.volume = Math.min(1, el.volume ?? 1) * gain;
           if (a.paused) a.play().catch(() => {});
         } else if (!a.paused) a.pause();
       }
@@ -2412,7 +2519,7 @@ function Player({
     // Until the clip has loaded there is no frame to slide.
     if (!natural?.width || !natural.height) return;
     e.preventDefault();
-    const overflow = coverOverflow(natural, edl.output);
+    const overflow = coverOverflow(croppedShape(natural, onScreen.crop), edl.output);
     const rect = stageRef.current!.getBoundingClientRect();
     const from = onScreen.anchor ?? CENTRE;
     const startX = e.clientX;
@@ -2457,38 +2564,55 @@ function Player({
             const visible = seg === active && seg.dur > 0;
             const fit = seg.el.fit ?? "contain";
             const at = fit === "cover" ? (seg.el.anchor ?? CENTRE) : CENTRE;
+            const shape = seg.el.crop ? shapeFor(a) : undefined;
+            // A cropped clip: the box is the kept part, placed as the export
+            // places it, and the whole source is drawn inside it and clipped.
+            const place = shape ? placeClip(shape, seg.el.crop, edl.output, fit, seg.el.anchor) : undefined;
             const common = {
-              className: `absolute inset-0 w-full h-full ${visible ? "" : "hidden"}`,
-              // object-position is the export's crop offset, so both frame it alike.
-              style: { objectFit: fit, objectPosition: `${at.x * 100}% ${at.y * 100}%` } as React.CSSProperties,
+              className: place ? "absolute max-w-none" : "absolute inset-0 w-full h-full",
+              style: (place
+                ? { ...pct(place.source), objectFit: "fill" }
+                : // object-position is the export's crop offset, so both frame it alike.
+                  { objectFit: fit, objectPosition: `${at.x * 100}% ${at.y * 100}%` }) as React.CSSProperties,
               "data-clip": seg.el.id,
+              onLoadedMetadata: noteSize(a.id),
+              onLoad: noteSize(a.id),
             };
-            return seg.el.type === "video" ? (
-              a.media_uid ? (
-                <MediaVideo
-                  key={seg.el.id}
-                  asset={a}
-                  elementRef={(v) => {
-                    if (v) videoRefs.current.set(seg.el.id, v);
-                  }}
-                  preload="auto"
-                  playsInline
-                  {...common}
-                />
-              ) : (
-                <video
-                  key={seg.el.id}
-                  ref={(v) => {
-                    if (v) videoRefs.current.set(seg.el.id, v);
-                  }}
-                  src={assetUrl(a)}
-                  preload="auto"
-                  playsInline
-                  {...common}
-                />
-              )
-            ) : (
-              <img key={seg.el.id} src={assetUrl(a)} {...common} />
+            // The same wrapper either way, so cropping never reloads the video.
+            return (
+              <div
+                key={seg.el.id}
+                className={`absolute ${place ? "overflow-hidden" : "inset-0"} ${visible ? "" : "hidden"}`}
+                style={place ? pct(place.box) : undefined}
+              >
+                {seg.el.type === "video" ? (
+                  a.media_uid ? (
+                    <MediaVideo
+                      key={seg.el.id}
+                      asset={a}
+                      elementRef={(v) => {
+                        if (v) videoRefs.current.set(seg.el.id, v);
+                      }}
+                      preload="auto"
+                      playsInline
+                      {...common}
+                    />
+                  ) : (
+                    <video
+                      key={seg.el.id}
+                      ref={(v) => {
+                        if (v) videoRefs.current.set(seg.el.id, v);
+                      }}
+                      src={assetUrl(a)}
+                      preload="auto"
+                      playsInline
+                      {...common}
+                    />
+                  )
+                ) : (
+                  <img key={seg.el.id} src={assetUrl(a)} {...common} />
+                )}
+              </div>
             );
           })}
 
@@ -2528,6 +2652,31 @@ function Player({
                   const m = el as OverlayMedia;
                   const a = resolveAsset(m.src);
                   if (!a) return null;
+                  const shape = m.crop ? shapeFor(a) : undefined;
+                  if (shape && m.crop) {
+                    const kept = croppedShape(shape, m.crop);
+                    const { source } = placeClip(shape, m.crop, kept, "contain");
+                    return (
+                      <div
+                        key={el.id}
+                        onPointerDown={dragOverlay(ti, i)}
+                        className={`absolute cursor-move overflow-hidden ${selected ? "outline outline-2 outline-ring" : ""}`}
+                        style={{
+                          left: `${m.x * 100}%`,
+                          top: `${m.y * 100}%`,
+                          width: `${m.width * 100}%`,
+                          aspectRatio: `${kept.width} / ${kept.height}`,
+                          opacity: m.opacity ?? 1,
+                        }}
+                      >
+                        {m.type === "image" ? (
+                          <img src={assetUrl(a)} className="absolute max-w-none pointer-events-none" style={pct(source)} />
+                        ) : (
+                          <video src={assetUrl(a)} muted className="absolute max-w-none pointer-events-none" style={{ ...pct(source), objectFit: "fill" }} />
+                        )}
+                      </div>
+                    );
+                  }
                   return (
                     <div
                       key={el.id}
@@ -2536,9 +2685,9 @@ function Player({
                       style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: m.opacity ?? 1 }}
                     >
                       {m.type === "image" ? (
-                        <img src={assetUrl(a)} className="w-full h-auto pointer-events-none" />
+                        <img src={assetUrl(a)} onLoad={noteSize(a.id)} className="w-full h-auto pointer-events-none" />
                       ) : (
-                        <video src={assetUrl(a)} muted className="w-full h-auto pointer-events-none" />
+                        <video src={assetUrl(a)} onLoadedMetadata={noteSize(a.id)} muted className="w-full h-auto pointer-events-none" />
                       )}
                     </div>
                   );
@@ -2572,6 +2721,14 @@ function Player({
     </div>
   );
 }
+
+/** A rectangle in shares of its container, as CSS. */
+const pct = (r: { left: number; top: number; width: number; height: number }): React.CSSProperties => ({
+  left: `${r.left * 100}%`,
+  top: `${r.top * 100}%`,
+  width: `${r.width * 100}%`,
+  height: `${r.height * 100}%`,
+});
 
 // ── format ──────────────────────────────────────────────────────────────────
 
@@ -2840,17 +2997,19 @@ function ClipsFit({ edl, update }: { edl: Edl; update: (fn: (d: Edl) => void) =>
  */
 function ClipFraming({
   asset,
+  crop,
   frame,
   onChange,
 }: {
   asset: Asset | undefined;
+  crop: Crop | undefined;
   frame: Edl["output"];
   onChange: (anchor: Anchor) => void;
 }) {
   const shapes = useShapes(asset ? [asset] : []);
   const shape = asset && shapes.get(asset.id);
   if (!shape) return null;
-  const overflow = coverOverflow(shape, frame);
+  const overflow = coverOverflow(croppedShape(shape, crop), frame);
   const sideways = overflow.x > 0.005;
   if (!sideways && overflow.y <= 0.005) return null;
 
@@ -2899,6 +3058,315 @@ function ClipFit({ value, onChange }: { value?: Fit; onChange: (fit: Fit) => voi
   );
 }
 
+// ── crop ────────────────────────────────────────────────────────────────────
+
+/** The shapes a crop can be held to. "frame" is the video's own shape. */
+const CROP_RATIOS = ["free", "frame", "16:9", "9:16", "1:1", "4:5"] as const;
+type CropRatio = (typeof CROP_RATIOS)[number];
+
+const HANDLES: { h: Handle; at: string; cursor: string }[] = [
+  { h: "nw", at: "left-0 top-0", cursor: "nwse-resize" },
+  { h: "n", at: "left-1/2 top-0", cursor: "ns-resize" },
+  { h: "ne", at: "left-full top-0", cursor: "nesw-resize" },
+  { h: "e", at: "left-full top-1/2", cursor: "ew-resize" },
+  { h: "se", at: "left-full top-full", cursor: "nwse-resize" },
+  { h: "s", at: "left-1/2 top-full", cursor: "ns-resize" },
+  { h: "sw", at: "left-0 top-full", cursor: "nesw-resize" },
+  { h: "w", at: "left-0 top-1/2", cursor: "ew-resize" },
+];
+
+/**
+ * The part of the picture a clip keeps. Opens the crop dialog; the crop is
+ * applied before the clip fits or fills the frame, so what is kept is scaled
+ * up the way footage shot at that size would be.
+ */
+function CropField({
+  asset,
+  crop,
+  frame,
+  window,
+  startAt,
+  hint,
+  onChange,
+}: {
+  asset: Asset | undefined;
+  crop: Crop | undefined;
+  frame: Edl["output"];
+  /** The part of a video the clip plays, in source seconds, for the scrubber. */
+  window?: { from: number; to: number };
+  /** Where the scrubber starts: the source second under the playhead. */
+  startAt: () => number;
+  hint: string;
+  onChange: (crop: Crop | undefined) => void;
+}) {
+  const [open, setOpen] = useState<number | null>(null);
+  if (!asset) return null;
+  return (
+    <Field label="Crop">
+      <div className="flex items-center gap-2">
+        <button className={btnSecondary} onClick={() => setOpen(startAt())}>
+          <CropIcon className="w-4 h-4" /> {crop ? "Change crop" : "Crop"}
+        </button>
+        {crop && (
+          <button className={btnGhost} onClick={() => onChange(undefined)}>
+            Remove
+          </button>
+        )}
+      </div>
+      {open !== null && (
+        <CropDialog
+          asset={asset}
+          initial={crop}
+          frame={frame}
+          window={window}
+          startAt={open}
+          hint={hint}
+          onClose={() => setOpen(null)}
+          onApply={(next) => {
+            onChange(next);
+            setOpen(null);
+          }}
+        />
+      )}
+    </Field>
+  );
+}
+
+function CropDialog({
+  asset,
+  initial,
+  frame,
+  window: span,
+  startAt,
+  hint,
+  onClose,
+  onApply,
+}: {
+  asset: Asset;
+  initial: Crop | undefined;
+  frame: Edl["output"];
+  window?: { from: number; to: number };
+  startAt: number;
+  hint: string;
+  onClose: () => void;
+  onApply: (crop: Crop | undefined) => void;
+}) {
+  // As in the preview: the decoded frame's size, once the element has it.
+  const [decoded, setDecoded] = useState<Shape | null>(null);
+  const reported = useShapes([asset]).get(asset.id);
+  const shape = decoded ?? reported;
+  const noteSize = (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => {
+    const m = e.currentTarget;
+    const width = m instanceof HTMLVideoElement ? m.videoWidth : m.naturalWidth;
+    const height = m instanceof HTMLVideoElement ? m.videoHeight : m.naturalHeight;
+    if (width && height && (decoded?.width !== width || decoded?.height !== height)) setDecoded({ width, height });
+  };
+  const [crop, setCrop] = useState<Crop>(initial ?? FULL);
+  const [ratioKey, setRatioKey] = useState<CropRatio>("free");
+  const [t, setT] = useState(span ? Math.min(span.to, Math.max(span.from, startAt)) : 0);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  const ratioOfKey = (key: CropRatio): number | undefined => {
+    if (key === "free") return undefined;
+    if (key === "frame") return frame.width / frame.height;
+    const r = parseRatio(key)!;
+    return r.w / r.h;
+  };
+  const ratio = ratioOfKey(ratioKey);
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (v && v.readyState > 0 && Math.abs(v.currentTime - t) > 0.01) v.currentTime = t;
+  }, [t]);
+
+  const pickRatio = (key: CropRatio) => {
+    setRatioKey(key);
+    const r = ratioOfKey(key);
+    if (r && shape) setCrop(cropToRatio(shape, r, { x: crop.x + crop.width / 2, y: crop.y + crop.height / 2 }));
+  };
+
+  const drag = (handle: Handle | "move") => (e: React.PointerEvent) => {
+    if (!shape) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = boxRef.current!.getBoundingClientRect();
+    const from = crop;
+    const sx = e.clientX;
+    const sy = e.clientY;
+    const move = (ev: PointerEvent) => {
+      const dx = (ev.clientX - sx) / rect.width;
+      const dy = (ev.clientY - sy) / rect.height;
+      setCrop(handle === "move" ? moveCrop(from, dx, dy) : resizeCrop(from, handle, dx, dy, shape, ratio));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  // Arrow keys move the kept area; Shift moves it further.
+  const onKey = (e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? 0.1 : 0.01;
+    const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
+    if (!d) return;
+    e.preventDefault();
+    setCrop((c) => moveCrop(c, d[0], d[1]));
+  };
+
+  const video = isVideoAsset(asset);
+  const media = {
+    className: "absolute inset-0 w-full h-full pointer-events-none",
+    style: { objectFit: "fill" } as React.CSSProperties,
+  };
+  const kept = shape && croppedShape(shape, crop);
+  // "Video 9:16" already says 9:16: don't offer it twice.
+  const isFrameShape = (key: CropRatio) => {
+    const r = key !== "free" && key !== "frame" ? parseRatio(key) : null;
+    return !!r && sameShape({ width: r.w, height: r.h }, frame);
+  };
+  const ratioLabelFor = (key: CropRatio) =>
+    key === "free" ? "Free" : key === "frame" ? `Video ${ratioLabel(frame.width, frame.height)}` : key;
+
+  return (
+    <Dialog
+      title="Crop"
+      icon={<CropIcon className="w-4 h-4 text-muted" />}
+      description={hint}
+      size="lg"
+      onClose={onClose}
+      footer={
+        <>
+          <button
+            className={`${btnGhost} mr-auto`}
+            disabled={isFull(crop)}
+            onClick={() => {
+              setCrop(FULL);
+              setRatioKey("free");
+            }}
+          >
+            Reset
+          </button>
+          <button onClick={onClose} className={btnGhost}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button onClick={() => onApply(tidyCrop(crop))} className={btnPrimary} disabled={!shape} data-autofocus>
+            <Check className="w-4 h-4" /> Done
+          </button>
+        </>
+      }
+    >
+      <div className="mt-4">
+        <Choice<CropRatio>
+          label="Shape"
+          value={ratioKey}
+          options={CROP_RATIOS.filter((k) => !isFrameShape(k)).map((k) => [k, ratioLabelFor(k)])}
+          onChange={pickRatio}
+        />
+      </div>
+      <div className="mt-3 grid place-items-center rounded-md bg-surface-sunken p-3">
+        {shape ? (
+          <div
+            ref={boxRef}
+            className="relative select-none touch-none"
+            style={{
+              aspectRatio: `${shape.width} / ${shape.height}`,
+              width: `min(100%, calc(50vh * ${shape.width / shape.height}))`,
+            }}
+          >
+            {/* The picture and its dimming are clipped; the handles are not, so a corner on the edge stays whole. */}
+            <div className="absolute inset-0 overflow-hidden">
+              {video ? (
+                asset.media_uid ? (
+                  <MediaVideo
+                    asset={asset}
+                    elementRef={(v) => (videoRef.current = v)}
+                    onLoadedMetadata={(e) => {
+                      e.currentTarget.currentTime = t;
+                      noteSize(e);
+                    }}
+                    muted
+                    playsInline
+                    preload="auto"
+                    {...media}
+                  />
+                ) : (
+                  <video
+                    ref={videoRef}
+                    src={assetUrl(asset)}
+                    onLoadedMetadata={(e) => {
+                      e.currentTarget.currentTime = t;
+                      noteSize(e);
+                    }}
+                    muted
+                    playsInline
+                    preload="auto"
+                    {...media}
+                  />
+                )
+              ) : (
+                <img src={assetUrl(asset)} alt="" onLoad={noteSize} {...media} />
+              )}
+              <div
+                className="absolute pointer-events-none"
+                style={{ ...pct({ left: crop.x, top: crop.y, width: crop.width, height: crop.height }), boxShadow: "0 0 0 9999px rgb(0 0 0 / 0.55)" }}
+              />
+            </div>
+            {/* The kept area. */}
+            <div
+              role="group"
+              aria-label="Kept area. Arrow keys move it."
+              tabIndex={0}
+              onKeyDown={onKey}
+              onPointerDown={drag("move")}
+              className="absolute cursor-move outline outline-2 outline-white focus-visible:outline-ring"
+              style={pct({ left: crop.x, top: crop.y, width: crop.width, height: crop.height })}
+            >
+              {HANDLES.map(({ h, at, cursor }) => (
+                <span
+                  key={h}
+                  onPointerDown={drag(h)}
+                  className={`absolute ${at} -translate-x-1/2 -translate-y-1/2 grid place-items-center w-6 h-6`}
+                  style={{ cursor }}
+                  aria-hidden
+                >
+                  <span className="block w-2.5 h-2.5 rounded-xs bg-white shadow-raised" />
+                </span>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 py-16 text-body-sm text-muted">
+            <Loader2 className="w-4 h-4 animate-spin" /> Loading the picture…
+          </div>
+        )}
+      </div>
+      <div className="mt-2 flex items-center gap-3">
+        {video && span && span.to - span.from > 0.05 && (
+          <input
+            type="range"
+            className="flex-1"
+            aria-label="Frame to look at"
+            min={span.from}
+            max={span.to}
+            step={0.01}
+            value={t}
+            onChange={(e) => setT(Number(e.target.value))}
+          />
+        )}
+        {kept && shape && (
+          <span className="ml-auto text-fine text-faint tabular-nums">
+            Keeps {Math.round(kept.width)}×{Math.round(kept.height)} of {shape.width}×{shape.height}
+            {ratio === undefined && !isFull(crop) ? ` (${ratioLabel(Math.round(kept.width), Math.round(kept.height))})` : ""}
+          </span>
+        )}
+      </div>
+    </Dialog>
+  );
+}
+
 // ── inspector ───────────────────────────────────────────────────────────────
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -2934,6 +3402,49 @@ function SliderRow({ label, value, onChange, min = 0, max = 1, step = 0.01 }: { 
   );
 }
 
+/**
+ * Fade in and out for an audio clip. The fade-out ends where the clip is last
+ * heard, so on music longer than the cut it ends with the video.
+ */
+function AudioFades({
+  el,
+  heard,
+  onChange,
+}: {
+  el: AudioElement;
+  heard: number;
+  onChange: (key: "fadeIn" | "fadeOut", seconds: number) => void;
+}) {
+  const row = (key: "fadeIn" | "fadeOut", label: string) => {
+    // Ten seconds covers fades set by hand; a longer one set by an agent widens
+    // the slider rather than being misreported. Past what is heard a fade does
+    // nothing more, so the slider stops there.
+    const set = el[key] ?? 0;
+    const max = Math.max(0.1, Math.floor(Math.min(heard, Math.max(10, set)) * 10) / 10);
+    const v = Math.min(set, max);
+    return (
+      <Row label={`${label} — ${v > 0 ? `${v.toFixed(1)}s` : "off"}`}>
+        <input
+          type="range"
+          className="w-full"
+          aria-label={label}
+          value={v}
+          min={0}
+          max={max}
+          step={0.1}
+          onChange={(e) => onChange(key, Number(e.target.value))}
+        />
+      </Row>
+    );
+  };
+  return (
+    <>
+      {row("fadeIn", "Fade in")}
+      {row("fadeOut", "Fade out")}
+    </>
+  );
+}
+
 function Inspector({
   pane,
   edl,
@@ -2945,6 +3456,7 @@ function Inspector({
   onDelete,
   brief,
   setBrief,
+  playheadRef,
 }: {
   pane: Pane;
   edl: Edl;
@@ -2957,6 +3469,8 @@ function Inspector({
   onDelete: () => void;
   brief: string;
   setBrief: (b: string) => void;
+  /** Read when the crop dialog opens, so the inspector need not re-render with the playhead. */
+  playheadRef: React.MutableRefObject<number>;
 }) {
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeMsg, setAnalyzeMsg] = useState("");
@@ -2991,6 +3505,27 @@ function Inspector({
       if (!el) return null;
       const set = (fn: (e: MainElement) => void) => update((d) => fn(d.main.elements[sel.i]));
       const dur = srcDur(el.src);
+      const seg = segments.find((x) => x.i === sel.i);
+      const mainCrop = (clip: MainElement) => {
+        const from = clip.type === "video" ? (clip.trimStart ?? 0) : 0;
+        return (
+          <CropField
+            asset={resolveAsset(clip.src)}
+            crop={clip.crop}
+            frame={edl.output}
+            window={clip.type === "video" && seg ? { from, to: from + seg.dur } : undefined}
+            // The frame under the playhead when it is on this clip, else the clip's first.
+            startAt={() => from + (seg ? Math.min(seg.dur, Math.max(0, playheadRef.current - seg.start)) : 0)}
+            hint="Keep part of the picture. What you keep fills the clip's place in the frame, scaled up the way it fits or fills."
+            onChange={(crop) =>
+              set((x) => {
+                if (crop) x.crop = crop;
+                else delete x.crop;
+              })
+            }
+          />
+        );
+      };
       return (
         <>
           <Zone>{el.type === "video" ? "Video clip" : "Image"}</Zone>
@@ -3006,10 +3541,12 @@ function Inspector({
               {el.fit === "cover" && (
                 <ClipFraming
                   asset={resolveAsset(el.src)}
+                  crop={el.crop}
                   frame={edl.output}
                   onChange={(anchor) => set((x) => ((x as MainVideo).anchor = anchor))}
                 />
               )}
+              {mainCrop(el)}
               <Row label="Clip audio">
                 <button
                   className={`${inputCls} text-left`}
@@ -3092,10 +3629,12 @@ function Inspector({
               {el.fit === "cover" && (
                 <ClipFraming
                   asset={resolveAsset(el.src)}
+                  crop={el.crop}
                   frame={edl.output}
                   onChange={(anchor) => set((x) => ((x as MainImage).anchor = anchor))}
                 />
               )}
+              {mainCrop(el)}
             </>
           )}
         </>
@@ -3128,9 +3667,66 @@ function Inspector({
                   <input className={inputCls} value={el.background ?? ""} placeholder="#00000080" onChange={(e) => set((x) => ((x as OverlayText).background = e.target.value || undefined))} />
                 </Row>
               </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Row label="Stroke">
+                  {/* Dimmed while there is no outline; picking a colour adds one. */}
+                  <input
+                    type="color"
+                    className={`field p-1 ${el.stroke ? "" : "opacity-40"}`}
+                    title={el.stroke ? undefined : "No outline: pick a colour to add one"}
+                    value={(el.stroke?.color ?? DEFAULT_TEXT_STROKE.color).slice(0, 7)}
+                    onChange={(e) =>
+                      set((x) => {
+                        const t = x as OverlayText;
+                        t.stroke = { color: e.target.value, width: t.stroke?.width ?? Math.min(DEFAULT_TEXT_STROKE.width, maxStrokeWidth(t.fontSize)) };
+                      })
+                    }
+                  />
+                </Row>
+                <NumberRow
+                  label="Width (px)"
+                  value={el.stroke?.width ?? 0}
+                  step={1}
+                  min={0}
+                  max={maxStrokeWidth(el.fontSize)}
+                  onChange={(n) =>
+                    set((x) => {
+                      const t = x as OverlayText;
+                      const width = Math.round(Math.min(maxStrokeWidth(t.fontSize), Math.max(0, n || 0)));
+                      t.stroke = width > 0 ? { color: t.stroke?.color ?? DEFAULT_TEXT_STROKE.color, width } : undefined;
+                    })
+                  }
+                />
+              </div>
+              {el.stroke && el.stroke.width > maxStrokeWidth(el.fontSize) && (
+                <p className="text-fine text-muted -mt-2 mb-3">
+                  Drawn at {maxStrokeWidth(el.fontSize)} px: an outline is at most a fifth of the font size.
+                </p>
+              )}
             </>
           )}
           {el.type !== "text" && <SliderRow label="Width" value={(el as OverlayMedia).width} min={0.02} onChange={(n) => set((x) => ((x as OverlayMedia).width = n))} />}
+          {el.type !== "text" && (
+            <CropField
+              asset={resolveAsset(el.src)}
+              crop={el.crop}
+              frame={edl.output}
+              window={
+                el.type === "video"
+                  ? { from: el.trimStart ?? 0, to: (el.trimStart ?? 0) + el.duration }
+                  : undefined
+              }
+              startAt={() => (el.trimStart ?? 0) + Math.min(el.duration, Math.max(0, playheadRef.current - el.startTime))}
+              hint="Keep part of the picture. It keeps its width on screen, and its height follows what you keep."
+              onChange={(crop) =>
+                set((x) => {
+                  const m = x as OverlayMedia;
+                  if (crop) m.crop = crop;
+                  else delete m.crop;
+                })
+              }
+            />
+          )}
           <PositionRow
             el={el}
             frame={edl.output}
@@ -3148,10 +3744,18 @@ function Inspector({
     const el = edl.audio?.[sel.ti]?.elements[sel.i];
     if (!el) return null;
     const set = (fn: (e: AudioElement) => void) => update((d) => fn(d.audio![sel.ti].elements[sel.i]));
+    const clipDur = el.duration ?? Math.max(0, (srcDur(el.src) ?? 0) - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
+    const heard = heardFor(el.startTime, clipDur, segments.reduce((n, s) => n + s.dur, 0));
     return (
       <>
         <Zone>Audio</Zone>
         <SliderRow label="Volume" value={el.volume ?? 1} max={2} onChange={(n) => set((x) => (x.volume = n))} />
+        <AudioFades
+          el={el}
+          heard={heard}
+          // One drag, one undo step: commit() folds edits under 600 ms apart.
+          onChange={(k, n) => update((d) => void (d.audio![sel.ti].elements[sel.i][k] = n > 0 ? n : undefined), true)}
+        />
         <div className="grid grid-cols-2 gap-2">
           <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
           <NumberRow label="Trim start (s)" value={el.trimStart ?? 0} min={0} onChange={(n) => set((x) => (x.trimStart = Math.max(0, n)))} />
@@ -3244,6 +3848,148 @@ function PositionRow({
         )}
       </div>
     </Row>
+  );
+}
+
+// ── share by link ───────────────────────────────────────────────────────────
+
+interface ShareState {
+  url: string | null;
+  /** Off only: whether there is a finished export to share. */
+  can_share?: boolean;
+  /** On only: when the export viewers see finished, and a newer one if any. */
+  exported_at?: string;
+  newer_export?: number | null;
+}
+
+/** "Oct 1, 14:02" from SQLite's space-separated UTC datetime. */
+function fmtWhen(s: string): string {
+  const d = new Date(s.replace(" ", "T") + "Z");
+  return isNaN(d.getTime())
+    ? ""
+    : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * One public link per project, pinned to one finished export so a later
+ * draft never reaches viewers by accident. The state is read when the popover
+ * opens, so it reflects an export made since.
+ */
+function ShareControl({ projectId }: { projectId: string }) {
+  const [open, setOpen] = useState(false);
+  // null while loading, so no action shows before the real state is known.
+  const [share, setShare] = useState<ShareState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [confirmOff, setConfirmOff] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    setShare(null);
+    setError("");
+    setCopied(false);
+    setConfirmOff(false);
+    api.get<ShareState>(`/api/projects/${projectId}/share`).then(setShare).catch(() => {});
+  }, [open, projectId]);
+
+  const change = async (method: "PUT" | "DELETE") => {
+    setBusy(true);
+    setError("");
+    try {
+      setShare(await api.send<ShareState>(method, `/api/projects/${projectId}/share`));
+      setCopied(false);
+      setConfirmOff(false);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const url = share?.url ?? null;
+  const copy = async () => {
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+    } catch {
+      setError("Couldn't copy. Select the link and copy it yourself.");
+    }
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button className={btnSecondary} title="Share a link to this video">
+          <Link2 className="w-4 h-4" /> <span className="hidden sm:inline">Share</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" width="w-80">
+        <div className="p-3 flex flex-col gap-3">
+          <div className="flex flex-col gap-1">
+            <span className="text-body-sm font-medium">Share by link</span>
+            <span className="text-fine text-muted">
+              Anyone with the link can watch and download this video, without signing in.
+            </span>
+          </div>
+          {!share ? null : url ? (
+            <>
+              <div className="flex gap-2">
+                <input
+                  readOnly
+                  value={url}
+                  aria-label="Share link"
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="field flex-1 min-w-0"
+                />
+                {/* Fixed width, so "Copied" does not shift the field. */}
+                <button onClick={copy} className={`${btnPrimary} w-24 justify-center`}>
+                  {copied ? <Check className="w-4 h-4" /> : <Link2 className="w-4 h-4" />} {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+              <span className="text-fine text-muted">
+                Plays the export from {fmtWhen(share.exported_at ?? "")}.
+                {share.newer_export ? " You have exported since; viewers still see this one." : ""}
+              </span>
+              {share.newer_export ? (
+                <button onClick={() => change("PUT")} disabled={busy} className={`${btnSecondary} self-start`}>
+                  {busy && <Loader2 className="w-4 h-4 animate-spin" />} Show the newest export
+                </button>
+              ) : null}
+              {/* Turning off is final for everyone holding the link (a new one
+                  gets a new address), so it asks once, in place. */}
+              {confirmOff ? (
+                <div className="flex flex-col gap-2">
+                  <span className="text-fine text-muted">
+                    People who have this link will no longer be able to watch. A new link gets a new address.
+                  </span>
+                  <div className="flex gap-2">
+                    <button onClick={() => change("DELETE")} disabled={busy} className={btnDanger}>
+                      {busy && <Loader2 className="w-4 h-4 animate-spin" />} Turn off
+                    </button>
+                    <button onClick={() => setConfirmOff(false)} className={btnGhost}>
+                      Keep link
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button onClick={() => setConfirmOff(true)} className={`${btnGhost} self-start -ml-2`}>
+                  Turn off link
+                </button>
+              )}
+            </>
+          ) : share.can_share === false ? (
+            <span className="text-fine text-muted">Export the video first. A link plays a finished export.</span>
+          ) : (
+            <button onClick={() => change("PUT")} disabled={busy} className={`${btnPrimary} self-start`}>
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />} Create link
+            </button>
+          )}
+          {error && <span className="text-fine text-danger">{error}</span>}
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -3549,7 +4295,7 @@ function TimelinePanel({
           <span className="text-faint"> / {fmtTime(total)}</span>
         </span>
         <div className="w-px h-5 bg-border mx-1" />
-        <button onClick={splitAtPlayhead} className={btnIcon} aria-label="Split at playhead" title="Split at playhead">
+        <button onClick={splitAtPlayhead} className={btnIcon} aria-label="Split at playhead" title="Split at playhead (Cmd+B)">
           <Scissors className="w-4 h-4" />
         </button>
         <button onClick={deleteSelected} disabled={!sel} className={btnIcon} aria-label="Delete selected" title="Delete selected">
@@ -3752,6 +4498,7 @@ function TimelinePanel({
                     title={a?.name}
                   >
                     {a && <Waveform url={assetUrl(a)} width={Math.round(w)} height={ROW_H - 8} />}
+                    <FadeRamps fadeIn={el.fadeIn} fadeOut={el.fadeOut} heard={heardFor(el.startTime, dur, total)} zoom={zoom} height={ROW_H - 8} />
                     <div onPointerDown={floatDrag("aud", ti, i, "resize")} className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize" />
                   </div>
                 );
@@ -3767,6 +4514,22 @@ function TimelinePanel({
         </div>
       </div>
     </div>
+  );
+}
+
+/** The fade ramps on an audio clip: the part a fade silences is dimmed under a sloped edge. */
+function FadeRamps({ fadeIn, fadeOut, heard, zoom, height }: { fadeIn?: number; fadeOut?: number; heard: number; zoom: number; height: number }) {
+  const fin = Math.min(fadeIn ?? 0, heard) * zoom;
+  const fout = Math.min(fadeOut ?? 0, heard) * zoom;
+  if (fin <= 0 && fout <= 0) return null;
+  const end = heard * zoom;
+  return (
+    <svg className="absolute inset-0 pointer-events-none" width={end} height={height} aria-hidden>
+      {fin > 0 && <polygon points={`0,0 ${fin},0 0,${height}`} className="fill-surface/60" />}
+      {fin > 0 && <line x1={0} y1={height} x2={fin} y2={0} className="stroke-surface" strokeWidth={1} />}
+      {fout > 0 && <polygon points={`${end - fout},0 ${end},0 ${end},${height}`} className="fill-surface/60" />}
+      {fout > 0 && <line x1={end - fout} y1={0} x2={end} y2={height} className="stroke-surface" strokeWidth={1} />}
+    </svg>
   );
 }
 

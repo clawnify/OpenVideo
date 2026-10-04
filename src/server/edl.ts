@@ -14,16 +14,20 @@
 // editing loop can locate exactly what to fix.
 
 import { z } from "zod";
+import { MAX_FADE_SECONDS } from "../shared/fade";
 
 export const MAX_ELEMENTS = 100;
 export const MAX_SOURCES = 20;
 export const MAX_OUTPUT_SECONDS = 300; // 5 minutes
 export const MAX_TEXT_CHARS = 500;
 export const MAX_TRACKS = 10;
+export const MAX_STROKE_PX = 80; // a fifth of the largest fontSize; drawn at most a fifth of its own (shared/outline.ts)
 
 const hexColor = z
   .string()
   .regex(/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/, "expected #RGB, #RRGGBB or #RRGGBBAA");
+
+const opaqueColor = z.string().regex(/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/, "expected #RGB or #RRGGBB");
 
 // "asset:<id>" (this app's media library), staged "file:…", https URL, or an
 // inline data: URI. Library assets are the normal case.
@@ -58,6 +62,18 @@ const anchor = z
   .object({ x: z.number().finite().min(0).max(1), y: z.number().finite().min(0).max(1) })
   .strict();
 
+/** A region of the SOURCE frame, in shares of its width and height, cut out
+ *  before the clip is fitted or filled (shared/crop.ts). */
+const crop = z
+  .object({
+    x: z.number().finite().min(0).max(1),
+    y: z.number().finite().min(0).max(1),
+    width: z.number().finite().min(0.01).max(1),
+    height: z.number().finite().min(0.01).max(1),
+  })
+  .strict()
+  .refine((c) => c.x + c.width <= 1.0001 && c.y + c.height <= 1.0001, "crop must stay inside the frame");
+
 const mainVideo = z
   .object({
     ...clipBase,
@@ -71,6 +87,7 @@ const mainVideo = z
     volume: z.number().finite().min(0).max(2).optional(),
     fit: fit.optional(),
     anchor: anchor.optional(),
+    crop: crop.optional(),
   })
   .strict();
 
@@ -81,6 +98,7 @@ const mainImage = z
     duration: seconds.min(0.05).max(MAX_OUTPUT_SECONDS),
     fit: fit.optional(),
     anchor: anchor.optional(),
+    crop: crop.optional(),
   })
   .strict();
 
@@ -100,8 +118,9 @@ const overlayMedia = z
     ...overlayBase,
     ...clipBase,
     type: z.enum(["video", "image"]),
-    /** Fraction of canvas width; height keeps the source aspect. */
+    /** Fraction of canvas width; height keeps the (cropped) source aspect. */
     width: z.number().finite().min(0.01).max(1),
+    crop: crop.optional(),
   })
   .strict();
 
@@ -115,6 +134,15 @@ const overlayText = z
     color: hexColor.optional(),
     /** Optional boxed background behind the text, e.g. "#00000080". */
     background: hexColor.optional(),
+    /** Optional outline around the letters, `width` px at output resolution.
+     *  Drawn at most a fifth of `fontSize` wide (`drawnStroke`), so shrinking
+     *  the text never makes the document invalid. Opaque only: the preview
+     *  draws it from overlapping copies, which would darken a translucent
+     *  colour where they meet. */
+    stroke: z
+      .object({ color: opaqueColor, width: z.number().int().min(1).max(MAX_STROKE_PX) })
+      .strict()
+      .optional(),
     align: z.enum(["left", "center", "right"]).optional(),
   })
   .strict();
@@ -135,6 +163,10 @@ const audioElement = z
     /** Default: source length minus trims. */
     duration: seconds.min(0.05).max(MAX_OUTPUT_SECONDS).optional(),
     volume: z.number().finite().min(0).max(2).optional(),
+    /** Seconds to ramp up from silence, and down to silence where the clip is
+     *  last heard (its end, or the cut's end if it runs past). shared/fade.ts */
+    fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
+    fadeOut: seconds.max(MAX_FADE_SECONDS).optional(),
   })
   .strict();
 
@@ -162,6 +194,8 @@ const captionsSchema = z
         position: z.enum(["bottom", "top"]),
         margin: z.number().finite().min(0).max(0.5),
         background: z.boolean(),
+        /** A dark outline around the letters. Absent on projects made before it existed. */
+        outline: z.boolean().optional(),
         color: hexColor,
         maxChars: z.number().int().min(8).max(80),
       })

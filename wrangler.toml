@@ -9,8 +9,9 @@ binding = "ASSETS"
 not_found_handling = "single-page-application"
 # Run the Worker first for API routes so the SPA fallback can't intercept them.
 # Without this, a navigation GET to /api/uploads/... (an export's download
-# link) gets served index.html instead of reaching the Worker.
-run_worker_first = ["/api/*"]
+# link) gets served index.html instead of reaching the Worker. /s/* is the
+# public share page, rendered by the Worker too.
+run_worker_first = ["/api/*", "/s/*"]
 
 [[d1_databases]]
 binding = "DB"

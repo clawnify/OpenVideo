@@ -77,6 +77,48 @@ export async function getUploadRange(
   };
 }
 
+/**
+ * A stored object as an HTTP response, honouring a `Range: bytes=a-b` header:
+ * media elements seek with byte ranges, and metadata probing of moov-at-end
+ * files is unusably slow without 206 responses. `headers` adds to (and can
+ * override) the defaults, e.g. caching or a download filename.
+ */
+export async function serveUpload(
+  key: string,
+  range: string | undefined,
+  headers: Record<string, string> = {},
+): Promise<Response | null> {
+  const m = range?.match(/^bytes=(\d+)-(\d*)$/);
+  if (m) {
+    const start = Number(m[1]);
+    const end = m[2] ? Number(m[2]) : undefined;
+    const obj = await getUploadRange(key, start, end !== undefined ? end - start + 1 : undefined);
+    if (!obj) return null;
+    const last = end !== undefined ? Math.min(end, obj.size - 1) : obj.size - 1;
+    return new Response(obj.data, {
+      status: 206,
+      headers: {
+        "Content-Type": obj.contentType,
+        "Content-Range": `bytes ${start}-${last}/${obj.size}`,
+        "Content-Length": String(last - start + 1),
+        "Accept-Ranges": "bytes",
+        ...headers,
+      },
+    });
+  }
+
+  const obj = await getUpload(key);
+  if (!obj) return null;
+  return new Response(obj.data, {
+    headers: {
+      "Content-Type": obj.contentType,
+      "Content-Length": String(obj.size),
+      "Accept-Ranges": "bytes",
+      ...headers,
+    },
+  });
+}
+
 export async function getUploadBytes(key: string): Promise<ArrayBuffer | null> {
   const obj = await _bucket.get(key);
   if (!obj) return null;

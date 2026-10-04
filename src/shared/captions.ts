@@ -19,6 +19,8 @@ export interface CaptionStyle {
   margin: number;
   /** A dark box behind the text, for legibility on busy footage. */
   background: boolean;
+  /** A dark outline around the letters, the other way to keep them legible. */
+  outline?: boolean;
   color: string;
   /** Longest caption, in characters, before it moves to the next one. */
   maxChars: number;
@@ -86,7 +88,19 @@ export interface CaptionText {
   fontSize: number;
   color: string;
   background?: string;
+  stroke?: TextStroke;
   align: "center";
+}
+
+export interface TextStroke {
+  color: string;
+  /** Pixels at the video's resolution, outside the letters. */
+  width: number;
+}
+
+/** A caption's outline: dark, and heavy enough to read at any size. */
+export function captionStroke(fontSize: number): TextStroke {
+  return { color: "#000000", width: Math.max(1, Math.round(fontSize * 0.08)) };
 }
 
 /** The box behind a caption, when the style asks for one. */
@@ -108,6 +122,7 @@ export function captionText(line: CaptionLine, style: CaptionStyle, frame: { wid
     fontSize,
     color: style.color,
     ...(style.background ? { background: CAPTION_BOX } : {}),
+    ...(style.outline ? { stroke: captionStroke(fontSize) } : {}),
     align: "center",
   };
 }
