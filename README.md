@@ -18,6 +18,7 @@ Most editors keep a project in a format built for their own app, not for you or 
 - **Live preview**: one master clock plays the cut back in the browser as you edit.
 - **Media library**: upload clips, stills and music, or import them from Google Drive, and use them in any project. Long footage goes to the managed media service, so a multi-gigabyte master plays and exports without passing through the app.
 - **Formats**: 16:9, 9:16 for Reels, TikTok and Shorts, 1:1, 4:5 and 4:3, or the shape of your own footage. Titles and logos keep their size and place when the shape changes, and clips either fit with bars or fill the frame.
+- **Crop**: keep part of any clip, logo or picture-in-picture, free or held to 16:9, 9:16, 1:1, 4:5 or the video's own shape, with a scrubber to check the subject stays inside. The preview places a cropped clip exactly as the export does.
 - **Captions**: switch them on for the whole video, pick one of twelve languages and one style. The words come from each clip's transcript, so captions follow every trim, split and reorder.
 - **Ask for a change**: describe an edit in your own words and it is applied to the cut you have. The model calls a fixed set of checked operations, so the edit is always a valid document. One instruction, one undo.
 - **AI assist**: Auto-cut watches several clips together and assembles the strongest sequence for what the video is for, captions included; Clean up trims one clip down to its good parts.
