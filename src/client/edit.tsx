@@ -340,7 +340,7 @@ function MediaVideo({
 }
 
 /** A frame of media-service footage, which beats decoding the video for one. */
-const frameUrl = (a: Asset, at = 0) => `/api/assets/${encodeURIComponent(a.id)}/frame?t=${Math.max(0, at).toFixed(1)}`;
+const frameUrl = (a: Pick<Asset, "id">, at = 0) => `/api/assets/${encodeURIComponent(a.id)}/frame?t=${Math.max(0, at).toFixed(1)}`;
 const isVideoAsset = (a: Asset) => a.content_type.startsWith("video/");
 const isImageAsset = (a: Asset) => a.content_type.startsWith("image/");
 const isAudioAsset = (a: Asset) => a.content_type.startsWith("audio/");
@@ -608,17 +608,33 @@ type ProjectSummary = Omit<EditProject, "edl" | "brief"> & {
   cover_type: string | null;
   /** Where the cut starts in the cover clip (its trimStart), in seconds. */
   cover_at: number | null;
+  cover_asset: string | null;
+  /** Set when the cover clip lives on the media service, not in app storage. */
+  cover_media: string | null;
 };
 
 /** The frame a project is recognised by: its opening shot, or a blank tile. */
 function ProjectCover({ p }: { p: ProjectSummary }) {
+  const [broken, setBroken] = useState(false);
   const url = p.cover_key ? `/api/uploads/${encodeURIComponent(p.cover_key)}` : null;
+  // Half a second in, not frame zero: footage often fades up from black.
+  const at = (p.cover_at ?? 0) + 0.5;
   return (
     <div className="aspect-video bg-surface-sunken grid place-items-center overflow-hidden">
-      {url && p.cover_type?.startsWith("video/") ? (
-        // Half a second in, not frame zero: footage often fades up from black.
+      {p.cover_media && p.cover_asset && !broken ? (
+        // Footage on the media service has nothing in app storage to play
+        // from; it has frames. Until it is ready there is no frame: blank tile.
+        <img
+          src={frameUrl({ id: p.cover_asset }, at)}
+          alt=""
+          onError={() => setBroken(true)}
+          className="w-full h-full object-cover bg-black"
+        />
+      ) : p.cover_media ? (
+        <Film className="w-6 h-6 text-faint" />
+      ) : url && p.cover_type?.startsWith("video/") ? (
         <video
-          src={`${url}#t=${(p.cover_at ?? 0) + 0.5}`}
+          src={`${url}#t=${at}`}
           muted
           preload="metadata"
           className="w-full h-full object-cover bg-black"
