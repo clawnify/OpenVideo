@@ -4045,6 +4045,30 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
     api.get<ExportJob[]>(`/api/exports?project_id=${projectId}`).then((j) => setLast(j[0] ?? null)).catch(() => {});
   }, [projectId]);
 
+  // The render runs in the background on the edit service, and each read of
+  // the job is what moves it on, so keep reading until it settles. This also
+  // picks a running export back up after a reload. One read at a time: the
+  // next is scheduled only once the last has answered.
+  const exporting = last?.status === "exporting" ? last.id : null;
+  useEffect(() => {
+    if (!exporting) return;
+    let stop = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      timer = setTimeout(async () => {
+        const job = await api.get<ExportJob>(`/api/exports/${exporting}`).catch(() => null);
+        if (stop) return;
+        if (job && job.status !== "exporting") setLast(job);
+        else tick();
+      }, 3000);
+    };
+    tick();
+    return () => {
+      stop = true;
+      clearTimeout(timer);
+    };
+  }, [exporting]);
+
   const run = async () => {
     setBusy(true);
     try {
@@ -4079,8 +4103,9 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
         </span>
       )}
       <QualityPicker value={quality} onChange={setQuality} />
-      <button onClick={run} disabled={busy || disabled} className={btnPrimary}>
-        {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Film className="w-4 h-4" />} Export
+      <button onClick={run} disabled={busy || !!exporting || disabled} className={btnPrimary}>
+        {busy || exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Film className="w-4 h-4" />}
+        {exporting ? "Exporting" : "Export"}
       </button>
     </div>
   );

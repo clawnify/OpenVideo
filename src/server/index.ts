@@ -29,9 +29,9 @@ import {
   withinFolder,
 } from "./drive";
 import { starterEdl, validateEdl, type Edl } from "./edl";
-import { renderKey } from "../shared/renders";
+import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
 import { instructEdit } from "./instruct";
-import { analyzeAsset, autocutAssets, copyOutput, resolveEdlSources, runEdit } from "./export";
+import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
 
 type Bindings = {
@@ -537,6 +537,8 @@ interface ExportJob {
   error: string | null;
   duration: number | null;
   size: number | null;
+  /** The render's job on the edit service; null until it is submitted. */
+  service_job_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -776,20 +778,67 @@ app.delete("/api/projects/:id", async (c) => {
 
 app.get("/api/exports", async (c) => {
   const projectId = c.req.query("project_id");
-  const rows = projectId
+  const rows: ExportJob[] = projectId
     ? await query<ExportJob>(
         "SELECT * FROM export_jobs WHERE project_id = ? ORDER BY created_at DESC LIMIT 50",
         [projectId],
       )
     : await query<ExportJob>("SELECT * FROM export_jobs ORDER BY created_at DESC LIMIT 50");
-  return c.json(rows);
+  return c.json(await Promise.all(rows.map((r) => settleExport(r, exportConfig(c.env)))));
 });
 
 app.get("/api/exports/:id", async (c) => {
   const row = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [c.req.param("id")]);
   if (!row) return c.json({ error: "Not found" }, 404);
-  return c.json(row);
+  return c.json(await settleExport(row, exportConfig(c.env)));
 });
+
+function exportConfig(env: Bindings): ExportConfig | null {
+  return env.CLAWNIFY_TOKEN ? { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN } : null;
+}
+
+/**
+ * Bring an 'exporting' row up to date. The render runs in the background on
+ * the edit service, and nothing calls back when it ends, so whichever read
+ * comes next (the editor polling, an agent, a reload) settles it: a finished
+ * render is copied into this app's storage, a failed one records why. Every
+ * write is guarded on status = 'exporting', so concurrent reads settle a row
+ * once; a duplicate copy lands on the same key (renderKeyFor).
+ */
+async function settleExport(job: ExportJob, cfg: ExportConfig | null): Promise<ExportJob> {
+  if (job.status !== "exporting") return job;
+  const failed = async (msg: string) => {
+    await run(
+      "UPDATE export_jobs SET status = 'failed', error = ?, updated_at = datetime('now') WHERE id = ? AND status = 'exporting'",
+      [msg.slice(0, 1000), job.id],
+    );
+  };
+
+  if (!job.service_job_id) {
+    // Still staging inside its request, or that request was cut off.
+    if (!isAbandonedExport(job.created_at, Date.now())) return job;
+    await failed("export_failed: the export stopped before it finished — export again");
+  } else {
+    if (!cfg) return job;
+    const poll = await pollEdit(job.service_job_id, cfg);
+    if (poll.status === "running") return job;
+    if (poll.status === "failed") {
+      await failed(`edit_failed: ${poll.detail}`);
+    } else {
+      const key = renderKeyFor(job.id, job.service_job_id);
+      try {
+        await copyOutput(poll.result, key);
+        await run(
+          "UPDATE export_jobs SET status = 'completed', output_url = ?, duration = ?, size = ?, updated_at = datetime('now') WHERE id = ? AND status = 'exporting'",
+          [`/api/uploads/${encodeURIComponent(key)}`, poll.result.duration, poll.result.size, job.id],
+        );
+      } catch (err) {
+        await failed(`export_failed: ${String(err).slice(0, 500)}`);
+      }
+    }
+  }
+  return (await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [job.id])) ?? job;
+}
 
 app.post("/api/projects/:id/export", async (c) => {
   const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [
@@ -834,19 +883,18 @@ app.post("/api/projects/:id/export", async (c) => {
     const resolved = await resolveEdlSources(parsed.edl, cfg);
     if ("failure" in resolved) return fail(resolved.failure.error, resolved.failure.detail, resolved.failure.path);
 
-    const edited = await runEdit(
+    const started = await startEdit(
       resolved.edl,
       { quality, filename: `${makeKey(project.name)}.mp4` },
       cfg,
     );
-    if ("failure" in edited) return fail(edited.failure.error, edited.failure.detail, edited.failure.path);
+    if ("failure" in started) return fail(started.failure.error, started.failure.detail, started.failure.path);
 
-    const key = `renders/edit-${jobId}-${lower8()}.mp4`;
-    await copyOutput(edited.result, key);
-    await run(
-      "UPDATE export_jobs SET status = 'completed', output_url = ?, duration = ?, size = ?, updated_at = datetime('now') WHERE id = ?",
-      [`/api/uploads/${encodeURIComponent(key)}`, edited.result.duration, edited.result.size, jobId],
-    );
+    // The render is on its way; reads of this job settle it (settleExport).
+    await run("UPDATE export_jobs SET service_job_id = ?, updated_at = datetime('now') WHERE id = ?", [
+      started.jobId,
+      jobId,
+    ]);
   } catch (err) {
     return fail("export_failed", String(err).slice(0, 500));
   }

@@ -19,3 +19,30 @@ export function renderKey(outputUrl: string | null | undefined): string | null {
   }
   return key.startsWith(RENDER_PREFIX) ? key : null;
 }
+
+/**
+ * The storage key a finished export is copied to. It comes from the two job
+ * ids rather than a fresh random suffix, so two reads that settle the same
+ * export at once write one object instead of orphaning a second. The service
+ * job id is a random UUID, so the key stays as unguessable as before.
+ */
+export function renderKeyFor(exportId: number, serviceJobId: string): string {
+  return `${RENDER_PREFIX}edit-${exportId}-${serviceJobId.replace(/-/g, "").slice(0, 8)}.mp4`;
+}
+
+// An export row is written before its sources are staged and the render is
+// submitted, and that part runs inside the request. A row still without a
+// service job past this age was cut off (the tab closed or the request died)
+// and will never finish. Staging waits at most about half a minute for
+// footage on the media service, and a 500 MB upload takes a few minutes.
+const ABANDONED_AFTER_MS = 15 * 60 * 1000;
+
+/** SQLite's datetime('now') is UTC without a zone ("2026-10-03 11:52:25"). */
+function sqliteTime(s: string): number {
+  return Date.parse(`${s.replace(" ", "T")}Z`);
+}
+
+export function isAbandonedExport(createdAt: string, now: number): boolean {
+  const t = sqliteTime(createdAt);
+  return Number.isFinite(t) && now - t > ABANDONED_AFTER_MS;
+}

@@ -302,6 +302,67 @@ export async function runEdit(
   return { result: { url: json.url, duration: json.duration ?? 0, size: json.size ?? 0 } };
 }
 
+/**
+ * Submit the resolved EDL as a background render. The service answers at once
+ * with a job id; the render itself has no request to outlive, so a long export
+ * or a closed tab no longer loses it. Read the outcome with `pollEdit`.
+ */
+export async function startEdit(
+  edl: Edl,
+  opts: { quality: string; filename: string },
+  cfg: ExportConfig,
+): Promise<{ jobId: string } | { failure: ExportFailure }> {
+  const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/video/edit`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ edl, quality: opts.quality, filename: opts.filename, async: true }),
+  });
+  const { json, text } = await readServiceResponse<{ job_id?: string } & Partial<EdlInvalid> & { error?: string }>(res);
+  if (res.status !== 202 || !json?.job_id) {
+    return {
+      failure: {
+        error: json?.error ?? "edit_failed",
+        detail: json?.detail ?? (text || `edit service returned ${res.status}`),
+        ...(json?.path ? { path: json.path } : {}),
+      },
+    };
+  }
+  return { jobId: json.job_id };
+}
+
+export type EditPoll =
+  | { status: "running" }
+  | { status: "done"; result: EditResult }
+  | { status: "failed"; detail: string };
+
+/**
+ * Where a background render stands. The service decides when a render has
+ * died (it watches its own queue and process), so this only reports. A reply
+ * that isn't an answer (an outage, a 5xx) reads as still running: the next
+ * read asks again rather than failing an export that may be fine.
+ */
+export async function pollEdit(jobId: string, cfg: ExportConfig): Promise<EditPoll> {
+  const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/video/edit/${encodeURIComponent(jobId)}`, {
+    headers: { Authorization: `Bearer ${cfg.token}` },
+  }).catch(() => null);
+  if (res?.status === 404) {
+    return { status: "failed", detail: "the edit service no longer has this render — export again" };
+  }
+  if (!res?.ok) return { status: "running" };
+  const { json } = await readServiceResponse<{
+    status?: string;
+    url?: string;
+    size?: number;
+    duration?: number | null;
+    detail?: string;
+  }>(res);
+  if (json?.status === "done" && json.url) {
+    return { status: "done", result: { url: json.url, size: json.size ?? 0, duration: json.duration ?? 0 } };
+  }
+  if (json?.status === "failed") return { status: "failed", detail: json.detail ?? "the render failed" };
+  return { status: "running" };
+}
+
 export interface AnalyzeResult {
   model: string;
   cuts: { start_ms: number; end_ms: number; label: string; keep: boolean }[];

@@ -101,3 +101,8 @@ CREATE TABLE IF NOT EXISTS media_uploads (
   duration REAL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- An export renders in the background on the edit service; this is its job
+-- there. The row stays 'exporting' until a read of the job finds the outcome
+-- and settles it, so a closed tab or a long render never loses the export.
+ALTER TABLE export_jobs ADD COLUMN service_job_id TEXT;
