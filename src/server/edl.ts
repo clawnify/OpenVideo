@@ -14,6 +14,7 @@
 // editing loop can locate exactly what to fix.
 
 import { z } from "zod";
+import { MAX_FADE_SECONDS } from "../shared/fade";
 
 export const MAX_ELEMENTS = 100;
 export const MAX_SOURCES = 20;
@@ -162,6 +163,10 @@ const audioElement = z
     /** Default: source length minus trims. */
     duration: seconds.min(0.05).max(MAX_OUTPUT_SECONDS).optional(),
     volume: z.number().finite().min(0).max(2).optional(),
+    /** Seconds to ramp up from silence, and down to silence where the clip is
+     *  last heard (its end, or the cut's end if it runs past). shared/fade.ts */
+    fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
+    fadeOut: seconds.max(MAX_FADE_SECONDS).optional(),
   })
   .strict();
 
