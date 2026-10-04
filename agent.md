@@ -126,7 +126,11 @@ picks which part stays in frame, as CSS object-position does: `x: 0` keeps
 the left edge, `x: 1` the right, and only the side that spills over moves; `sourceAudio: false` mutes a clip's own sound; images need an
 explicit `duration`. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
-`background` (`#RRGGBBAA` works). Media overlays: `width` as a fraction of
+`background` (`#RRGGBBAA` works), optional `stroke: { "color": "#000000",
+"width": 4 }` for an outline around the letters (opaque colour; `width` in px
+at output resolution, drawn outside them and at most a fifth of `fontSize`,
+since a wider outline fills the letters in; white text with a black stroke
+reads on any footage without a box). Media overlays: `width` as a fraction of
 canvas width, height keeps aspect. Audio elements: `volume` 0..2, `duration`
 defaults to the source's length minus trims. Output duration (sum of the main
 track) maxes at 5 minutes.
@@ -136,15 +140,17 @@ numbers, at most 3840x2160. At the default resolution the presets are 1280x720
 (16:9), 720x1280 (9:16, Reels, TikTok, Shorts), 1280x1280 (1:1), 1024x1280
 (4:5, Instagram feed) and 1280x960 (4:3). To reshape a finished edit, ask for
 it through `/instruct` ("make it vertical"): it applies the editor's own rule,
-which keeps the long side, scales `fontSize` by the change in the short side
+which keeps the long side, scales `fontSize` (and a text `stroke`) by the change in the short side
 and keeps each logo's size on screen and the side of the frame it sits on.
 Clips keep their `fit`; set `"cover"` on each to fill the new frame instead of
 showing bars.
 
 **Captions** are a project setting, not overlays: an optional `captions` block,
 `{ "enabled": true, "lang": "en", "style": { "size": 0.055, "position":
-"bottom", "margin": 0.08, "background": true, "color": "#ffffff", "maxChars":
-32 } }` (`size` and `margin` are shares of the frame's height). The words come
+"bottom", "margin": 0.08, "background": true, "outline": false, "color":
+"#ffffff", "maxChars": 32 } }` (`size` and `margin` are shares of the frame's
+height; `outline` draws a black outline sized to the text, with or without
+the box). The words come
 from each clip's transcript and the part of it the clip plays, so captions
 follow every trim, split and reorder; nothing is stored per caption. Only
 footage on the media service (imported from Drive) has a transcript: poll

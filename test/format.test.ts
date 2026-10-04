@@ -82,6 +82,16 @@ describe("reshape", () => {
     expect(text(reshape(edl, 1280, 1280)).fontSize).toBe(71);
   });
 
+  it("scales a title's outline with its letters, and adds none to a title without one", () => {
+    const outlined = {
+      ...edl,
+      overlays: [{ elements: [{ ...edl.overlays[0].elements[0], stroke: { color: "#000000", width: 4 } }] }],
+    };
+    expect(reshape(outlined, 1280, 1280).overlays[0].elements[0]).toMatchObject({ fontSize: 71, stroke: { color: "#000000", width: 7 } });
+    expect(reshape(outlined, 720, 1280).overlays[0].elements[0]).toMatchObject({ stroke: { width: 4 } });
+    expect("stroke" in text(reshape(edl, 1280, 1280))).toBe(false);
+  });
+
   it("keeps a logo its size on screen, in the corner it was in", () => {
     const vertical = reshape(edl, 720, 1280);
     // 0.1 of 1280 is 128px, which is 128/720 of the narrower frame.

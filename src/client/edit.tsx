@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { splitClip } from "../shared/split";
+import { drawnStroke, maxStrokeWidth, outlineShadow } from "../shared/outline";
 import {
   DEFAULT_CAPTIONS,
   captionText,
@@ -156,6 +157,8 @@ interface OverlayText {
   fontFamily?: "sans" | "serif" | "mono";
   color?: string;
   background?: string;
+  /** Outline around the letters, `width` px at output resolution. */
+  stroke?: { color: string; width: number };
   align?: "left" | "center" | "right";
 }
 type OverlayElement = OverlayMedia | OverlayText;
@@ -248,6 +251,8 @@ const api = {
 // defaults for a caption, and the design tokens do not apply inside a frame.
 const DEFAULT_TEXT_COLOR = "#ffffff";
 const DEFAULT_TEXT_BOX = "#00000080";
+/** What the Stroke controls start from: a black outline at 0 px is "none". */
+const DEFAULT_TEXT_STROKE = { color: "#000000", width: 4 };
 
 const rid = () => Math.random().toString(36).slice(2, 10);
 /**
@@ -478,7 +483,7 @@ function TextOnStage({
   selected = false,
   onPointerDown,
 }: {
-  t: Pick<OverlayText, "text" | "fontSize" | "fontFamily" | "color" | "background" | "opacity" | "align" | "x" | "y">;
+  t: Pick<OverlayText, "text" | "fontSize" | "fontFamily" | "color" | "background" | "stroke" | "opacity" | "align" | "x" | "y">;
   frame: Edl["output"];
   scale: number;
   selected?: boolean;
@@ -489,6 +494,7 @@ function TextOnStage({
   const lines = wrapLines(t.text, t.fontSize, frame.width, family);
   const step = lineStep(t.fontSize, !!t.background) / frame.height;
   const top = fitTop(t.y, blockHeight(t.text, t.fontSize, frame.width, family, !!t.background), frame.height);
+  const stroke = drawnStroke(t.stroke, t.fontSize);
   return (
     <>
       {lines.map((line, n) =>
@@ -506,6 +512,8 @@ function TextOnStage({
               color: t.color ?? DEFAULT_TEXT_COLOR,
               background: t.background,
               padding: t.background ? `${0.3 * t.fontSize * scale}px ${0.45 * t.fontSize * scale}px` : undefined,
+              // Round-joined, like the export's; see shared/outline.ts.
+              textShadow: stroke ? outlineShadow(stroke.width * scale, stroke.color) : undefined,
               opacity: t.opacity ?? 1,
               textAlign: t.align ?? "left",
             }}
@@ -1928,6 +1936,12 @@ function CaptionsPanel({
           options={[[true, "Box"], [false, "No box"]]}
           onChange={(background) => setStyle({ background })}
         />
+        <Choice
+          label="Outline"
+          value={!!cfg.style.outline}
+          options={[[true, "Outline"], [false, "No outline"]]}
+          onChange={(outline) => setStyle({ outline })}
+        />
         <label className="flex items-center justify-between gap-2 text-fine text-muted">
           Text color
           {/* The value is a colour authored into the video, not app chrome. */}
@@ -3163,6 +3177,42 @@ function Inspector({
                   <input className={inputCls} value={el.background ?? ""} placeholder="#00000080" onChange={(e) => set((x) => ((x as OverlayText).background = e.target.value || undefined))} />
                 </Row>
               </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Row label="Stroke">
+                  {/* Dimmed while there is no outline; picking a colour adds one. */}
+                  <input
+                    type="color"
+                    className={`field p-1 ${el.stroke ? "" : "opacity-40"}`}
+                    title={el.stroke ? undefined : "No outline: pick a colour to add one"}
+                    value={(el.stroke?.color ?? DEFAULT_TEXT_STROKE.color).slice(0, 7)}
+                    onChange={(e) =>
+                      set((x) => {
+                        const t = x as OverlayText;
+                        t.stroke = { color: e.target.value, width: t.stroke?.width ?? Math.min(DEFAULT_TEXT_STROKE.width, maxStrokeWidth(t.fontSize)) };
+                      })
+                    }
+                  />
+                </Row>
+                <NumberRow
+                  label="Width (px)"
+                  value={el.stroke?.width ?? 0}
+                  step={1}
+                  min={0}
+                  max={maxStrokeWidth(el.fontSize)}
+                  onChange={(n) =>
+                    set((x) => {
+                      const t = x as OverlayText;
+                      const width = Math.round(Math.min(maxStrokeWidth(t.fontSize), Math.max(0, n || 0)));
+                      t.stroke = width > 0 ? { color: t.stroke?.color ?? DEFAULT_TEXT_STROKE.color, width } : undefined;
+                    })
+                  }
+                />
+              </div>
+              {el.stroke && el.stroke.width > maxStrokeWidth(el.fontSize) && (
+                <p className="text-fine text-muted -mt-2 mb-3">
+                  Drawn at {maxStrokeWidth(el.fontSize)} px: an outline is at most a fifth of the font size.
+                </p>
+              )}
             </>
           )}
           {el.type !== "text" && <SliderRow label="Width" value={(el as OverlayMedia).width} min={0.02} onChange={(n) => set((x) => ((x as OverlayMedia).width = n))} />}
