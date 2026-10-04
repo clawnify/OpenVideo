@@ -63,6 +63,7 @@ import {
   Film,
   Folder,
   Image as ImageIcon,
+  Link2,
   Loader2,
   Music,
   Pause,
@@ -1155,6 +1156,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         >
           <Sparkles className="w-4 h-4" /> <span className="hidden sm:inline">Auto-cut</span>
         </button>
+        <ShareControl projectId={initial.id} />
         <ExportControls projectId={initial.id} disabled={dirty.current || edl.main.elements.length === 0} />
       </div>
 
@@ -3779,6 +3781,148 @@ function PositionRow({
         )}
       </div>
     </Row>
+  );
+}
+
+// ── share by link ───────────────────────────────────────────────────────────
+
+interface ShareState {
+  url: string | null;
+  /** Off only: whether there is a finished export to share. */
+  can_share?: boolean;
+  /** On only: when the export viewers see finished, and a newer one if any. */
+  exported_at?: string;
+  newer_export?: number | null;
+}
+
+/** "Oct 1, 14:02" from SQLite's space-separated UTC datetime. */
+function fmtWhen(s: string): string {
+  const d = new Date(s.replace(" ", "T") + "Z");
+  return isNaN(d.getTime())
+    ? ""
+    : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * One public link per project, pinned to one finished export so a later
+ * draft never reaches viewers by accident. The state is read when the popover
+ * opens, so it reflects an export made since.
+ */
+function ShareControl({ projectId }: { projectId: string }) {
+  const [open, setOpen] = useState(false);
+  // null while loading, so no action shows before the real state is known.
+  const [share, setShare] = useState<ShareState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [confirmOff, setConfirmOff] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    setShare(null);
+    setError("");
+    setCopied(false);
+    setConfirmOff(false);
+    api.get<ShareState>(`/api/projects/${projectId}/share`).then(setShare).catch(() => {});
+  }, [open, projectId]);
+
+  const change = async (method: "PUT" | "DELETE") => {
+    setBusy(true);
+    setError("");
+    try {
+      setShare(await api.send<ShareState>(method, `/api/projects/${projectId}/share`));
+      setCopied(false);
+      setConfirmOff(false);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const url = share?.url ?? null;
+  const copy = async () => {
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+    } catch {
+      setError("Couldn't copy. Select the link and copy it yourself.");
+    }
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button className={btnSecondary} title="Share a link to this video">
+          <Link2 className="w-4 h-4" /> <span className="hidden sm:inline">Share</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" width="w-80">
+        <div className="p-3 flex flex-col gap-3">
+          <div className="flex flex-col gap-1">
+            <span className="text-body-sm font-medium">Share by link</span>
+            <span className="text-fine text-muted">
+              Anyone with the link can watch and download this video, without signing in.
+            </span>
+          </div>
+          {!share ? null : url ? (
+            <>
+              <div className="flex gap-2">
+                <input
+                  readOnly
+                  value={url}
+                  aria-label="Share link"
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="field flex-1 min-w-0"
+                />
+                {/* Fixed width, so "Copied" does not shift the field. */}
+                <button onClick={copy} className={`${btnPrimary} w-24 justify-center`}>
+                  {copied ? <Check className="w-4 h-4" /> : <Link2 className="w-4 h-4" />} {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+              <span className="text-fine text-muted">
+                Plays the export from {fmtWhen(share.exported_at ?? "")}.
+                {share.newer_export ? " You have exported since; viewers still see this one." : ""}
+              </span>
+              {share.newer_export ? (
+                <button onClick={() => change("PUT")} disabled={busy} className={`${btnSecondary} self-start`}>
+                  {busy && <Loader2 className="w-4 h-4 animate-spin" />} Show the newest export
+                </button>
+              ) : null}
+              {/* Turning off is final for everyone holding the link (a new one
+                  gets a new address), so it asks once, in place. */}
+              {confirmOff ? (
+                <div className="flex flex-col gap-2">
+                  <span className="text-fine text-muted">
+                    People who have this link will no longer be able to watch. A new link gets a new address.
+                  </span>
+                  <div className="flex gap-2">
+                    <button onClick={() => change("DELETE")} disabled={busy} className={btnDanger}>
+                      {busy && <Loader2 className="w-4 h-4 animate-spin" />} Turn off
+                    </button>
+                    <button onClick={() => setConfirmOff(false)} className={btnGhost}>
+                      Keep link
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button onClick={() => setConfirmOff(true)} className={`${btnGhost} self-start -ml-2`}>
+                  Turn off link
+                </button>
+              )}
+            </>
+          ) : share.can_share === false ? (
+            <span className="text-fine text-muted">Export the video first. A link plays a finished export.</span>
+          ) : (
+            <button onClick={() => change("PUT")} disabled={busy} className={`${btnPrimary} self-start`}>
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />} Create link
+            </button>
+          )}
+          {error && <span className="text-fine text-danger">{error}</span>}
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }
 

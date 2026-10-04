@@ -23,7 +23,8 @@ Most editors keep a project in a format built for their own app, not for you or 
 - **Ask for a change**: describe an edit in your own words and it is applied to the cut you have. The model calls a fixed set of checked operations, so the edit is always a valid document. One instruction, one undo.
 - **AI assist**: Auto-cut watches several clips together and assembles the strongest sequence for what the video is for, captions included; Clean up trims one clip down to its good parts.
 - **Export to MP4** in draft, standard or high quality, on Clawnify's managed edit service.
-- **Agent-ready**: a REST API (`/api/assets`, `/api/drive`, `/api/projects`, `/api/exports`) and an `agent.md`, so an AI agent can assemble, edit and export videos without a human in the loop. Validation errors carry a JSON pointer to the offending node, so an agent's edit loop self-corrects.
+- **Share by link**: one link per project plays an export to anyone you send it to, with no sign-in, and a Download button. The link stays on the export you shared until you move it to a newer one, so a draft never reaches viewers; turning it off ends it for everyone.
+- **Agent-ready**: a REST API (`/api/assets`, `/api/drive`, `/api/projects`, `/api/exports`, `/api/projects/{id}/share`) and an `agent.md`, so an AI agent can assemble, edit and export videos without a human in the loop. Validation errors carry a JSON pointer to the offending node, so an agent's edit loop self-corrects.
 
 ## How an edit works
 
@@ -73,7 +74,7 @@ src/
   client/edit.tsx    # projects list and the editor: media rail, player, inspector, timeline
   client/ui.tsx      # shared control recipes (buttons, dialog, empty state)
   client/styles.css  # design tokens: palette, type scale, elevation
-  server/            # REST API (assets, projects, exports) and EDL validation
+  server/            # REST API (assets, projects, exports), EDL validation, the public share page
 agent.md             # how an AI agent assembles, edits and exports videos
 ```
 
