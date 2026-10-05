@@ -633,16 +633,12 @@ app.put("/api/projects/:id", async (c) => {
   }
   // Guarded on the revision read above, so fields this request left out are
   // never filled from a version another write has already replaced.
-  const res = await run(
+  const [row] = await guardedWrite<EditProject>(
     `UPDATE edit_projects SET name = ?, edl = ?, brief = ?, revision = revision + 1, updated_at = datetime('now')
-      WHERE id = ? AND revision = ?`,
+      WHERE id = ? AND revision = ? RETURNING *`,
     [b.name?.trim() || existing.name, edlJson, b.brief !== undefined ? b.brief.trim() : existing.brief, id, existing.revision],
   );
-  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
-  if (!row) return c.json({ error: "Not found" }, 404);
-  if (res.changes === 0) {
-    return conflict(c, row.revision, "The project changed while this was being saved. Read it again and redo your change on that.");
-  }
+  if (!row) return changedWhileRunning(c, id, "The project changed while this was being saved. Read it again and redo your change on that.");
   return c.json(projectOut(row));
 });
 
@@ -710,11 +706,11 @@ app.post("/api/projects/:id/instruct", async (c) => {
 
   // The model worked on the version read at the start, which can be a minute
   // old by now: write only if nothing else saved in between.
-  const res = await run(
-    "UPDATE edit_projects SET edl = ?, revision = revision + 1, updated_at = datetime('now') WHERE id = ? AND revision = ?",
+  const [saved] = await guardedWrite(
+    "UPDATE edit_projects SET edl = ?, revision = revision + 1, updated_at = datetime('now') WHERE id = ? AND revision = ? RETURNING revision",
     [JSON.stringify(out.edl), project.id, project.revision],
   );
-  if (res.changes === 0) return changedWhileRunning(c, project.id);
+  if (!saved) return changedWhileRunning(c, project.id);
   return c.json({ edl: out.edl, said: out.said, applied: out.applied, revision: project.revision + 1 });
 });
 
@@ -791,23 +787,33 @@ app.post("/api/projects/:id/autocut", async (c) => {
 
   const v = validateEdl(edl);
   if ("invalid" in v) return c.json(v.invalid, 422);
-  const res = await run(
-    "UPDATE edit_projects SET edl = ?, revision = revision + 1, updated_at = datetime('now') WHERE id = ? AND revision = ?",
+  const [row] = await guardedWrite<EditProject>(
+    "UPDATE edit_projects SET edl = ?, revision = revision + 1, updated_at = datetime('now') WHERE id = ? AND revision = ? RETURNING *",
     [JSON.stringify(v.edl), project.id, project.revision],
   );
-  if (res.changes === 0) return changedWhileRunning(c, project.id);
-  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [project.id]);
-  return c.json({ ...projectOut(row!), notes: cut.result.notes });
+  if (!row) return changedWhileRunning(c, project.id);
+  return c.json({ ...projectOut(row), notes: cut.result.notes });
 });
 
-/** The AI pass finished on a version someone has since saved over. */
-async function changedWhileRunning(c: Context, id: string) {
+/**
+ * A write guarded by `WHERE ... AND revision = ?`, answered with RETURNING:
+ * no row back means it did not land. Read from the rows rather than the
+ * `changes` count, because not every storage this app can run on reports
+ * one, and a missing count reads as 0, which would refuse every save.
+ */
+function guardedWrite<T = { revision: number }>(sql: string, params: unknown[]) {
+  return query<T>(sql, params);
+}
+
+/** A guarded write found the project at another revision; 404 if it is gone. */
+async function changedWhileRunning(
+  c: Context,
+  id: string,
+  detail = "The project was saved somewhere else while this ran, so nothing was applied. Try again on the latest version.",
+) {
   const row = await get<{ revision: number }>("SELECT revision FROM edit_projects WHERE id = ?", [id]);
-  return conflict(
-    c,
-    row?.revision ?? 0,
-    "The project was saved somewhere else while this ran, so nothing was applied. Try again on the latest version.",
-  );
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return conflict(c, row.revision, detail);
 }
 
 app.delete("/api/projects/:id", async (c) => {

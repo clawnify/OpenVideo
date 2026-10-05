@@ -1020,10 +1020,27 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     [commit],
   );
 
+  // Drags hold an element's index from press to release; swapping the
+  // document under one would move whatever now sits at that index.
+  const pointerHeld = useRef(false);
+  useEffect(() => {
+    const down = () => (pointerHeld.current = true);
+    const up = () => (pointerHeld.current = false);
+    window.addEventListener("pointerdown", down, true);
+    window.addEventListener("pointerup", up, true);
+    window.addEventListener("pointercancel", up, true);
+    return () => {
+      window.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("pointerup", up, true);
+      window.removeEventListener("pointercancel", up, true);
+    };
+  }, []);
+
   useEffect(() => {
     let live = true;
     const check = async () => {
-      if (document.visibilityState !== "visible" || inFlight.current || aiBusy.current || conflictRef.current) return;
+      const quiet = !inFlight.current && !aiBusy.current && !conflictRef.current && !pointerHeld.current;
+      if (document.visibilityState !== "visible" || !quiet) return;
       const base = saved.current;
       // An empty 304 while nothing changed, so checking costs next to nothing.
       // shortcut: a fixed 5 s poll while visible; push (a socket) if this ever shows up in request counts.
@@ -1033,8 +1050,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       }).catch(() => null);
       if (!live || !r || !r.ok || r.status === 304) return;
       const row = (await r.json()) as EditProject;
-      // A save or an AI pass started while this was on the wire: next time.
-      if (!live || saved.current !== base || inFlight.current || aiBusy.current) return;
+      // A save, an AI pass or a drag started while this was on the wire: next time.
+      if (!live || saved.current !== base || inFlight.current || aiBusy.current || pointerHeld.current) return;
       const next = onRemote(docRef.current, base, row.revision);
       if (next === "adopt") adopt(row);
       else if (next === "conflict") {
