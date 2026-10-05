@@ -33,6 +33,7 @@ import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
 import { instructEdit } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
+import { etagMatches } from "../shared/sync";
 
 type Bindings = {
   DB: D1Database;
@@ -576,7 +577,7 @@ app.get("/api/projects/:id", async (c) => {
   const etag = `"${row.revision}"`;
   c.header("ETag", etag);
   c.header("Cache-Control", "no-store");
-  if (c.req.header("If-None-Match") === etag) return c.body(null, 304);
+  if (etagMatches(c.req.header("If-None-Match"), etag)) return c.body(null, 304);
   return c.json(projectOut(row));
 });
 

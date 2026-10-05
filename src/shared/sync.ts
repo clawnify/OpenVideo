@@ -25,3 +25,14 @@ export function onRemote<E>(local: Doc<E>, saved: Doc<E> & { revision: number },
   if (remote === saved.revision) return "ignore";
   return sameDoc(local, saved) ? "adopt" : "conflict";
 }
+
+/**
+ * If-None-Match against one ETag, by weak comparison as HTTP defines it for
+ * this header. The edge compresses JSON and turns `"7"` into `W/"7"` on the
+ * way out, so a client that echoes what it got back sends the weak form.
+ */
+export function etagMatches(header: string | undefined, etag: string): boolean {
+  if (!header) return false;
+  const bare = (t: string) => t.trim().replace(/^W\//, "");
+  return header.split(",").some((t) => t.trim() === "*" || bare(t) === bare(etag));
+}
