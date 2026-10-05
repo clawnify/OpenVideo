@@ -106,3 +106,8 @@ CREATE TABLE IF NOT EXISTS media_uploads (
 -- there. The row stays 'exporting' until a read of the job finds the outcome
 -- and settles it, so a closed tab or a long render never loses the export.
 ALTER TABLE export_jobs ADD COLUMN service_job_id TEXT;
+
+-- A project's version: every write adds one. A writer that read revision N
+-- saves only while the project is still at N, so an editor, an agent and a
+-- teammate cannot overwrite each other's work without seeing it first.
+ALTER TABLE edit_projects ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;

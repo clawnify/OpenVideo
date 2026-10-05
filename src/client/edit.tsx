@@ -24,6 +24,7 @@ import {
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
 import { fadeGain, heardFor } from "../shared/fade";
+import { onRemote, sameDoc } from "../shared/sync";
 import {
   FULL,
   cropToRatio,
@@ -83,6 +84,7 @@ import {
   EyeOff,
   Volume2,
   VolumeX,
+  TriangleAlert,
 } from "lucide-react";
 import {
   ConfirmDialog,
@@ -226,6 +228,8 @@ export interface EditProject {
   edl: Edl;
   brief: string;
   updated_at: string;
+  /** Adds one on every save, wherever it comes from. See shared/sync.ts. */
+  revision: number;
 }
 
 interface ExportJob {
@@ -256,19 +260,29 @@ const api = {
     if (!r.ok) throw new Error((await errJson(r)).error || r.statusText);
     return r.json();
   },
-  async send<T>(method: string, url: string, body?: unknown): Promise<T> {
+  async send<T>(method: string, url: string, body?: unknown, keepalive = false): Promise<T> {
     const r = await fetch(url, {
       method,
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined,
+      keepalive,
     });
     if (!r.ok) {
       const e = await errJson(r);
-      throw new Error(e.detail ? `${e.detail}${e.path ? ` (at ${e.path})` : ""}` : e.error || r.statusText);
+      throw new ApiError(r.status, e.detail ? `${e.detail}${e.path ? ` (at ${e.path})` : ""}` : e.error || r.statusText);
     }
     return r.json();
   },
 };
+
+class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 // Defaults for text the user burns INTO the video. Document content, not app
 // chrome: white on footage and a translucent black box are the legible
@@ -777,6 +791,9 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
 /** Which pane is on screen below the lg breakpoint (desktop shows all three). */
 type Pane = "library" | "canvas" | "inspector";
 
+/** Saves what is on screen, runs a server-side AI pass on it, returns the result. */
+type RunAi = (call: (revision: number) => Promise<{ edl: Edl; revision: number }>) => Promise<Edl>;
+
 type Sel =
   | { area: "main"; i: number }
   | { area: "ovl"; ti: number; i: number }
@@ -853,34 +870,6 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const mediaClock = useRef<(() => number | null) | null>(null);
   const { srcDur, resolveAsset } = useSourceDurations(edl, assets);
 
-  // ── persistence (debounced) ───────────────────────────────────────────────
-  const dirty = useRef(false);
-  // What the server holds. Compared against this, not the document the page
-  // opened with: undo can walk back to that very document, and comparing with
-  // it skipped the save, so the undo showed on screen and never persisted.
-  const saved = useRef({ edl: initial.edl, name: initial.name, brief: initial.brief ?? "" });
-  useEffect(() => {
-    const last = saved.current;
-    if (edl === last.edl && name === last.name && brief === last.brief) {
-      dirty.current = false;
-      setSaveState("saved");
-      return;
-    }
-    dirty.current = true;
-    setSaveState("saving");
-    const t = setTimeout(async () => {
-      try {
-        await api.send("PUT", `/api/projects/${initial.id}`, { name, edl, brief });
-        saved.current = { edl, name, brief };
-        dirty.current = false;
-        setSaveState("saved");
-      } catch (e) {
-        setSaveState(String((e as Error).message));
-      }
-    }, 700);
-    return () => clearTimeout(t);
-  }, [edl, name, brief, initial.id, initial.edl, initial.name, initial.brief]);
-
   /**
    * Replace the document, remembering the version before it. `coalesce` folds
    * this edit into the previous step when they belong to the same gesture.
@@ -927,6 +916,187 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     setSel(null);
     bumpHistory((n) => n + 1);
   }, []);
+
+  // ── persistence ───────────────────────────────────────────────────────────
+  // The editor is one writer among several (agents, Ask, a teammate, another
+  // tab), so every save names the revision it started from and the editor
+  // asks the server every few seconds whether a newer one exists. Rules in
+  // shared/sync.ts.
+  const docRef = useRef({ edl, name, brief });
+  docRef.current = { edl, name, brief };
+  // What the server holds. Compared against this, not the document the page
+  // opened with: undo can walk back to that very document, and comparing with
+  // it skipped the save, so the undo showed on screen and never persisted.
+  const saved = useRef({ edl: initial.edl, name: initial.name, brief: initial.brief ?? "", revision: initial.revision ?? 0 });
+  const unsaved = !sameDoc({ edl, name, brief }, saved.current);
+  // A newer version met unsaved edits. Saving stops until the person picks.
+  const [conflict, setConflict] = useState(false);
+  const conflictRef = useRef(false);
+  conflictRef.current = conflict;
+  // One save at a time, so a slow one can never land after a newer one.
+  const inFlight = useRef<Promise<boolean> | null>(null);
+  // AI passes write on the server; the poll leaves the project alone meanwhile.
+  const aiBusy = useRef(false);
+
+  const putNow = useCallback(
+    async (keepalive = false): Promise<boolean> => {
+      while (inFlight.current) await inFlight.current;
+      const doc = docRef.current;
+      const base = saved.current;
+      if (sameDoc(doc, base)) return true;
+      if (conflictRef.current) return false;
+      const run = (async () => {
+        setSaveState("saving");
+        try {
+          const row = await api.send<EditProject>(
+            "PUT",
+            `/api/projects/${initial.id}`,
+            { name: doc.name, edl: doc.edl, brief: doc.brief, revision: base.revision },
+            keepalive,
+          );
+          saved.current = { ...doc, revision: row.revision };
+          setSaveState(sameDoc(docRef.current, saved.current) ? "saved" : "saving");
+          return true;
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 409) {
+            conflictRef.current = true;
+            setConflict(true);
+            setSaveState("Not saved");
+          } else setSaveState(String((e as Error).message));
+          return false;
+        }
+      })();
+      inFlight.current = run;
+      try {
+        return await run;
+      } finally {
+        inFlight.current = null;
+      }
+    },
+    [initial.id],
+  );
+
+  useEffect(() => {
+    if (sameDoc(docRef.current, saved.current)) {
+      setSaveState("saved");
+      return;
+    }
+    if (conflictRef.current) return;
+    setSaveState("saving");
+    const t = setTimeout(() => void putNow(), 700);
+    return () => clearTimeout(t);
+  }, [edl, name, brief, conflict, putNow]);
+
+  // Leaving must not drop the last edit: going back to Projects unmounts the
+  // editor inside its 700 ms wait, and closing the tab ends it outright.
+  useEffect(() => {
+    const onUnload = (e: BeforeUnloadEvent) => {
+      if (sameDoc(docRef.current, saved.current)) return;
+      // A keepalive request outlives the page but carries at most 64 KB.
+      if (!conflictRef.current && !inFlight.current && JSON.stringify(docRef.current).length < 60_000) {
+        void putNow(true);
+        return;
+      }
+      e.preventDefault();
+    };
+    window.addEventListener("beforeunload", onUnload);
+    return () => {
+      window.removeEventListener("beforeunload", onUnload);
+      void putNow();
+    };
+  }, [putNow]);
+
+  /** Show a version saved elsewhere. One undo step, so undo brings back the cut that was on screen. */
+  const adopt = useCallback(
+    (row: EditProject) => {
+      saved.current = { edl: row.edl, name: row.name, brief: row.brief ?? "", revision: row.revision };
+      commit(row.edl);
+      setName(row.name);
+      setBrief(row.brief ?? "");
+      setSel(null);
+      conflictRef.current = false;
+      setConflict(false);
+    },
+    [commit],
+  );
+
+  useEffect(() => {
+    let live = true;
+    const check = async () => {
+      if (document.visibilityState !== "visible" || inFlight.current || aiBusy.current || conflictRef.current) return;
+      const base = saved.current;
+      // An empty 304 while nothing changed, so checking costs next to nothing.
+      // shortcut: a fixed 5 s poll while visible; push (a socket) if this ever shows up in request counts.
+      const r = await fetch(`/api/projects/${initial.id}`, {
+        cache: "no-store",
+        headers: { "If-None-Match": `"${base.revision}"` },
+      }).catch(() => null);
+      if (!live || !r || !r.ok || r.status === 304) return;
+      const row = (await r.json()) as EditProject;
+      // A save or an AI pass started while this was on the wire: next time.
+      if (!live || saved.current !== base || inFlight.current || aiBusy.current) return;
+      const next = onRemote(docRef.current, base, row.revision);
+      if (next === "adopt") adopt(row);
+      else if (next === "conflict") {
+        conflictRef.current = true;
+        setConflict(true);
+        setSaveState("Not saved");
+      }
+    };
+    const t = setInterval(check, 5000);
+    const onVisible = () => void check();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      live = false;
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [initial.id, adopt]);
+
+  const latest = () => api.get<EditProject>(`/api/projects/${initial.id}`);
+  /** Take the version saved elsewhere. The cut that was on screen stays one undo away. */
+  const takeTheirs = async () => adopt(await latest());
+  /** Save what is on screen over the version saved elsewhere. */
+  const keepMine = async () => {
+    const row = await latest();
+    saved.current = { edl: row.edl, name: row.name, brief: row.brief ?? "", revision: row.revision };
+    conflictRef.current = false;
+    setConflict(false);
+    await putNow();
+  };
+
+  /**
+   * Before an AI pass: save what is on screen, then hand back the revision the
+   * pass works on. Null when there is a conflict to settle first.
+   */
+  const settle = useCallback(async (): Promise<number | null> => {
+    const ok = await putNow();
+    return ok && !conflictRef.current ? saved.current.revision : null;
+  }, [putNow]);
+
+  /** Run an AI pass on what is on screen; it saves on the server and returns the new version. */
+  const runAi = useCallback(
+    async (call: (revision: number) => Promise<{ edl: Edl; revision: number }>) => {
+      const revision = await settle();
+      if (revision === null) {
+        throw new Error(
+          conflictRef.current
+            ? "This project was saved somewhere else. Choose a version above, then try again."
+            : "Your latest changes could not be saved, so nothing was sent. Try again.",
+        );
+      }
+      aiBusy.current = true;
+      try {
+        const out = await call(revision);
+        saved.current = { ...docRef.current, edl: out.edl, revision: out.revision };
+        return out.edl;
+      } finally {
+        aiBusy.current = false;
+      }
+    },
+    [settle],
+  );
+
 
   // Cmd+Z / Ctrl+Z, and Shift for redo. Ignored while typing.
   useEffect(() => {
@@ -1179,8 +1349,24 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           <Sparkles className="w-4 h-4" /> <span className="hidden sm:inline">Auto-cut</span>
         </button>
         <ShareControl projectId={initial.id} />
-        <ExportControls projectId={initial.id} disabled={dirty.current || edl.main.elements.length === 0} />
+        <ExportControls projectId={initial.id} disabled={unsaved || conflict || edl.main.elements.length === 0} />
       </div>
+
+      {conflict && (
+        <div role="alert" className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 border-b border-border bg-warning-tint shrink-0">
+          <TriangleAlert className="w-4 h-4 text-warning shrink-0" aria-hidden />
+          <p className="flex-1 min-w-48 text-body-sm">
+            This project was saved somewhere else while you were editing, by an agent, a teammate or another tab. Your
+            changes since then are not saved.
+          </p>
+          <button onClick={() => void takeTheirs().catch((e) => setSaveState(String(e.message)))} className={btnSecondary}>
+            Show the saved version
+          </button>
+          <button onClick={() => void keepMine().catch((e) => setSaveState(String(e.message)))} className={btnGhost}>
+            Keep mine
+          </button>
+        </div>
+      )}
 
       {/* Row 2, small screens only: which pane is on screen. */}
       <div className="lg:hidden flex items-center px-4 h-11 border-b border-border bg-surface shrink-0">
@@ -1209,6 +1395,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       {askOpen && (
         <AskDialog
           projectId={initial.id}
+          runAi={runAi}
           onClose={() => setAskOpen(false)}
           onApplied={(next) => {
             // One step for the whole instruction, like Auto-cut.
@@ -1221,6 +1408,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       {autocutOpen && (
         <AutocutModal
           projectId={initial.id}
+          runAi={runAi}
           clips={timelineClips}
           brief={brief}
           setBrief={setBrief}
@@ -1311,8 +1499,10 @@ function AutocutModal({
   setBrief,
   onClose,
   onApplied,
+  runAi,
 }: {
   projectId: string;
+  runAi: RunAi;
   clips: Asset[];
   brief: string;
   setBrief: (b: string) => void;
@@ -1326,11 +1516,13 @@ function AutocutModal({
     setRunning(true);
     setMsg("Watching all clips together — this takes a minute for long footage…");
     try {
-      const res = await api.send<EditProject & { notes?: string }>("POST", `/api/projects/${projectId}/autocut`, {
-        asset_ids: clips.map((c) => c.id),
-      });
-      onApplied(res.edl);
-      void res.notes;
+      const edl = await runAi((revision) =>
+        api.send<EditProject & { notes?: string }>("POST", `/api/projects/${projectId}/autocut`, {
+          asset_ids: clips.map((c) => c.id),
+          revision,
+        }),
+      );
+      onApplied(edl);
     } catch (e) {
       setMsg(String((e as Error).message));
       setRunning(false);
@@ -1609,10 +1801,12 @@ function LeftPanel({
  */
 function AskDialog({
   projectId,
+  runAi,
   onClose,
   onApplied,
 }: {
   projectId: string;
+  runAi: RunAi;
   onClose: () => void;
   onApplied: (edl: Edl) => void;
 }) {
@@ -1625,12 +1819,14 @@ function AskDialog({
     setRunning(true);
     setErr("");
     try {
-      const out = await api.send<{ edl: Edl; said: string; applied: string[] }>(
-        "POST",
-        `/api/projects/${projectId}/instruct`,
-        { instruction: instruction.trim() },
+      const edl = await runAi((revision) =>
+        api.send<{ edl: Edl; said: string; applied: string[]; revision: number }>(
+          "POST",
+          `/api/projects/${projectId}/instruct`,
+          { instruction: instruction.trim(), revision },
+        ),
       );
-      onApplied(out.edl);
+      onApplied(edl);
       onClose();
     } catch (e) {
       setErr(String((e as Error).message));
