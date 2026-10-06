@@ -3514,7 +3514,18 @@ function AudioFades({
  * Ducking for an audio clip: it dips while someone on the main track speaks,
  * and comes back up in the pauses. Off, or one of three depths.
  */
-function AudioDuck({ el, hint, onChange }: { el: AudioElement; hint: string | null; onChange: (db: number) => void }) {
+function AudioDuck({
+  el,
+  lang,
+  hint,
+  onChange,
+}: {
+  el: AudioElement;
+  /** The language transcripts are asked for: the media service needs the one spoken, it does not detect it. */
+  lang: string;
+  hint: string | null;
+  onChange: (db: number) => void;
+}) {
   const db = el.duck ?? 0;
   const choices: [number, string][] = [[0, "Off"], ...DUCK_CHOICES.map((n): [number, string] => [n, `−${n} dB`])];
   return (
@@ -3523,6 +3534,11 @@ function AudioDuck({ el, hint, onChange }: { el: AudioElement; hint: string | nu
       <Choice label="Lower under speech" value={db} options={choices} onChange={onChange} />
       {/* A depth set by an agent may be none of the three. */}
       {db > 0 && !choices.some(([n]) => n === db) && <p className="text-fine text-muted mt-1">Lowered by {db} dB.</p>}
+      {db > 0 && (
+        <p className="text-fine text-muted mt-1">
+          Listens for speech in {CAPTION_LANGUAGES.find(([code]) => code === lang)?.[1] ?? lang}. Change it under Captions.
+        </p>
+      )}
       {db > 0 && hint && <p className="text-fine text-muted mt-1">{hint}</p>}
     </div>
   );
@@ -3842,7 +3858,7 @@ function Inspector({
           // One drag, one undo step: commit() folds edits under 600 ms apart.
           onChange={(k, n) => update((d) => void (d.audio![sel.ti].elements[sel.i][k] = n > 0 ? n : undefined), true)}
         />
-        <AudioDuck el={el} hint={duckHint} onChange={(db) => set((x) => (x.duck = db > 0 ? db : undefined))} />
+        <AudioDuck el={el} lang={edl.captions?.lang ?? "en"} hint={duckHint} onChange={(db) => set((x) => (x.duck = db > 0 ? db : undefined))} />
         <div className="grid grid-cols-2 gap-2">
           <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
           <NumberRow label="Trim start (s)" value={el.trimStart ?? 0} min={0} onChange={(n) => set((x) => (x.trimStart = Math.max(0, n)))} />
