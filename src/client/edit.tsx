@@ -971,13 +971,15 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   // Ducking: where speech is heard on the cut, and the dip each ducked audio
   // clip gets under it, worked out the way the export works it out.
   const speech = useMemo(() => {
-    if (!ducking) return [];
-    const heard = segments
-      .filter((sg) => sg.el.type === "video" && sg.el.src.startsWith("asset:") && sg.el.sourceAudio !== false && (sg.el.volume ?? 1) > 0)
-      .map((sg) => ({ src: sg.el.src, start: sg.start, dur: sg.dur, trimStart: (sg.el as MainVideo).trimStart ?? 0 }));
+    if (!ducking) return { spans: [], muted: false };
     const cues = new Map<string, Cue[]>();
     for (const [src, t] of transcripts) if (t.status === "ready") cues.set(src, t.cues);
-    return speechSpans(heard, cues);
+    const place = (sg: (typeof segments)[number]) => ({ src: sg.el.src, start: sg.start, dur: sg.dur, trimStart: (sg.el as MainVideo).trimStart ?? 0 });
+    const videos = segments.filter((sg) => sg.el.type === "video" && sg.el.src.startsWith("asset:"));
+    const heard = videos.filter((sg) => (sg.el as MainVideo).sourceAudio !== false && ((sg.el as MainVideo).volume ?? 1) > 0);
+    const spans = speechSpans(heard.map(place), cues);
+    // Speech on the cut that is not in the mix: say so, not "no speech".
+    return { spans, muted: spans.length === 0 && speechSpans(videos.map(place), cues).length > 0 };
   }, [ducking, segments, transcripts]);
   const envelopes = useMemo(() => {
     const out = new Map<string, EnvelopePoint[]>();
@@ -986,14 +988,15 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         if (!el.duck) continue;
         const known = srcDur(el.src);
         const dur = el.duration ?? (known === undefined ? total : known - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
-        out.set(el.id, duckEnvelope(speech, { startTime: el.startTime, heard: heardFor(el.startTime, dur, total) }, el.duck));
+        out.set(el.id, duckEnvelope(speech.spans, { startTime: el.startTime, heard: heardFor(el.startTime, dur, total) }, el.duck));
       }
     }
     return out;
   }, [edl.audio, speech, srcDur, total]);
   /** Why a ducked clip shows no dip yet, or null when there is speech to dip under. */
   const duckHint = useMemo(() => {
-    if (!ducking || speech.length > 0) return null;
+    if (!ducking || speech.spans.length > 0) return null;
+    if (speech.muted) return "The clips with speech are muted, so there is nothing to dip under.";
     const states = [...transcripts.values()].map((t) => t.status);
     if (captionIds.length === 0) return "Add a video with speech to the main track.";
     if (states.length < captionIds.length || states.some((s) => s === "loading" || s === "preparing" || s === "transcribing")) {
