@@ -20,6 +20,7 @@ Most editors keep a project in a format built for their own app, not for you or 
 - **Formats**: 16:9, 9:16 for Reels, TikTok and Shorts, 1:1, 4:5 and 4:3, or the shape of your own footage. Titles and logos keep their size and place when the shape changes, and clips either fit with bars or fill the frame.
 - **Crop**: keep part of any clip, logo or picture-in-picture, free or held to 16:9, 9:16, 1:1, 4:5 or the video's own shape, with a scrubber to check the subject stays inside. The preview places a cropped clip exactly as the export does.
 - **Captions**: switch them on for the whole video, pick one of twelve languages and one style. The words come from each clip's transcript, so captions follow every trim, split and reorder.
+- **Music under speech**: fade music in and out, and have it dip while someone speaks so the voice stays clear, then come back up in the pauses. The dips follow the transcript, so they move with every trim, and the preview plays them as the export will.
 - **Ask for a change**: describe an edit in your own words and it is applied to the cut you have. The model calls a fixed set of checked operations, so the edit is always a valid document. One instruction, one undo.
 - **AI assist**: Auto-cut watches several clips together and assembles the strongest sequence for what the video is for, captions included; Clean up trims one clip down to its good parts.
 - **Export to MP4** in draft, standard or high quality, on Clawnify's managed edit service.

@@ -24,6 +24,7 @@ import {
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
 import { fadeGain, heardFor } from "../shared/fade";
+import { DUCK_CHOICES, duckEnvelope, envelopeGain, speechSpans, type EnvelopePoint } from "../shared/duck";
 import {
   FULL,
   cropToRatio,
@@ -201,6 +202,8 @@ interface AudioElement {
   /** Seconds of ramp from silence, and to silence where the clip is last heard (shared/fade.ts). */
   fadeIn?: number;
   fadeOut?: number;
+  /** Dip this many dB while someone on the main track speaks (shared/duck.ts). */
+  duck?: number;
 }
 interface AudioTrack {
   id: string;
@@ -952,7 +955,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     () => [...new Set(edl.main.elements.filter((e) => e.type === "video" && e.src.startsWith("asset:")).map((e) => e.src.slice(6)))],
     [edl.main.elements],
   );
-  const transcripts = useTranscripts(captionIds, edl.captions?.lang ?? "en", !!edl.captions?.enabled || tab === "captions");
+  const ducking = useMemo(() => (edl.audio ?? []).some((t) => t.elements.some((el) => el.duck)), [edl.audio]);
+  const transcripts = useTranscripts(captionIds, edl.captions?.lang ?? "en", !!edl.captions?.enabled || tab === "captions" || ducking);
   const captionLayer = useMemo(() => {
     const cfg = edl.captions;
     if (!cfg?.enabled) return null;
@@ -963,6 +967,40 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     for (const [src, t] of transcripts) if (t.status === "ready") cues.set(src, t.cues);
     return { lines: captionTimeline(placed, cues, cfg.style.maxChars), style: cfg.style };
   }, [edl.captions, segments, transcripts]);
+
+  // Ducking: where speech is heard on the cut, and the dip each ducked audio
+  // clip gets under it, worked out the way the export works it out.
+  const speech = useMemo(() => {
+    if (!ducking) return [];
+    const heard = segments
+      .filter((sg) => sg.el.type === "video" && sg.el.src.startsWith("asset:") && sg.el.sourceAudio !== false && (sg.el.volume ?? 1) > 0)
+      .map((sg) => ({ src: sg.el.src, start: sg.start, dur: sg.dur, trimStart: (sg.el as MainVideo).trimStart ?? 0 }));
+    const cues = new Map<string, Cue[]>();
+    for (const [src, t] of transcripts) if (t.status === "ready") cues.set(src, t.cues);
+    return speechSpans(heard, cues);
+  }, [ducking, segments, transcripts]);
+  const envelopes = useMemo(() => {
+    const out = new Map<string, EnvelopePoint[]>();
+    for (const track of edl.audio ?? []) {
+      for (const el of track.elements) {
+        if (!el.duck) continue;
+        const known = srcDur(el.src);
+        const dur = el.duration ?? (known === undefined ? total : known - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
+        out.set(el.id, duckEnvelope(speech, { startTime: el.startTime, heard: heardFor(el.startTime, dur, total) }, el.duck));
+      }
+    }
+    return out;
+  }, [edl.audio, speech, srcDur, total]);
+  /** Why a ducked clip shows no dip yet, or null when there is speech to dip under. */
+  const duckHint = useMemo(() => {
+    if (!ducking || speech.length > 0) return null;
+    const states = [...transcripts.values()].map((t) => t.status);
+    if (captionIds.length === 0) return "Add a video with speech to the main track.";
+    if (states.length < captionIds.length || states.some((s) => s === "loading" || s === "preparing" || s === "transcribing")) {
+      return "Waiting for the transcripts…";
+    }
+    return "No speech found. The dips follow the transcripts of videos uploaded to the media service.";
+  }, [ducking, speech, transcripts, captionIds]);
 
   // Distinct video clips on the main track, in timeline order — the unit
   // Auto-cut operates on (the arrangement is the user's intent).
@@ -1258,6 +1296,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           playheadRef={playheadRef}
           mediaClock={mediaClock}
           captions={captionLayer}
+          envelopes={envelopes}
           playing={playing}
           resolveAsset={resolveAsset}
           sel={sel}
@@ -1272,6 +1311,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           srcDur={srcDur}
           resolveAsset={resolveAsset}
           segments={segments}
+          duckHint={duckHint}
           onDelete={deleteSelected}
           brief={brief}
           setBrief={setBrief}
@@ -1297,6 +1337,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         splitAtPlayhead={splitAtPlayhead}
         splitAt={splitAt}
         deleteSelected={deleteSelected}
+        envelopes={envelopes}
       />
     </div>
   );
@@ -2345,6 +2386,7 @@ function Player({
   playheadRef,
   mediaClock,
   captions,
+  envelopes,
   playing,
   resolveAsset,
   sel,
@@ -2361,6 +2403,8 @@ function Player({
   mediaClock: React.MutableRefObject<(() => number | null) | null>;
   /** The project's captions, already laid onto the timeline, or null when off. */
   captions: { lines: CaptionLine[]; style: CaptionStyle } | null;
+  /** Each ducked audio clip's volume envelope, by element id. */
+  envelopes: Map<string, EnvelopePoint[]>;
   playing: boolean;
   resolveAsset: (src: string) => Asset | undefined;
   sel: Sel;
@@ -2471,15 +2515,17 @@ function Player({
         const wanted = (el.trimStart ?? 0) + (t - el.startTime);
         if (inWindow && playing && !track.muted) {
           if (Math.abs(a.currentTime - wanted) > 0.25) a.currentTime = wanted;
-          // The export's afade envelope, so fades sound in the preview as they will in the file.
-          const gain = fadeGain(el, heardFor(el.startTime, dur, cutLength), t - el.startTime);
+          // The export's afade and duck envelopes, so they sound in the preview as they will in the file.
+          const gain =
+            fadeGain(el, heardFor(el.startTime, dur, cutLength), t - el.startTime) *
+            envelopeGain(envelopes.get(el.id) ?? [], t - el.startTime);
           a.volume = Math.min(1, el.volume ?? 1) * gain;
           if (a.paused) a.play().catch(() => {});
         } else if (!a.paused) a.pause();
       }
       void ti;
     }
-  }, [playhead, playing, segments, active, edl.audio]);
+  }, [playhead, playing, segments, active, edl.audio, envelopes]);
 
   // Drag overlays on the stage (position as canvas fractions).
   const dragOverlay = (ti: number, i: number) => (e: React.PointerEvent) => {
@@ -3461,6 +3507,24 @@ function AudioFades({
   );
 }
 
+/**
+ * Ducking for an audio clip: it dips while someone on the main track speaks,
+ * and comes back up in the pauses. Off, or one of three depths.
+ */
+function AudioDuck({ el, hint, onChange }: { el: AudioElement; hint: string | null; onChange: (db: number) => void }) {
+  const db = el.duck ?? 0;
+  const choices: [number, string][] = [[0, "Off"], ...DUCK_CHOICES.map((n): [number, string] => [n, `−${n} dB`])];
+  return (
+    <div className="mb-3">
+      <span className="block text-label text-muted mb-1">Lower under speech</span>
+      <Choice label="Lower under speech" value={db} options={choices} onChange={onChange} />
+      {/* A depth set by an agent may be none of the three. */}
+      {db > 0 && !choices.some(([n]) => n === db) && <p className="text-fine text-muted mt-1">Lowered by {db} dB.</p>}
+      {db > 0 && hint && <p className="text-fine text-muted mt-1">{hint}</p>}
+    </div>
+  );
+}
+
 function Inspector({
   pane,
   edl,
@@ -3469,6 +3533,7 @@ function Inspector({
   srcDur,
   resolveAsset,
   segments,
+  duckHint,
   onDelete,
   brief,
   setBrief,
@@ -3482,6 +3547,8 @@ function Inspector({
   srcDur: (src: string) => number | undefined;
   resolveAsset: (src: string) => Asset | undefined;
   segments: ReturnType<typeof mainSegments>;
+  /** Why a ducked clip shows no dip yet, or null when there is speech to dip under. */
+  duckHint: string | null;
   onDelete: () => void;
   brief: string;
   setBrief: (b: string) => void;
@@ -3772,6 +3839,7 @@ function Inspector({
           // One drag, one undo step: commit() folds edits under 600 ms apart.
           onChange={(k, n) => update((d) => void (d.audio![sel.ti].elements[sel.i][k] = n > 0 ? n : undefined), true)}
         />
+        <AudioDuck el={el} hint={duckHint} onChange={(db) => set((x) => (x.duck = db > 0 ? db : undefined))} />
         <div className="grid grid-cols-2 gap-2">
           <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
           <NumberRow label="Trim start (s)" value={el.trimStart ?? 0} min={0} onChange={(n) => set((x) => (x.trimStart = Math.max(0, n)))} />
@@ -4153,6 +4221,7 @@ function TimelinePanel({
   splitAtPlayhead,
   splitAt,
   deleteSelected,
+  envelopes,
 }: {
   pane: Pane;
   edl: Edl;
@@ -4172,6 +4241,8 @@ function TimelinePanel({
   /** Split the main-track clip under a timeline time (right-click "Split here"). */
   splitAt: (t: number) => void;
   deleteSelected: () => void;
+  /** Each ducked audio clip's volume envelope, by element id. */
+  envelopes: Map<string, EnvelopePoint[]>;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(40); // px per second
@@ -4514,6 +4585,7 @@ function TimelinePanel({
                     title={a?.name}
                   >
                     {a && <Waveform url={assetUrl(a)} width={Math.round(w)} height={ROW_H - 8} />}
+                    <DuckDips points={envelopes.get(el.id)} heard={heardFor(el.startTime, dur, total)} zoom={zoom} height={ROW_H - 8} />
                     <FadeRamps fadeIn={el.fadeIn} fadeOut={el.fadeOut} heard={heardFor(el.startTime, dur, total)} zoom={zoom} height={ROW_H - 8} />
                     <div onPointerDown={floatDrag("aud", ti, i, "resize")} className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize" />
                   </div>
@@ -4545,6 +4617,24 @@ function FadeRamps({ fadeIn, fadeOut, heard, zoom, height }: { fadeIn?: number; 
       {fin > 0 && <line x1={0} y1={height} x2={fin} y2={0} className="stroke-surface" strokeWidth={1} />}
       {fout > 0 && <polygon points={`${end - fout},0 ${end},0 ${end},${height}`} className="fill-surface/60" />}
       {fout > 0 && <line x1={end - fout} y1={0} x2={end} y2={height} className="stroke-surface" strokeWidth={1} />}
+    </svg>
+  );
+}
+
+/** Where a ducked clip dips under speech: the part it lowers is dimmed above the gain line. */
+function DuckDips({ points, heard, zoom, height }: { points?: EnvelopePoint[]; heard: number; zoom: number; height: number }) {
+  if (!points?.length || heard <= 0) return null;
+  const end = heard * zoom;
+  const y = (gain: number) => Math.max(0, Math.min(1, 1 - gain)) * height;
+  const line = [
+    `0,${y(points[0].gain)}`,
+    ...points.filter((p) => p.time > 0 && p.time < heard).map((p) => `${p.time * zoom},${y(p.gain)}`),
+    `${end},${y(envelopeGain(points, heard))}`,
+  ].join(" ");
+  return (
+    <svg className="absolute inset-0 pointer-events-none" width={end} height={height} aria-hidden>
+      <polygon points={`0,0 ${line} ${end},0`} className="fill-surface/60" />
+      <polyline points={line} className="stroke-surface fill-none" strokeWidth={1} />
     </svg>
   );
 }
