@@ -16,6 +16,7 @@ import { captionText, captionTimeline, type PlacedClip } from "../shared/caption
 import { parseVtt, type Cue } from "../shared/transcript";
 import { duckEnvelope, speechSpans } from "../shared/duck";
 import { heardFor } from "../shared/fade";
+import { layOut } from "../shared/transition";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -140,7 +141,19 @@ export async function resolveEdlSources(
     if ("failure" in res) return res;
     staged.set(assetId, res.src);
   }
-  return { edl: layoutText(substituteAssetSrcs(edl, (id) => staged.get(id)!)) };
+  return { edl: dropLeadTransition(layoutText(substituteAssetSrcs(edl, (id) => staged.get(id)!))) };
+}
+
+/**
+ * The first clip has no clip before it to come in from, and the service
+ * refuses a transition there. One can be left on it by an edit (the clip
+ * before it was deleted or moved), and the editor already plays it as a cut.
+ */
+function dropLeadTransition(edl: Edl): Edl {
+  const [first, ...rest] = edl.main.elements;
+  if (!first?.transition) return edl;
+  const { transition: _, ...lead } = first;
+  return { ...edl, main: { ...edl.main, elements: [lead as typeof first, ...rest] } };
 }
 
 /**
@@ -150,7 +163,7 @@ export async function resolveEdlSources(
  * not know. Both are worked out from each clip's stored transcript and the
  * part of it the clip plays, the same way the preview works them out.
  */
-async function expandSpeech(edl: Edl): Promise<Edl> {
+export async function expandSpeech(edl: Edl): Promise<Edl> {
   const { captions, ...rest } = edl;
   const ducked = (edl.audio ?? []).some((t) => t.elements.some((el) => el.duck));
   if (!captions?.enabled && !ducked) return rest as Edl;
@@ -160,16 +173,20 @@ async function expandSpeech(edl: Edl): Promise<Edl> {
   /** The clips whose own sound is in the mix: only their speech ducks the music. */
   const heard: PlacedClip[] = [];
   const cues = new Map<string, Cue[]>();
-  let at = 0;
+  const lengths: number[] = [];
   for (const el of edl.main.elements) {
     let plays = el.duration;
     if (plays === undefined && el.src.startsWith("asset:")) {
       const row = await get<{ duration: number | null }>("SELECT duration FROM assets WHERE id = ?", [el.src.slice(6)]);
       plays = row?.duration ? row.duration - (el.trimStart ?? 0) - (el.trimEnd ?? 0) : 0;
     }
-    plays = Math.max(0, plays ?? 0);
+    lengths.push(Math.max(0, plays ?? 0));
+  }
+  // Where each clip sits, in the whole frames the preview and the render use.
+  const { placed: at, total } = layOut(lengths, edl.main.elements.map((el) => el.transition), edl.output.fps);
+  for (const [i, el] of edl.main.elements.entries()) {
     if (el.type === "video" && el.src.startsWith("asset:")) {
-      const clip = { src: el.src, start: at, dur: plays, trimStart: el.trimStart ?? 0 };
+      const clip = { src: el.src, start: at[i].start, dur: at[i].dur, trimStart: el.trimStart ?? 0 };
       placed.push(clip);
       if (el.sourceAudio !== false && (el.volume ?? 1) > 0) heard.push(clip);
       if (!cues.has(el.src)) {
@@ -180,11 +197,10 @@ async function expandSpeech(edl: Edl): Promise<Edl> {
         if (row?.transcript && row.transcript_lang === lang) cues.set(el.src, parseVtt(row.transcript));
       }
     }
-    at += plays;
   }
 
   let out = rest as Edl;
-  if (ducked) out = await duckAudio(out, speechSpans(heard, cues), at);
+  if (ducked) out = await duckAudio(out, speechSpans(heard, cues), total);
   if (!captions?.enabled) return out;
   const lines = captionTimeline(placed, cues, captions.style.maxChars);
   if (lines.length === 0) return out;

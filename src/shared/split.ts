@@ -13,6 +13,9 @@ export interface SplittableClip {
   trimStart?: number;
   trimEnd?: number;
   duration?: number;
+  fadeIn?: number;
+  fadeOut?: number;
+  transition?: unknown;
 }
 
 /**
@@ -39,5 +42,23 @@ export function splitClip<T extends SplittableClip>(
     delete second.trimEnd;
   }
   // Otherwise the second half keeps the clip's own tail trim and plays on to it.
+  keepEdgeFades([first, second]);
   return [first, second];
+}
+
+/**
+ * A fade belongs to the outer edge of the clip it was set on, and so does a
+ * transition, which is how the clip comes in. When a clip becomes several
+ * pieces (split, or cleaned up into the parts worth keeping) the first keeps
+ * the fade-in and the transition, the last the fade-out, and the cuts between
+ * them are hard. Mutates the pieces, in play order.
+ */
+export function keepEdgeFades(pieces: { fadeIn?: number; fadeOut?: number; transition?: unknown }[]): void {
+  pieces.forEach((piece, n) => {
+    if (n > 0) {
+      delete piece.fadeIn;
+      delete piece.transition;
+    }
+    if (n < pieces.length - 1) delete piece.fadeOut;
+  });
 }
