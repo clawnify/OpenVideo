@@ -80,6 +80,32 @@ describe("Ask operations", () => {
     expect(apply(d, "fade", { clip: 0 })).toHaveProperty("error");
   });
 
+  it("joins one cut, or every cut, with a transition, and removes it with none", () => {
+    const d = edl();
+    d.main.elements.push({ id: "c", type: "image", src: "asset:three", duration: 3 });
+    expect(apply(d, "transition", { clip: 1, type: "dissolve" })).toMatchObject({ said: "Joined clip 1 with a 0.5s dissolve" });
+    expect(d.main.elements[1].transition).toEqual({ type: "dissolve", duration: 0.5 });
+    expect(apply(d, "transition", { every: true, type: "fade-black", seconds: 9 })).toMatchObject({
+      said: "Joined every cut with a 5.0s fade through black",
+    });
+    expect(d.main.elements.map((e) => e.transition?.type)).toEqual([undefined, "fade-black", "fade-black"]);
+    expect(apply(d, "transition", { clip: 2, type: "none" })).toMatchObject({ said: "Removed the transition into clip 2" });
+    expect(d.main.elements[2].transition).toBeUndefined();
+    expect(apply(d, "transition", { clip: 0, type: "dissolve" })).toHaveProperty("error");
+    expect(apply(d, "transition", { clip: 1, type: "spin" })).toHaveProperty("error");
+    expect(apply(d, "transition", { clip: 7, type: "dissolve" })).toHaveProperty("error");
+  });
+
+  it("clean up keeps a clip's transition on its first part, where it comes in", async () => {
+    const d = edl();
+    d.main.elements[1] = { ...d.main.elements[1], duration: 25, transition: { type: "wipe-left", duration: 1 } };
+    await cleanUp(d, { clip: 1 }, new Map(), async () => ({
+      keeps: [{ start: 2, end: 9 }, { start: 11, end: 15 }],
+      notes: "",
+    }));
+    expect(d.main.elements.slice(1).map((e) => e.transition?.type)).toEqual(["wipe-left", undefined]);
+  });
+
   it("clean up leaves a clip alone when nothing needs cutting", async () => {
     const d = edl();
     const out = await cleanUp(d, { clip: 0 }, new Map(), async () => ({ keeps: [{ start: 5, end: 25 }], notes: "clean" }));

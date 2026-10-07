@@ -104,7 +104,8 @@ A complete document:
     "elements": [
       { "id": "intro", "type": "video", "src": "asset:3f9c2a1b8d4e6f70", "trimStart": 2 },
       { "id": "screen", "type": "video", "src": "asset:9a1d4c7e2b5f8036", "fit": "cover", "sourceAudio": false },
-      { "id": "outro", "type": "image", "src": "asset:5e8b1f4a7c2d9063", "duration": 3 }
+      { "id": "outro", "type": "image", "src": "asset:5e8b1f4a7c2d9063", "duration": 3,
+        "transition": { "type": "dissolve", "duration": 0.5 } }
     ]
   },
   "overlays": [
@@ -150,7 +151,20 @@ down to black, and the clip's own sound with it: end the video on a fade with
 with `fadeOut` on one and `fadeIn` on the next. Nothing on the timeline moves,
 so overlay and audio times stay as they are. On a text or media overlay they
 fade it from and to transparent; a fade-out on an overlay that runs past the
-end of the video ends where the video does. Text overlays: `fontFamily`
+end of the video ends where the video does. A main-track clip after the first
+takes `transition: { "type", "duration" }`, how it comes in from the clip
+before it instead of a hard cut: `dissolve` (a cross-dissolve), `fade-black`
+and `fade-white` (through a colour), `wipe-left`, `wipe-right`, `wipe-up`,
+`wipe-down` (the edge travels that way), `slide-left`, `slide-right`,
+`slide-up`, `slide-down` (the next clip pushes the last one out), `blur` or
+`pixelize`; `duration` is 0.05 to 5 seconds, and 0.5 suits most cuts. It is
+centred on the cut, half before it and half after, and moves no clip: the
+outgoing clip plays on past its out-point and the incoming one starts before
+its in-point, into the footage beyond their trims (a clip that starts at 0:00
+holds its first frame for that part). So overlay and audio times stay where
+they are and the video keeps its length. One longer than the clips on either
+side allow is shortened to fit, and one on the first clip is left out of the
+export. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
 `background` (`#RRGGBBAA` works), optional `stroke: { "color": "#000000",
 "width": 4 }` for an outline around the letters (opaque colour; `width` in px

@@ -10,7 +10,7 @@
 // array — reordering is a splice, splitting is two trims), saved with a
 // debounced PUT; validation errors surface with their JSON pointer.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { keepEdgeFades, splitClip } from "../shared/split";
 import { drawnStroke, maxStrokeWidth, outlineShadow } from "../shared/outline";
@@ -24,6 +24,16 @@ import {
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
 import { fadeGain, heardFor } from "../shared/fade";
+import {
+  DEFAULT_TRANSITION_SECONDS,
+  MAX_TRANSITION_SECONDS,
+  TRANSITION_GROUPS,
+  layOut,
+  transitionLook,
+  transitionName,
+  type Transition,
+  type TransitionType,
+} from "../shared/transition";
 import {
   FULL,
   cropToRatio,
@@ -142,6 +152,8 @@ interface MainVideo {
   /** Seconds to fade from and to black (shared/fade.ts). */
   fadeIn?: number;
   fadeOut?: number;
+  /** How it comes in from the clip before it (shared/transition.ts). */
+  transition?: Transition;
 }
 interface MainImage {
   id: string;
@@ -154,6 +166,7 @@ interface MainImage {
   /** Seconds to fade from and to black (shared/fade.ts). */
   fadeIn?: number;
   fadeOut?: number;
+  transition?: Transition;
 }
 type MainElement = MainVideo | MainImage;
 
@@ -375,15 +388,25 @@ function mainDur(el: MainElement, srcDur: (src: string) => number | undefined): 
   return Math.max(0, d - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
 }
 
-/** Segments of the main track on the output timeline. */
+/**
+ * Segments of the main track on the output timeline: end to end, in whole
+ * output frames as the export renders them, each with the transition into it
+ * around its start (`before` / `after` the cut), shortened to fit as the
+ * export does (shared/transition.ts).
+ */
 function mainSegments(edl: Edl, srcDur: (src: string) => number | undefined) {
-  let t = 0;
-  return edl.main.elements.map((el, i) => {
-    const dur = mainDur(el, srcDur);
-    const seg = { el, i, start: t, dur };
-    t += dur;
-    return seg;
-  });
+  const els = edl.main.elements;
+  const { placed } = layOut(
+    els.map((el) => mainDur(el, srcDur)),
+    els.map((el) => el.transition),
+    edl.output.fps,
+  );
+  return els.map((el, i) => ({ el, i, ...placed[i] }));
+}
+
+/** Where the cut ends: the last clip's end, in the same whole frames. */
+function cutEnd(segments: { start: number; dur: number }[]): number {
+  return segments.reduce((end, s) => Math.max(end, s.start + s.dur), 0);
 }
 
 // ── media metadata / filmstrip / waveform caches (module-level) ─────────────
@@ -791,6 +814,8 @@ type Pane = "library" | "canvas" | "inspector";
 
 type Sel =
   | { area: "main"; i: number }
+  /** The cut into main clip `i`, where its transition sits. */
+  | { area: "cut"; i: number }
   | { area: "ovl"; ti: number; i: number }
   | { area: "aud"; ti: number; i: number }
   | null;
@@ -956,7 +981,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
 
   // ── derived timeline ──────────────────────────────────────────────────────
   const segments = useMemo(() => mainSegments(edl, srcDur), [edl, srcDur]);
-  const total = segments.reduce((a, s) => a + s.dur, 0);
+  const total = cutEnd(segments);
 
   // Captions: the transcripts of the videos on the timeline, and the caption
   // lines they give once laid onto it. Worked out, never stored.
@@ -1072,7 +1097,9 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         keepEdgeFades([el, right]);
         d.main.elements.splice(seg.i + 1, 0, right);
       } else {
-        const halves = splitClip(structuredClone(el), off, seg.dur, rid());
+        // Its own length, not the whole frames it is drawn at: a play window
+        // rounded up could ask the export for more than the source has.
+        const halves = splitClip(structuredClone(el), off, mainDur(el, srcDur), rid());
         if (halves) d.main.elements.splice(seg.i, 1, ...halves);
       }
     });
@@ -1084,6 +1111,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     if (!sel) return;
     update((d) => {
       if (sel.area === "main") d.main.elements.splice(sel.i, 1);
+      if (sel.area === "cut") delete d.main.elements[sel.i]?.transition;
       if (sel.area === "ovl") d.overlays?.[sel.ti]?.elements.splice(sel.i, 1);
       if (sel.area === "aud") d.audio?.[sel.ti]?.elements.splice(sel.i, 1);
     });
@@ -2413,10 +2441,30 @@ function Player({
   }, [edl.output.width, edl.output.height]);
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
-  const cutLength = segments.reduce((n, s) => n + s.dur, 0);
-  // The playing clip's fade, as the export draws it: the canvas goes to black
-  // and the clip's own sound to silence over the same windows.
-  const clipGain = active && active.dur > 0 ? fadeGain(active.el, active.dur, playhead - active.start) : 1;
+  const cutLength = cutEnd(segments);
+  // A transition under way, centred on its cut: both clips on screen from
+  // `before` ahead of the cut to `after` past it. The clip under the playhead
+  // stays `active`, the one the clock follows; the other plays alongside it,
+  // into the footage past its trim.
+  const across = segments.find(
+    (s) => s.i > 0 && s.before + s.after > 0 && playhead >= s.start - s.before && playhead < s.start + s.after,
+  );
+  const blend =
+    across?.el.transition
+      ? {
+          from: segments[across.i - 1],
+          to: across,
+          look: transitionLook(across.el.transition.type, (playhead - (across.start - across.before)) / (across.before + across.after), edl.output),
+        }
+      : null;
+  type Seg = (typeof segments)[number];
+  /** On screen and playing: the active clip, and both sides of a transition. */
+  const live = (seg: Seg) => seg.dur > 0 && (seg === active || (!!blend && (seg === blend.from || seg === blend.to)));
+  /** How a clip's layer is drawn now: as itself, or partway through a transition. */
+  const layerLook = (seg: Seg) => (blend && seg === blend.from ? blend.look.from : blend && seg === blend.to ? blend.look.to : undefined);
+  /** A clip's sound in a transition, on acrossfade's curve; 1 otherwise. */
+  const crossGain = (seg: Seg) => (blend && seg === blend.from ? blend.look.gains[0] : blend && seg === blend.to ? blend.look.gains[1] : 1);
+  const filterId = useId().replace(/:/g, "");
   /** An overlay's opacity right now: its own times its fades. */
   const overlayOpacity = (el: { startTime: number; duration: number; opacity?: number; fadeIn?: number; fadeOut?: number }) =>
     (el.opacity ?? 1) * fadeGain(el, heardFor(el.startTime, el.duration, cutLength), playhead - el.startTime);
@@ -2467,19 +2515,32 @@ function Player({
     for (const seg of segments) {
       const v = videoRefs.current.get(seg.el.id);
       if (!v || seg.el.type !== "video") continue;
-      const isActive = seg === active && seg.dur > 0;
-      const wanted = (seg.el.trimStart ?? 0) + (t - seg.start);
-      if (isActive) {
+      if (live(seg)) {
+        // In a transition a clip plays past its trims. Where its source has
+        // nothing there (it starts at 0:00, or ends) the edge frame holds, as
+        // in the export; play() on an ended video would start it over instead.
+        const end = Number.isFinite(v.duration) ? v.duration : Infinity;
+        const raw = (seg.el.trimStart ?? 0) + (t - seg.start);
+        const wanted = Math.max(0, Math.min(raw, end));
+        const hold = raw < 0 || raw >= end - 0.05;
         // Playing, the video leads and needs no correction; only a real jump
         // (a scrub, or a cut to another clip) is worth a seek, because each
         // one empties the buffer. Paused, follow the playhead closely.
-        const jumped = Math.abs(v.currentTime - wanted) > (playing ? 0.75 : 0.05);
+        const jumped = Math.abs(v.currentTime - wanted) > (playing && !hold ? 0.75 : 0.05);
         if (jumped && !v.seeking) v.currentTime = wanted;
-        v.volume = Math.min(1, seg.el.volume ?? 1) * fadeGain(seg.el, seg.dur, t - seg.start);
+        v.volume = Math.min(1, Math.min(1, seg.el.volume ?? 1) * fadeGain(seg.el, seg.dur, t - seg.start) * crossGain(seg));
         v.muted = seg.el.sourceAudio === false;
-        if (playing && v.paused) v.play().catch(() => {});
-        if (!playing && !v.paused) v.pause();
-      } else if (!v.paused) v.pause();
+        if (playing && !hold && v.paused) v.play().catch(() => {});
+        if ((!playing || hold) && !v.paused) v.pause();
+      } else {
+        if (!v.paused) v.pause();
+        // The clip after the active one waits where it will start playing: its
+        // first frame, or as far before it as its transition in reaches. A clip
+        // that starts where it was last left, within the seek tolerance above,
+        // runs ahead of the clock, and the playhead jumps when it takes over.
+        const first = Math.max(0, (seg.el.trimStart ?? 0) - seg.before);
+        if (active && seg.i === active.i + 1 && !v.seeking && Math.abs(v.currentTime - first) > 0.05) v.currentTime = first;
+      }
     }
     for (const [ti, track] of (edl.audio ?? []).entries()) {
       for (const el of track.elements) {
@@ -2498,7 +2559,7 @@ function Player({
       }
       void ti;
     }
-  }, [playhead, playing, segments, active, edl.audio]);
+  }, [playhead, playing, segments, active, blend?.to, edl.audio]);
 
   // Drag overlays on the stage (position as canvas fractions).
   const dragOverlay = (ti: number, i: number) => (e: React.PointerEvent) => {
@@ -2592,11 +2653,23 @@ function Player({
           style={{ background: edl.output.background ?? "#000" }}
           onPointerDown={stagePointerDown}
         >
-          {/* main track media (stacked; active visible) */}
+          {/* main track media: a full-frame layer per clip, the active one shown,
+              and in a transition the clip coming in drawn over it */}
+          {blend?.look.through && (
+            <div className="absolute inset-0 pointer-events-none" style={{ background: blend.look.through }} />
+          )}
+          {blend && (blend.look.blurBox || blend.look.block) ? (
+            <TransitionFilter id={filterId} blurBox={blend.look.blurBox} block={blend.look.block} scale={scale} />
+          ) : null}
           {segments.map((seg) => {
             const a = resolveAsset(seg.el.src);
             if (!a) return null;
-            const visible = seg === active && seg.dur > 0;
+            const visible = live(seg);
+            const look = layerLook(seg);
+            const effect = look && ((blend?.look.blurBox ?? 0) > 1 || (blend?.look.block ?? 0) * scale >= 1) ? `url(#${filterId})` : undefined;
+            // The clip's own fade, as the export draws it before any transition
+            // joins it to the next: the whole frame to black.
+            const gain = visible ? fadeGain(seg.el, seg.dur, playhead - seg.start) : 1;
             const fit = seg.el.fit ?? "contain";
             const at = fit === "cover" ? (seg.el.anchor ?? CENTRE) : CENTRE;
             const shape = seg.el.crop ? shapeFor(a) : undefined;
@@ -2613,13 +2686,22 @@ function Player({
               onLoadedMetadata: noteSize(a.id),
               onLoad: noteSize(a.id),
             };
-            // The same wrapper either way, so cropping never reloads the video.
             return (
               <div
                 key={seg.el.id}
-                className={`absolute ${place ? "overflow-hidden" : "inset-0"} ${visible ? "" : "hidden"}`}
-                style={place ? pct(place.box) : undefined}
+                className={`absolute inset-0 ${visible ? "" : "hidden"}`}
+                // The background fills the bars, so a clip blends, wipes and
+                // slides together with them, as each is one frame in the export.
+                style={{
+                  background: edl.output.background ?? "#000",
+                  opacity: look?.opacity,
+                  transform: look?.transform,
+                  clipPath: look?.clipPath,
+                  filter: effect,
+                }}
               >
+              {/* The same wrapper either way, so cropping never reloads the video. */}
+              <div className={`absolute ${place ? "overflow-hidden" : "inset-0"}`} style={place ? pct(place.box) : undefined}>
                 {seg.el.type === "video" ? (
                   a.media_uid ? (
                     <MediaVideo
@@ -2648,14 +2730,14 @@ function Player({
                   <img key={seg.el.id} src={assetUrl(a)} {...common} />
                 )}
               </div>
+              {/* its fade to black, over the clip and under everything laid on it */}
+              {gain < 1 && (
+                // The export's fade colour, whatever the project's background.
+                <div className="absolute inset-0 pointer-events-none" style={{ background: "#000", opacity: 1 - gain }} />
+              )}
+              </div>
             );
           })}
-
-          {/* the playing clip's fade to black, over the clip and under everything laid on it */}
-          {clipGain < 1 && (
-            // The export's fade colour, whatever the project's background.
-            <div className="absolute inset-0 pointer-events-none" style={{ background: "#000", opacity: 1 - clipGain }} />
-          )}
 
           {/* project captions, under the overlays so a title placed by hand stays on top */}
           {captions &&
@@ -2760,6 +2842,35 @@ function Player({
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * A blur or pixelate transition's effect, as an SVG filter both clips' layers
+ * use. Sizes come in output pixels (shared/transition.ts) and are drawn at the
+ * stage's scale. The blur is centred where xfade's box runs right of each
+ * pixel, which does not read at half a frame's spread; the blocks sample each
+ * square at its centre, as xfade does.
+ */
+function TransitionFilter({ id, blurBox, block, scale }: { id: string; blurBox?: number; block?: number; scale: number }) {
+  const b = (block ?? 0) * scale;
+  return (
+    <svg className="absolute w-0 h-0" aria-hidden>
+      <filter id={id} x="0" y="0" width="100%" height="100%" colorInterpolationFilters="sRGB">
+        {blurBox && blurBox > 1 ? (
+          // A box of width w spreads like a Gaussian of deviation w/√12.
+          <feGaussianBlur stdDeviation={`${(blurBox / Math.sqrt(12)) * scale} 0`} edgeMode="duplicate" />
+        ) : b >= 1 ? (
+          <>
+            <feFlood x={b / 2} y={b / 2} width={1} height={1} />
+            <feComposite width={b} height={b} />
+            <feTile result="grid" />
+            <feComposite in="SourceGraphic" in2="grid" operator="in" />
+            <feMorphology operator="dilate" radius={b / 2} />
+          </>
+        ) : null}
+      </filter>
+    </svg>
   );
 }
 
@@ -3487,6 +3598,168 @@ function Fades({
   );
 }
 
+/**
+ * A style's icon: how the picture changes, drawn small. Wipes and slides are
+ * drawn moving left and turned for the other directions.
+ */
+function TransitionIcon({ type, className = "w-4 h-4" }: { type?: TransitionType; className?: string }) {
+  const turn = type?.endsWith("-right") ? 180 : type?.endsWith("-up") ? 90 : type?.endsWith("-down") ? -90 : 0;
+  const glyph = (() => {
+    switch (type) {
+      case undefined:
+        // A cut: two clips meeting, the mark editors put on an edit.
+        return <path d="M2.5 4v8l5.5-4zM13.5 4v8L8 8z" fill="currentColor" stroke="none" />;
+      case "dissolve":
+        return (
+          <>
+            <rect x="1.75" y="3.25" width="8.5" height="8.5" rx="1.5" />
+            <rect x="5.75" y="4.25" width="8.5" height="8.5" rx="1.5" fill="currentColor" fillOpacity={0.35} />
+          </>
+        );
+      case "fade-black":
+      case "fade-white":
+        // Out of one frame, through a solid one (or a blank one), into the next.
+        return (
+          <>
+            <rect x="1" y="4.5" width="4" height="7" rx="1" />
+            <rect x="6" y="4.5" width="4" height="7" rx="1" fill={type === "fade-black" ? "currentColor" : "none"} />
+            <rect x="11" y="4.5" width="4" height="7" rx="1" />
+          </>
+        );
+      case "blur":
+        return (
+          <>
+            <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" />
+            <path d="M4.5 6.5h7M3.5 8h9M5 9.5h5.5" />
+          </>
+        );
+      case "pixelize":
+        return (
+          <>
+            <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" />
+            <path d="M2 3h6v5H2zM8 8h6v5H8z" fill="currentColor" fillOpacity={0.45} stroke="none" />
+          </>
+        );
+      default:
+        return type.startsWith("wipe") ? (
+          // The edge sweeping across the frame.
+          <>
+            <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" />
+            <path d="M8 2.75v10.5" />
+            <path d="M8.75 3h4a1.25 1.25 0 0 1 1.25 1.25v7.5A1.25 1.25 0 0 1 12.75 13h-4z" fill="currentColor" fillOpacity={0.35} stroke="none" />
+            <path d="M6.5 8H3.5M5 6.5 3.5 8 5 9.5" />
+          </>
+        ) : (
+          // The next frame pushing in, the arrow its way.
+          <>
+            <rect x="6.25" y="3.75" width="8" height="8.5" rx="1.5" fill="currentColor" fillOpacity={0.35} />
+            <path d="M4.25 8H1M2.5 6.5 1 8l1.5 1.5" />
+          </>
+        );
+    }
+  })();
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.25}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={turn ? { transform: `rotate(${turn}deg)` } : undefined}
+      aria-hidden
+    >
+      {glyph}
+    </svg>
+  );
+}
+
+/** A tile's short name: its group says the rest ("Wipe" over "Left"). */
+const tileName = (name: string) => {
+  const short = name.replace(/^(Wipe|Slide|Fade) /, "");
+  return short.charAt(0).toUpperCase() + short.slice(1);
+};
+
+/**
+ * The transition on one cut: a style from the tiles (or none, a cut), its
+ * length, and a way to put the same one on every cut. `plays` is what it
+ * actually gets once shortened to fit the clips on either side
+ * (shared/transition.ts).
+ */
+function TransitionPanel({
+  value,
+  plays,
+  shortened,
+  onChange,
+  onApplyToAll,
+}: {
+  value?: Transition;
+  plays: number;
+  shortened: boolean;
+  onChange: (t: Transition | undefined, coalesce?: boolean) => void;
+  onApplyToAll: (t: Transition) => void;
+}) {
+  const tile = (key: string, chosen: boolean, title: string, label: string, icon: React.ReactNode, pick: () => void) => (
+    <button
+      key={key}
+      onClick={pick}
+      title={title}
+      aria-pressed={chosen}
+      className={`flex flex-col items-center gap-1 rounded-sm px-1 py-2 text-fine leading-tight text-center ${
+        chosen ? "bg-surface-sunken text-foreground shadow-edge" : "text-muted hover:bg-surface-sunken hover:text-foreground"
+      }`}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+  return (
+    <>
+      <div className="grid grid-cols-3 gap-1 mb-3">
+        {tile("cut", !value, "Cut: no transition", "Cut", <TransitionIcon className="w-6 h-6" />, () => onChange(undefined))}
+      </div>
+      {TRANSITION_GROUPS.map((group) => (
+        <div key={group.label} className="mb-3">
+          <span className="block text-label text-muted mb-1">{group.label}</span>
+          <div className="grid grid-cols-3 gap-1">
+            {group.items.map((item) =>
+              tile(item.type, item.type === value?.type, item.name, tileName(item.name), <TransitionIcon type={item.type} className="w-6 h-6" />, () =>
+                onChange({ type: item.type, duration: value?.duration ?? DEFAULT_TRANSITION_SECONDS }),
+              ),
+            )}
+          </div>
+        </div>
+      ))}
+      {value && (
+        <Row label={`Length: ${value.duration.toFixed(1)}s`}>
+          <input
+            type="range"
+            className="w-full"
+            aria-label="Transition length"
+            value={value.duration}
+            min={0.1}
+            max={MAX_TRANSITION_SECONDS}
+            step={0.1}
+            // One drag, one undo step, as on the fade sliders.
+            onChange={(e) => onChange({ ...value, duration: Number(e.target.value) }, true)}
+          />
+        </Row>
+      )}
+      {value && shortened && (
+        <p className="text-fine text-muted -mt-2 mb-3">
+          Plays {plays.toFixed(1)}s: the clips on either side are too short for more.
+        </p>
+      )}
+      {value && (
+        <button onClick={() => onApplyToAll(value)} className={`${btnSecondary} ${stretch}`}>
+          Apply to every cut
+        </button>
+      )}
+    </>
+  );
+}
+
 function Inspector({
   pane,
   edl,
@@ -3541,6 +3814,32 @@ function Inspector({
           </div>
         </div>
       );
+
+    if (sel.area === "cut") {
+      const el = edl.main.elements[sel.i];
+      const seg = segments.find((x) => x.i === sel.i);
+      if (!el || !seg || sel.i === 0) return null;
+      const plays = seg.before + seg.after;
+      return (
+        <>
+          <Zone>Transition</Zone>
+          <TransitionPanel
+            value={el.transition}
+            plays={plays}
+            // Within half a frame is the length asked for, rounded to frames.
+            shortened={!!el.transition && plays < el.transition.duration - 0.5 / edl.output.fps}
+            onChange={(t, coalesce) =>
+              update((d) => {
+                const clip = d.main.elements[sel.i];
+                if (t) clip.transition = t;
+                else delete clip.transition;
+              }, coalesce)
+            }
+            onApplyToAll={(t) => update((d) => d.main.elements.forEach((clip, k) => k > 0 && (clip.transition = { ...t })))}
+          />
+        </>
+      );
+    }
 
     if (sel.area === "main") {
       const el = edl.main.elements[sel.i];
@@ -3796,7 +4095,7 @@ function Inspector({
           <SliderRow label="Opacity" value={el.opacity ?? 1} onChange={(n) => set((x) => (x.opacity = n))} />
           <Fades
             el={el}
-            heard={heardFor(el.startTime, el.duration, segments.reduce((n, s) => n + s.dur, 0))}
+            heard={heardFor(el.startTime, el.duration, cutEnd(segments))}
             onChange={(k, n) => update((d) => void (d.overlays![sel.ti].elements[sel.i][k] = n > 0 ? n : undefined), true)}
           />
           <div className="grid grid-cols-2 gap-2">
@@ -3811,7 +4110,7 @@ function Inspector({
     if (!el) return null;
     const set = (fn: (e: AudioElement) => void) => update((d) => fn(d.audio![sel.ti].elements[sel.i]));
     const clipDur = el.duration ?? Math.max(0, (srcDur(el.src) ?? 0) - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
-    const heard = heardFor(el.startTime, clipDur, segments.reduce((n, s) => n + s.dur, 0));
+    const heard = heardFor(el.startTime, clipDur, cutEnd(segments));
     return (
       <>
         <Zone>Audio</Zone>
@@ -3834,9 +4133,9 @@ function Inspector({
   return (
     <div className={`${pane === "inspector" ? "block" : "hidden"} lg:block w-full lg:w-64 shrink-0 border-l border-border bg-surface overflow-y-auto p-4`}>
       {body()}
-      {sel && (
+      {sel && (sel.area !== "cut" || edl.main.elements[sel.i]?.transition) && (
         <button onClick={onDelete} className={`${btnDanger} ${stretch} mt-2`}>
-          <Trash2 className="w-4 h-4" /> Delete
+          <Trash2 className="w-4 h-4" /> {sel.area === "cut" ? "Remove transition" : "Delete"}
         </button>
       )}
     </div>
@@ -4180,7 +4479,7 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
 // ── timeline ────────────────────────────────────────────────────────────────
 
 const RULER_H = 22;
-const MAIN_H = 52;
+const MAIN_H = 40;
 /** Space between neighbouring clips on the main track, in pixels. */
 const CLIP_GAP = 4;
 const ROW_H = 30;
@@ -4406,7 +4705,7 @@ function TimelinePanel({
           </div>
 
           {/* main track */}
-          <TrackRow label="Video" height={MAIN_H}>
+          <TrackRow label="Video" height={MAIN_H} group>
             {segments.map((seg) => {
               const a = resolveAsset(seg.el.src);
               const selected = sel?.area === "main" && sel.i === seg.i;
@@ -4469,7 +4768,8 @@ function TimelinePanel({
                     <img src={assetUrl(a)} className="w-full h-full object-cover" />
                   ) : null}
                   <FadeRamps fadeIn={seg.el.fadeIn} fadeOut={seg.el.fadeOut} heard={seg.dur} zoom={zoom} height={MAIN_H - 8} />
-                  <div className="absolute left-1 bottom-0.5 text-fine text-on-accent/90 drop-shadow truncate max-w-[90%] tabular-nums">
+                  {/* Clear of the cut's mark, which sits half over a clip's start. */}
+                  <div className={`absolute ${seg.i > 0 ? "left-3" : "left-1"} bottom-0.5 text-fine text-on-accent/90 drop-shadow truncate max-w-[90%] tabular-nums`}>
                     {a?.name} · {seg.dur.toFixed(1)}s
                   </div>
                   <div onPointerDown={trimDrag(seg.i, "l")} className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize bg-white/0 hover:bg-white/30" />
@@ -4493,6 +4793,41 @@ function TimelinePanel({
                   </ContextMenuItem>
                 </ContextMenuContent>
                 </ContextMenu>
+              );
+            })}
+            {/* Each cut between two clips carries a mark, centred in the gap: its
+                transition's icon, or (on hover) the way to add one. A transition
+                also tints the stretch it plays, half each side of the cut, without
+                taking the pointer from the clips' trim handles under it. */}
+            {segments.slice(1).map((seg) => {
+              const t = seg.el.transition;
+              const span = seg.before + seg.after;
+              const chosen = sel?.area === "cut" && sel.i === seg.i;
+              const at = seg.start * zoom - CLIP_GAP / 2;
+              return (
+                <div key={`cut-${seg.el.id}`}>
+                  {t && span > 0 && (
+                    <div
+                      className="absolute z-[4] top-1 bottom-1 rounded-xs bg-white/15 ring-1 ring-inset ring-white/60 pointer-events-none"
+                      style={{ left: (seg.start - seg.before) * zoom, width: span * zoom }}
+                    />
+                  )}
+                  <button
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={() => {
+                      if (!t) update((d) => void (d.main.elements[seg.i].transition = { type: "dissolve", duration: DEFAULT_TRANSITION_SECONDS }));
+                      setSel({ area: "cut", i: seg.i });
+                    }}
+                    className={`absolute z-[6] top-1/2 grid place-items-center w-5 h-5 rounded-xs bg-surface shadow-raised ${
+                      t ? "text-foreground" : "text-muted opacity-0 group-hover/track:opacity-100 focus-visible:opacity-100"
+                    } ${chosen ? "ring-2 ring-ring opacity-100" : ""}`}
+                    style={{ left: at, transform: "translate(-50%, -50%)" }}
+                    title={t ? `${transitionName(t.type)}, ${span.toFixed(1)}s` : "Add transition"}
+                    aria-label={t ? `${transitionName(t.type)} between clips ${seg.i} and ${seg.i + 1}` : `Add a transition between clips ${seg.i} and ${seg.i + 1}`}
+                  >
+                    <TransitionIcon type={t?.type} className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               );
             })}
           </TrackRow>
@@ -4602,14 +4937,27 @@ function FadeRamps({ fadeIn, fadeOut, heard, zoom, height }: { fadeIn?: number; 
   );
 }
 
-function TrackRow({ label, height, action, children }: { label: string; height: number; action?: React.ReactNode; children: React.ReactNode }) {
+function TrackRow({
+  label,
+  height,
+  action,
+  group = false,
+  children,
+}: {
+  label: string;
+  height: number;
+  action?: React.ReactNode;
+  /** Lets marks inside show on hover of the whole track (`group-hover/track:`). */
+  group?: boolean;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex" style={{ height }}>
       <div style={{ width: HEAD_W }} className="shrink-0 border-r border-b border-border px-2 flex items-center justify-between bg-surface sticky left-0 z-10">
         <span className="text-fine text-muted truncate">{label}</span>
         {action}
       </div>
-      <div className="relative flex-1 border-b border-border bg-surface-sunken/50" data-empty>
+      <div className={`relative flex-1 border-b border-border bg-surface-sunken/50 ${group ? "group/track" : ""}`} data-empty>
         {children}
       </div>
     </div>

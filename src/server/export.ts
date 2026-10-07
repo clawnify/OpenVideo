@@ -14,6 +14,7 @@ import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { drawnStroke } from "../shared/outline";
 import { captionText, captionTimeline, type PlacedClip } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
+import { layOut } from "../shared/transition";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -138,7 +139,19 @@ export async function resolveEdlSources(
     if ("failure" in res) return res;
     staged.set(assetId, res.src);
   }
-  return { edl: layoutText(substituteAssetSrcs(edl, (id) => staged.get(id)!)) };
+  return { edl: dropLeadTransition(layoutText(substituteAssetSrcs(edl, (id) => staged.get(id)!))) };
+}
+
+/**
+ * The first clip has no clip before it to come in from, and the service
+ * refuses a transition there. One can be left on it by an edit (the clip
+ * before it was deleted or moved), and the editor already plays it as a cut.
+ */
+function dropLeadTransition(edl: Edl): Edl {
+  const [first, ...rest] = edl.main.elements;
+  if (!first?.transition) return edl;
+  const { transition: _, ...lead } = first;
+  return { ...edl, main: { ...edl.main, elements: [lead as typeof first, ...rest] } };
 }
 
 /**
@@ -147,22 +160,26 @@ export async function resolveEdlSources(
  * from each clip's stored transcript and the part of it the clip plays, the
  * same way the preview works them out.
  */
-async function expandCaptions(edl: Edl): Promise<Edl> {
+export async function expandCaptions(edl: Edl): Promise<Edl> {
   const { captions, ...rest } = edl;
   if (!captions?.enabled) return rest as Edl;
 
   const placed: PlacedClip[] = [];
   const cues = new Map<string, Cue[]>();
-  let at = 0;
+  const lengths: number[] = [];
   for (const el of edl.main.elements) {
     let plays = el.duration;
     if (plays === undefined && el.src.startsWith("asset:")) {
       const row = await get<{ duration: number | null }>("SELECT duration FROM assets WHERE id = ?", [el.src.slice(6)]);
       plays = row?.duration ? row.duration - (el.trimStart ?? 0) - (el.trimEnd ?? 0) : 0;
     }
-    plays = Math.max(0, plays ?? 0);
+    lengths.push(Math.max(0, plays ?? 0));
+  }
+  // Where each clip sits, in the whole frames the preview and the render use.
+  const { placed: at } = layOut(lengths, edl.main.elements.map((el) => el.transition), edl.output.fps);
+  for (const [i, el] of edl.main.elements.entries()) {
     if (el.type === "video" && el.src.startsWith("asset:")) {
-      placed.push({ src: el.src, start: at, dur: plays, trimStart: el.trimStart ?? 0 });
+      placed.push({ src: el.src, start: at[i].start, dur: at[i].dur, trimStart: el.trimStart ?? 0 });
       if (!cues.has(el.src)) {
         const row = await get<{ transcript: string | null; transcript_lang: string | null }>(
           "SELECT transcript, transcript_lang FROM assets WHERE id = ?",
@@ -171,7 +188,6 @@ async function expandCaptions(edl: Edl): Promise<Edl> {
         if (row?.transcript && row.transcript_lang === captions.lang) cues.set(el.src, parseVtt(row.transcript));
       }
     }
-    at += plays;
   }
 
   const lines = captionTimeline(placed, cues, captions.style.maxChars);
