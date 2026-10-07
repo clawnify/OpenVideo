@@ -12,6 +12,14 @@
 import { MAX_TEXT_CHARS, validateEdl, type Edl, type EdlInvalid } from "./edl";
 import { keepEdgeFades, splitClip } from "../shared/split";
 import { MAX_FADE_SECONDS } from "../shared/fade";
+import {
+  DEFAULT_TRANSITION_SECONDS,
+  MAX_TRANSITION_SECONDS,
+  TRANSITION_TYPES,
+  transitionName,
+  type Transition,
+  type TransitionType,
+} from "../shared/transition";
 import { FORMAT_PRESETS, reshape, sizeFor } from "../shared/format";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -42,6 +50,7 @@ interface Clip {
   type: "video" | "image";
   fadeIn?: number;
   fadeOut?: number;
+  transition?: Transition;
   duration?: number;
   trimStart?: number;
   volume?: number;
@@ -117,6 +126,21 @@ const OPS = [
         in: { type: "number", description: `seconds to fade in, 0 to remove, at most ${MAX_FADE_SECONDS}` },
         out: { type: "number", description: `seconds to fade out, 0 to remove, at most ${MAX_FADE_SECONDS}` },
       },
+    },
+  },
+  {
+    name: "transition",
+    description:
+      "Join a main-track clip to the one before it with a transition instead of a hard cut. It is centred on the cut, half before and half after, and moves no clip: the video keeps its length. `none` removes it. Clip 0 has nothing before it. Give `clip` for one cut, or `every: true` for every cut in the video.",
+    parameters: {
+      type: "object",
+      properties: {
+        clip: { type: "integer", description: "0-based position on the main track of the clip that comes in, 1 or more" },
+        every: { type: "boolean", description: "set it on every clip after the first" },
+        type: { type: "string", enum: ["none", ...TRANSITION_TYPES] },
+        seconds: { type: "number", description: `how long it plays, centred on the cut, default ${DEFAULT_TRANSITION_SECONDS}, at most ${MAX_TRANSITION_SECONDS}` },
+      },
+      required: ["type"],
     },
   },
   {
@@ -232,6 +256,29 @@ export function apply(draft: Edl, name: string, args: Record<string, unknown>): 
       const what = args.clip !== undefined ? `clip ${args.clip}` : `${args.track}.${args.index}`;
       return { said: target.fadeIn || target.fadeOut ? `Set the fades on ${what}` : `Removed the fades on ${what}` };
     }
+    case "transition": {
+      const type = String(args.type ?? "");
+      if (type !== "none" && !(TRANSITION_TYPES as readonly string[]).includes(type)) {
+        return { error: `type must be none or one of ${TRANSITION_TYPES.join(", ")}` };
+      }
+      const every = args.every === true;
+      if (every && main.length < 2) return { error: "there is only one clip, so there is no cut to join" };
+      if (!every && Number(args.clip) === 0) return { error: "clip 0 has no clip before it to come in from" };
+      const targets = every ? main.slice(1) : [clipAt(args.clip)];
+      if (targets.some((c) => !c)) return { error: `there is no clip ${args.clip}` };
+      const seconds =
+        typeof args.seconds === "number"
+          ? Math.round(Math.min(MAX_TRANSITION_SECONDS, Math.max(0.1, args.seconds)) * 10) / 10
+          : DEFAULT_TRANSITION_SECONDS;
+      for (const clip of targets as Clip[]) {
+        if (type === "none") delete clip.transition;
+        else clip.transition = { type: type as TransitionType, duration: seconds };
+      }
+      const what = every ? "every cut" : `clip ${args.clip}`;
+      return type === "none"
+        ? { said: `Removed the transition into ${what}` }
+        : { said: `Joined ${what} with a ${seconds.toFixed(1)}s ${transitionName(type as TransitionType).toLowerCase()}` };
+    }
     case "add_text": {
       const text = String(args.text ?? "").slice(0, MAX_TEXT_CHARS);
       if (!text.trim()) return { error: "the text is empty" };
@@ -315,6 +362,12 @@ function fades(el: { fadeIn?: number; fadeOut?: number }): string {
   return parts.length ? `, ${parts.join(", ")}` : "";
 }
 
+/** How a clip comes in, when it does not simply cut in. */
+function joined(el: { transition?: Transition }, i: number): string {
+  const t = i > 0 ? el.transition : undefined;
+  return t ? `, comes in with a ${t.duration.toFixed(1)}s ${transitionName(t.type).toLowerCase()}` : "";
+}
+
 /** What the model is shown: the cut as a short list, not raw JSON. */
 function describeEdl(edl: Edl, names: Map<string, string>): string {
   const clips = edl.main.elements.map((el, i) => {
@@ -322,7 +375,7 @@ function describeEdl(edl: Edl, names: Map<string, string>): string {
     const from = el.trimStart ?? 0;
     const playing = "duration" in el && el.duration !== undefined ? `${el.duration.toFixed(1)}s` : "the rest";
     const audio = el.type === "video" && el.sourceAudio === false ? ", muted" : "";
-    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${audio}${fades(el)}`;
+    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${audio}${fades(el)}${joined(el, i)}`;
   });
   const texts = (edl.overlays ?? []).flatMap((track, ti) =>
     track.elements.map((el, i) =>
