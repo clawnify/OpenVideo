@@ -88,6 +88,10 @@ const mainVideo = z
     fit: fit.optional(),
     anchor: anchor.optional(),
     crop: crop.optional(),
+    /** Seconds to fade up from black, and down to black before the clip
+     *  ends; a video clip's own sound fades with it. shared/fade.ts */
+    fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
+    fadeOut: seconds.max(MAX_FADE_SECONDS).optional(),
   })
   .strict();
 
@@ -99,6 +103,10 @@ const mainImage = z
     fit: fit.optional(),
     anchor: anchor.optional(),
     crop: crop.optional(),
+    /** Seconds to fade up from black, and down to black before the clip
+     *  ends; a video clip's own sound fades with it. shared/fade.ts */
+    fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
+    fadeOut: seconds.max(MAX_FADE_SECONDS).optional(),
   })
   .strict();
 
@@ -111,6 +119,10 @@ const overlayBase = {
   x: z.number().finite().min(0).max(1),
   y: z.number().finite().min(0).max(1),
   opacity: z.number().finite().min(0).max(1).optional(),
+  /** Seconds to fade in from transparent, and out to transparent where the
+   *  element is last seen (its end, or the cut's end if it runs past). */
+  fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
+  fadeOut: seconds.max(MAX_FADE_SECONDS).optional(),
 };
 
 const overlayMedia = z
