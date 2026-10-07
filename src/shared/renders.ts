@@ -30,6 +30,13 @@ export function renderKeyFor(exportId: number, serviceJobId: string): string {
   return `${RENDER_PREFIX}edit-${exportId}-${serviceJobId.replace(/-/g, "").slice(0, 8)}.mp4`;
 }
 
+/** Where an export's poster frame (a JPEG of the output) is kept: beside its
+ *  render, same name. Older exports, and renders the service made without
+ *  one, have no object there. */
+export function posterKeyOf(renderKey: string): string {
+  return renderKey.replace(/\.mp4$/, ".jpg");
+}
+
 // An export row is written before its sources are staged and the render is
 // submitted, and that part runs inside the request. A row still without a
 // service job past this age was cut off (the tab closed or the request died)

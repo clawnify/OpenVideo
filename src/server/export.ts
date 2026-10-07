@@ -9,6 +9,7 @@
 
 import { get, run } from "./db";
 import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
+import { posterKeyOf } from "../shared/renders";
 import { mediaState, prepareMedia } from "./media";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { drawnStroke } from "../shared/outline";
@@ -275,6 +276,8 @@ export interface EditResult {
   url: string;
   duration: number;
   size: number;
+  /** A frame of the output (JPEG), when the render was asked for one. */
+  poster_url?: string;
 }
 
 /** Run the resolved EDL on the managed edit service. */
@@ -315,7 +318,9 @@ export async function startEdit(
   const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/video/edit`, {
     method: "POST",
     headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ edl, quality: opts.quality, filename: opts.filename, async: true }),
+    // `poster: {}` asks for the output's middle frame, for the share page's
+    // link preview. A service without posters ignores the field.
+    body: JSON.stringify({ edl, quality: opts.quality, filename: opts.filename, async: true, poster: {} }),
   });
   const { json, text } = await readServiceResponse<{ job_id?: string } & Partial<EdlInvalid> & { error?: string }>(res);
   if (res.status !== 202 || !json?.job_id) {
@@ -355,9 +360,18 @@ export async function pollEdit(jobId: string, cfg: ExportConfig): Promise<EditPo
     size?: number;
     duration?: number | null;
     detail?: string;
+    poster_url?: string;
   }>(res);
   if (json?.status === "done" && json.url) {
-    return { status: "done", result: { url: json.url, size: json.size ?? 0, duration: json.duration ?? 0 } };
+    return {
+      status: "done",
+      result: {
+        url: json.url,
+        size: json.size ?? 0,
+        duration: json.duration ?? 0,
+        ...(json.poster_url ? { poster_url: json.poster_url } : {}),
+      },
+    };
   }
   if (json?.status === "failed") return { status: "failed", detail: json.detail ?? "the render failed" };
   return { status: "running" };
@@ -817,7 +831,12 @@ export async function autocutAssets(
   return { result: parsed };
 }
 
-/** Copy the finished MP4 into this app's storage; returns the storage key. */
+/** Copy the finished MP4 into this app's storage, and its poster beside it
+ *  (posterKeyOf). The poster is best-effort: without one the share page simply
+ *  has no preview image, which is never worth failing an export over. */
 export async function copyOutput(result: EditResult, key: string): Promise<void> {
   await putUploadFromUrl(result.url, key, "video/mp4", result.size);
+  if (result.poster_url) {
+    await putUploadFromUrl(result.poster_url, posterKeyOf(key), "image/jpeg").catch(() => {});
+  }
 }

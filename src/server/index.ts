@@ -6,6 +6,7 @@ import {
   putUploadFromUrl,
   deleteUpload,
   serveUpload,
+  hasUpload,
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
@@ -29,7 +30,7 @@ import {
   withinFolder,
 } from "./drive";
 import { starterEdl, validateEdl, type Edl } from "./edl";
-import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
+import { isAbandonedExport, posterKeyOf, renderKey, renderKeyFor } from "../shared/renders";
 import { instructEdit } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
@@ -766,7 +767,10 @@ app.delete("/api/projects/:id", async (c) => {
     "SELECT output_url FROM export_jobs WHERE project_id = ? AND output_url IS NOT NULL",
     [id],
   );
-  const keys = jobs.map((j) => renderKey(j.output_url)).filter((k): k is string => k !== null);
+  const keys = jobs
+    .map((j) => renderKey(j.output_url))
+    .filter((k): k is string => k !== null)
+    .flatMap((k) => [k, posterKeyOf(k)]);
   if (keys.length) await deleteUpload(keys).catch(() => {});
   await run("DELETE FROM share_links WHERE project_id = ?", [id]);
   await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
@@ -992,7 +996,25 @@ app.get("/s/:token", async (c) => {
   if (!shared) {
     return c.html(notePage("This link doesn't work", "It may have been turned off. Ask whoever sent it for a new one."), 404);
   }
-  return c.html(sharePage(shared.name, `/s/${encodeURIComponent(c.req.param("token"))}/video?v=${shared.export_id}`));
+  const base = `/s/${encodeURIComponent(c.req.param("token"))}`;
+  const key = renderKey(shared.output_url);
+  // og:image must be an absolute URL (unfurlers fetch it on their own).
+  const poster =
+    key && (await hasUpload(posterKeyOf(key))) ? new URL(`${base}/poster.jpg?v=${shared.export_id}`, c.req.url).toString() : null;
+  return c.html(sharePage(shared.name, `${base}/video?v=${shared.export_id}`, poster));
+});
+
+// The export's poster frame: the link preview a chat app shows when the link
+// is pasted, and the player's still before it plays. Same pin rule as the video.
+app.get("/s/:token/poster.jpg", async (c) => {
+  const shared = await sharedExport(c.req.param("token"));
+  const key = renderKey(shared?.output_url);
+  const v = c.req.query("v");
+  if (!shared || !key || (v !== undefined && v !== String(shared.export_id))) {
+    return c.text("Not found", 404, PUBLIC_HEADERS);
+  }
+  const res = await serveUpload(posterKeyOf(key), undefined, { ...PUBLIC_HEADERS, "Cache-Control": "no-store" });
+  return res ?? c.text("Not found", 404, PUBLIC_HEADERS);
 });
 
 // `v` names the export the page was rendered with. Only the pinned one is
