@@ -23,6 +23,7 @@ describe("share links", () => {
     const html = sharePage("Launch", "/s/abc/video?v=3", url);
     expect(html).toContain(`<meta property="og:image" content="${url}">`);
     expect(html).toContain('<meta name="twitter:card" content="summary_large_image">');
+    expect(html).toContain(`<meta name="twitter:image" content="${url}">`);
     expect(html).toContain(`poster="${url}"`);
 
     const bare = sharePage("Launch", "/s/abc/video?v=3");
