@@ -143,7 +143,14 @@ clip shows exactly the crop. Media overlays take `crop` too (a face cut out
 of a screen recording for a picture-in-picture), and their height follows
 what is kept. Leave `crop` out to keep the whole frame;
 `sourceAudio: false` mutes a clip's own sound; images need an
-explicit `duration`. Text overlays: `fontFamily`
+explicit `duration`. Every clip and overlay takes `fadeIn` and `fadeOut`, in
+seconds (0..30). On a main-track clip they fade the picture up from black and
+down to black, and the clip's own sound with it: end the video on a fade with
+`fadeOut` on the last clip, and make a fade through black between two clips
+with `fadeOut` on one and `fadeIn` on the next. Nothing on the timeline moves,
+so overlay and audio times stay as they are. On a text or media overlay they
+fade it from and to transparent; a fade-out on an overlay that runs past the
+end of the video ends where the video does. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
 `background` (`#RRGGBBAA` works), optional `stroke: { "color": "#000000",
 "width": 4 }` for an outline around the letters (opaque colour; `width` in px

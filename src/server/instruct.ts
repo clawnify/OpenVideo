@@ -10,7 +10,8 @@
 // with a single undo.
 
 import { MAX_TEXT_CHARS, validateEdl, type Edl, type EdlInvalid } from "./edl";
-import { splitClip } from "../shared/split";
+import { keepEdgeFades, splitClip } from "../shared/split";
+import { MAX_FADE_SECONDS } from "../shared/fade";
 import { FORMAT_PRESETS, reshape, sizeFor } from "../shared/format";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -39,6 +40,8 @@ export type AppliedOp = string;
 
 interface Clip {
   type: "video" | "image";
+  fadeIn?: number;
+  fadeOut?: number;
   duration?: number;
   trimStart?: number;
   volume?: number;
@@ -99,6 +102,21 @@ const OPS = [
         volume: { type: "number", description: "0 to 2" },
       },
       required: ["clip"],
+    },
+  },
+  {
+    name: "fade",
+    description:
+      "Fade a main-track clip up from black and down to black (its own sound fades with it), or fade an on-screen text or overlay in and out. To open the video on a fade, fade in clip 0; to end on one, fade out the last clip; a fade out on one clip and a fade in on the next make a fade through black. Give `clip` for a main-track clip, or `track` and `index` for a text or overlay.",
+    parameters: {
+      type: "object",
+      properties: {
+        clip: { type: "integer", description: "0-based position on the main track" },
+        track: { type: "integer", description: "overlay track of a text or overlay" },
+        index: { type: "integer", description: "its position on that track" },
+        in: { type: "number", description: `seconds to fade in, 0 to remove, at most ${MAX_FADE_SECONDS}` },
+        out: { type: "number", description: `seconds to fade out, 0 to remove, at most ${MAX_FADE_SECONDS}` },
+      },
     },
   },
   {
@@ -203,6 +221,17 @@ export function apply(draft: Edl, name: string, args: Record<string, unknown>): 
       if (typeof args.volume === "number") clip.volume = Math.max(0, Math.min(2, args.volume));
       return { said: args.muted ? `Muted clip ${args.clip}` : `Set clip ${args.clip} volume` };
     }
+    case "fade": {
+      const target: { fadeIn?: number; fadeOut?: number } | null | undefined =
+        args.clip !== undefined ? clipAt(args.clip) : draft.overlays?.[Number(args.track)]?.elements[Number(args.index)];
+      if (!target) return { error: args.clip !== undefined ? `there is no clip ${args.clip}` : "there is no text or overlay there" };
+      if (typeof args.in !== "number" && typeof args.out !== "number") return { error: "give `in` or `out` seconds" };
+      const seconds = (n: number) => Math.round(Math.min(MAX_FADE_SECONDS, Math.max(0, n)) * 10) / 10 || undefined;
+      if (typeof args.in === "number") target.fadeIn = seconds(args.in);
+      if (typeof args.out === "number") target.fadeOut = seconds(args.out);
+      const what = args.clip !== undefined ? `clip ${args.clip}` : `${args.track}.${args.index}`;
+      return { said: target.fadeIn || target.fadeOut ? `Set the fades on ${what}` : `Removed the fades on ${what}` };
+    }
     case "add_text": {
       const text = String(args.text ?? "").slice(0, MAX_TEXT_CHARS);
       if (!text.trim()) return { error: "the text is empty" };
@@ -275,9 +304,15 @@ export async function cleanUp(
     delete (part as { trimEnd?: number }).trimEnd;
     return part;
   });
+  keepEdgeFades(parts);
   draft.main.elements.splice(i, 1, ...parts);
   const removed = before !== null ? ` and removed ${(before - after).toFixed(1)}s` : "";
   return { said: `Cleaned up clip ${i}: kept ${keeps.length} part${keeps.length > 1 ? "s" : ""}${removed}` };
+}
+
+function fades(el: { fadeIn?: number; fadeOut?: number }): string {
+  const parts = [el.fadeIn && `fades in ${el.fadeIn.toFixed(1)}s`, el.fadeOut && `fades out ${el.fadeOut.toFixed(1)}s`].filter(Boolean);
+  return parts.length ? `, ${parts.join(", ")}` : "";
 }
 
 /** What the model is shown: the cut as a short list, not raw JSON. */
@@ -287,13 +322,13 @@ function describeEdl(edl: Edl, names: Map<string, string>): string {
     const from = el.trimStart ?? 0;
     const playing = "duration" in el && el.duration !== undefined ? `${el.duration.toFixed(1)}s` : "the rest";
     const audio = el.type === "video" && el.sourceAudio === false ? ", muted" : "";
-    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${audio}`;
+    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${audio}${fades(el)}`;
   });
   const texts = (edl.overlays ?? []).flatMap((track, ti) =>
     track.elements.map((el, i) =>
       el.type === "text"
-        ? `  text ${ti}.${i}: "${el.text}" at ${el.startTime.toFixed(1)}s for ${el.duration.toFixed(1)}s`
-        : `  overlay ${ti}.${i}: ${el.type}`,
+        ? `  text ${ti}.${i}: "${el.text}" at ${el.startTime.toFixed(1)}s for ${el.duration.toFixed(1)}s${fades(el)}`
+        : `  overlay ${ti}.${i}: ${el.type}${fades(el)}`,
     ),
   );
   return [

@@ -12,7 +12,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
-import { splitClip } from "../shared/split";
+import { keepEdgeFades, splitClip } from "../shared/split";
 import { drawnStroke, maxStrokeWidth, outlineShadow } from "../shared/outline";
 import {
   DEFAULT_CAPTIONS,
@@ -139,6 +139,9 @@ interface MainVideo {
   anchor?: Anchor;
   /** The part of the source kept, cut out before fitting (shared/crop.ts). */
   crop?: Crop;
+  /** Seconds to fade from and to black (shared/fade.ts). */
+  fadeIn?: number;
+  fadeOut?: number;
 }
 interface MainImage {
   id: string;
@@ -148,6 +151,9 @@ interface MainImage {
   fit?: "contain" | "cover";
   anchor?: Anchor;
   crop?: Crop;
+  /** Seconds to fade from and to black (shared/fade.ts). */
+  fadeIn?: number;
+  fadeOut?: number;
 }
 type MainElement = MainVideo | MainImage;
 
@@ -164,6 +170,9 @@ interface OverlayMedia {
   trimStart?: number;
   trimEnd?: number;
   crop?: Crop;
+  /** Seconds to fade from and to transparent, the out ending where it is last seen. */
+  fadeIn?: number;
+  fadeOut?: number;
 }
 interface OverlayText {
   id: string;
@@ -181,6 +190,9 @@ interface OverlayText {
   /** Outline around the letters, `width` px at output resolution. */
   stroke?: { color: string; width: number };
   align?: "left" | "center" | "right";
+  /** Seconds to fade from and to transparent, the out ending where it is last seen. */
+  fadeIn?: number;
+  fadeOut?: number;
 }
 type OverlayElement = OverlayMedia | OverlayText;
 interface OverlayTrack {
@@ -1057,6 +1069,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       if (el.type === "image") {
         const right = { ...structuredClone(el), id: rid(), duration: el.duration - off };
         el.duration = off;
+        keepEdgeFades([el, right]);
         d.main.elements.splice(seg.i + 1, 0, right);
       } else {
         const halves = splitClip(structuredClone(el), off, seg.dur, rid());
@@ -2401,6 +2414,12 @@ function Player({
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
   const cutLength = segments.reduce((n, s) => n + s.dur, 0);
+  // The playing clip's fade, as the export draws it: the canvas goes to black
+  // and the clip's own sound to silence over the same windows.
+  const clipGain = active && active.dur > 0 ? fadeGain(active.el, active.dur, playhead - active.start) : 1;
+  /** An overlay's opacity right now: its own times its fades. */
+  const overlayOpacity = (el: { startTime: number; duration: number; opacity?: number; fadeIn?: number; fadeOut?: number }) =>
+    (el.opacity ?? 1) * fadeGain(el, heardFor(el.startTime, el.duration, cutLength), playhead - el.startTime);
 
   // A cropped clip is placed from its source's own size (shared/crop.ts).
   const cropped: Asset[] = [];
@@ -2456,7 +2475,7 @@ function Player({
         // one empties the buffer. Paused, follow the playhead closely.
         const jumped = Math.abs(v.currentTime - wanted) > (playing ? 0.75 : 0.05);
         if (jumped && !v.seeking) v.currentTime = wanted;
-        v.volume = Math.min(1, seg.el.volume ?? 1);
+        v.volume = Math.min(1, seg.el.volume ?? 1) * fadeGain(seg.el, seg.dur, t - seg.start);
         v.muted = seg.el.sourceAudio === false;
         if (playing && v.paused) v.play().catch(() => {});
         if (!playing && !v.paused) v.pause();
@@ -2632,6 +2651,12 @@ function Player({
             );
           })}
 
+          {/* the playing clip's fade to black, over the clip and under everything laid on it */}
+          {clipGain < 1 && (
+            // The export's fade colour, whatever the project's background.
+            <div className="absolute inset-0 pointer-events-none" style={{ background: "#000", opacity: 1 - clipGain }} />
+          )}
+
           {/* project captions, under the overlays so a title placed by hand stays on top */}
           {captions &&
             captions.lines
@@ -2657,7 +2682,7 @@ function Player({
                     return (
                       <TextOnStage
                         key={el.id}
-                        t={el as OverlayText}
+                        t={{ ...(el as OverlayText), opacity: overlayOpacity(el) }}
                         frame={edl.output}
                         scale={scale}
                         selected={selected}
@@ -2682,7 +2707,7 @@ function Player({
                           top: `${m.y * 100}%`,
                           width: `${m.width * 100}%`,
                           aspectRatio: `${kept.width} / ${kept.height}`,
-                          opacity: m.opacity ?? 1,
+                          opacity: overlayOpacity(m),
                         }}
                       >
                         {m.type === "image" ? (
@@ -2698,7 +2723,7 @@ function Player({
                       key={el.id}
                       onPointerDown={dragOverlay(ti, i)}
                       className={`absolute cursor-move ${selected ? "outline outline-2 outline-ring" : ""}`}
-                      style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: m.opacity ?? 1 }}
+                      style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: overlayOpacity(m) }}
                     >
                       {m.type === "image" ? (
                         <img src={assetUrl(a)} onLoad={noteSize(a.id)} className="w-full h-auto pointer-events-none" />
@@ -3419,15 +3444,16 @@ function SliderRow({ label, value, onChange, min = 0, max = 1, step = 0.01 }: { 
 }
 
 /**
- * Fade in and out for an audio clip. The fade-out ends where the clip is last
- * heard, so on music longer than the cut it ends with the video.
+ * Fade in and out for any clip. `heard` is how long it is seen or heard: the
+ * fade-out ends there, so music or a logo running past the cut fades out with
+ * the video.
  */
-function AudioFades({
+function Fades({
   el,
   heard,
   onChange,
 }: {
-  el: AudioElement;
+  el: { fadeIn?: number; fadeOut?: number };
   heard: number;
   onChange: (key: "fadeIn" | "fadeOut", seconds: number) => void;
 }) {
@@ -3542,6 +3568,22 @@ function Inspector({
           />
         );
       };
+      const mainFades = seg && (
+        <>
+          <Fades
+            el={el}
+            heard={seg.dur}
+            // One drag, one undo step, as on audio clips.
+            onChange={(k, n) => update((d) => void (d.main.elements[sel.i][k] = n > 0 ? n : undefined), true)}
+          />
+          {(el.fadeIn || el.fadeOut) && (
+            <p className="text-fine text-muted -mt-2 mb-3">
+              {el.type === "video" ? "Fades from and to black, with the clip's sound." : "Fades from and to black."} A fade out
+              here and a fade in on the next clip make a fade through black.
+            </p>
+          )}
+        </>
+      );
       return (
         <>
           <Zone>{el.type === "video" ? "Video clip" : "Image"}</Zone>
@@ -3572,6 +3614,7 @@ function Inspector({
                 </button>
               </Row>
               <SliderRow label="Volume" value={el.volume ?? 1} max={2} onChange={(n) => set((e) => ((e as MainVideo).volume = n))} />
+              {mainFades}
               <button
                 disabled={analyzing}
                 onClick={async () => {
@@ -3617,6 +3660,7 @@ function Inspector({
                         delete p.trimEnd;
                         return p;
                       });
+                      keepEdgeFades(parts);
                       d.main.elements.splice(sel.i, 1, ...parts);
                     });
                     setAnalyzeMsg(
@@ -3651,6 +3695,7 @@ function Inspector({
                 />
               )}
               {mainCrop(el)}
+              {mainFades}
             </>
           )}
         </>
@@ -3749,6 +3794,11 @@ function Inspector({
             onPlace={(place) => set((x) => Object.assign(x, place))}
           />
           <SliderRow label="Opacity" value={el.opacity ?? 1} onChange={(n) => set((x) => (x.opacity = n))} />
+          <Fades
+            el={el}
+            heard={heardFor(el.startTime, el.duration, segments.reduce((n, s) => n + s.dur, 0))}
+            onChange={(k, n) => update((d) => void (d.overlays![sel.ti].elements[sel.i][k] = n > 0 ? n : undefined), true)}
+          />
           <div className="grid grid-cols-2 gap-2">
             <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
             <NumberRow label="Duration (s)" value={el.duration} min={0.1} onChange={(n) => set((x) => (x.duration = Math.max(0.1, n)))} />
@@ -3766,7 +3816,7 @@ function Inspector({
       <>
         <Zone>Audio</Zone>
         <SliderRow label="Volume" value={el.volume ?? 1} max={2} onChange={(n) => set((x) => (x.volume = n))} />
-        <AudioFades
+        <Fades
           el={el}
           heard={heard}
           // One drag, one undo step: commit() folds edits under 600 ms apart.
@@ -4418,6 +4468,7 @@ function TimelinePanel({
                   ) : a ? (
                     <img src={assetUrl(a)} className="w-full h-full object-cover" />
                   ) : null}
+                  <FadeRamps fadeIn={seg.el.fadeIn} fadeOut={seg.el.fadeOut} heard={seg.dur} zoom={zoom} height={MAIN_H - 8} />
                   <div className="absolute left-1 bottom-0.5 text-fine text-on-accent/90 drop-shadow truncate max-w-[90%] tabular-nums">
                     {a?.name} · {seg.dur.toFixed(1)}s
                   </div>
@@ -4473,8 +4524,10 @@ function TimelinePanel({
                     } ${el.type === "text" ? "bg-track-text-tint text-track-text" : "bg-track-image-tint text-track-image"} ${track.hidden ? "opacity-40" : ""}`}
                     style={{ left: el.startTime * zoom, width: Math.max(14, el.duration * zoom) }}
                   >
-                    {el.type === "text" ? <TypeIcon className="w-3 h-3 shrink-0" /> : <ImageIcon className="w-3 h-3 shrink-0" />}
-                    <span className="truncate">{el.type === "text" ? (el as OverlayText).text : resolveAsset((el as OverlayMedia).src)?.name}</span>
+                    <FadeRamps fadeIn={el.fadeIn} fadeOut={el.fadeOut} heard={heardFor(el.startTime, el.duration, total)} zoom={zoom} height={ROW_H - 8} />
+                    {/* relative: above the ramps, which are positioned */}
+                    {el.type === "text" ? <TypeIcon className="relative w-3 h-3 shrink-0" /> : <ImageIcon className="relative w-3 h-3 shrink-0" />}
+                    <span className="relative truncate">{el.type === "text" ? (el as OverlayText).text : resolveAsset((el as OverlayMedia).src)?.name}</span>
                     <div onPointerDown={floatDrag("ovl", ti, i, "resize")} className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize" />
                   </div>
                 );
@@ -4533,7 +4586,7 @@ function TimelinePanel({
   );
 }
 
-/** The fade ramps on an audio clip: the part a fade silences is dimmed under a sloped edge. */
+/** The fade ramps on a clip: the part a fade takes away is dimmed under a sloped edge. */
 function FadeRamps({ fadeIn, fadeOut, heard, zoom, height }: { fadeIn?: number; fadeOut?: number; heard: number; zoom: number; height: number }) {
   const fin = Math.min(fadeIn ?? 0, heard) * zoom;
   const fout = Math.min(fadeOut ?? 0, heard) * zoom;

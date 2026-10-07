@@ -51,6 +51,35 @@ describe("Ask operations", () => {
     ]);
   });
 
+  it("clean up keeps a clip's fade-in on its first part and its fade-out on its last", async () => {
+    const d = edl();
+    Object.assign(d.main.elements[0], { fadeIn: 1, fadeOut: 2 });
+    await cleanUp(d, { clip: 0 }, new Map(), async () => ({
+      keeps: [{ start: 5, end: 9 }, { start: 11, end: 15 }, { start: 18, end: 25 }],
+      notes: "",
+    }));
+    expect(d.main.elements.slice(0, 3).map((e) => [e.fadeIn, e.fadeOut])).toEqual([
+      [1, undefined],
+      [undefined, undefined],
+      [undefined, 2],
+    ]);
+  });
+
+  it("fades a clip, a text, and removes a fade at 0", () => {
+    const d = edl();
+    d.overlays = [
+      { id: "t", elements: [{ id: "x", type: "text", text: "Hi", fontSize: 40, startTime: 0, duration: 2, x: 0.5, y: 0.5 }] },
+    ];
+    expect(apply(d, "fade", { clip: 1, out: 1.5 })).toMatchObject({ said: "Set the fades on clip 1" });
+    expect(d.main.elements[1]).toMatchObject({ fadeOut: 1.5 });
+    expect(apply(d, "fade", { track: 0, index: 0, in: 0.5, out: 99 })).toHaveProperty("said");
+    expect(d.overlays[0].elements[0]).toMatchObject({ fadeIn: 0.5, fadeOut: 30 });
+    expect(apply(d, "fade", { clip: 1, out: 0 })).toMatchObject({ said: "Removed the fades on clip 1" });
+    expect(d.main.elements[1].fadeOut).toBeUndefined();
+    expect(apply(d, "fade", { clip: 7, in: 1 })).toHaveProperty("error");
+    expect(apply(d, "fade", { clip: 0 })).toHaveProperty("error");
+  });
+
   it("clean up leaves a clip alone when nothing needs cutting", async () => {
     const d = edl();
     const out = await cleanUp(d, { clip: 0 }, new Map(), async () => ({ keeps: [{ start: 5, end: 25 }], notes: "clean" }));
