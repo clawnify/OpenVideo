@@ -38,6 +38,8 @@ export interface MediaState {
   captions?: { language: string; status: string }[];
   /** The video has no sound, so it can have no transcript. */
   no_audio?: boolean;
+  /** Whether the platform's video analysis can read it yet; set once `prepare` has been asked for. */
+  analysis?: "none" | "preparing" | "ready" | "failed";
 }
 
 export interface MediaPlayback {
