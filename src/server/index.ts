@@ -1286,7 +1286,8 @@ app.get("/api/projects/:id/highlights", async (c) => {
 });
 
 // A person's call on one highlight: pick keep | drop | null (back to
-// unreviewed), and its in and out (seconds into the clip) if they move them.
+// unreviewed), its in and out (seconds into the clip) if they move them, and
+// who says it or what it shows when they know better (a name and title).
 app.patch("/api/projects/:id/highlights/:hid", async (c) => {
   const row = await get<HighlightListRow>(
     `SELECT ${HIGHLIGHT_COLUMNS}
@@ -1295,7 +1296,11 @@ app.patch("/api/projects/:id/highlights/:hid", async (c) => {
     [c.req.param("id"), c.req.param("hid")],
   );
   if (!row) return c.json({ error: "Not found" }, 404);
-  const b = await c.req.json<{ pick?: unknown; start?: unknown; end?: unknown }>().catch(() => ({}) as { pick?: unknown; start?: unknown; end?: unknown });
+  const b = await c.req
+    .json<{ pick?: unknown; start?: unknown; end?: unknown; speaker?: unknown; text?: unknown }>()
+    .catch(() => ({}) as { pick?: unknown; start?: unknown; end?: unknown; speaker?: unknown; text?: unknown });
+  if (b.speaker !== undefined && typeof b.speaker !== "string") return c.json({ error: "invalid_request", detail: "speaker is text" }, 400);
+  if (b.text !== undefined && (typeof b.text !== "string" || !b.text.trim())) return c.json({ error: "invalid_request", detail: "text can't be empty" }, 400);
   let pick = row.pick;
   if (b.pick !== undefined) {
     if (b.pick !== null && b.pick !== "keep" && b.pick !== "drop") return c.json({ error: "invalid_request", detail: "pick is keep, drop or null" }, 400);
@@ -1307,10 +1312,12 @@ app.patch("/api/projects/:id/highlights/:hid", async (c) => {
   if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end > length + 0.05 || end - start < 0.2) {
     return c.json({ error: "invalid_request", detail: "start and end must lie inside the clip, end after start" }, 400);
   }
-  await run("UPDATE footage_highlights SET pick = ?, src_in = ?, src_out = ?, updated_at = datetime('now') WHERE id = ?", [
+  await run("UPDATE footage_highlights SET pick = ?, src_in = ?, src_out = ?, speaker = ?, text = ?, updated_at = datetime('now') WHERE id = ?", [
     pick,
     Math.round(start * 100) / 100,
     Math.round(Math.min(end, length) * 100) / 100,
+    typeof b.speaker === "string" ? b.speaker.trim().slice(0, 120) : row.speaker,
+    typeof b.text === "string" ? b.text.trim().slice(0, 1000) : row.text,
     row.id,
   ]);
   const updated = await get<HighlightListRow>(

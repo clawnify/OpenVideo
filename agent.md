@@ -117,12 +117,15 @@ POST  /api/projects/{id}/highlights          { "brief"?: "…", "again"?: true }
 GET   /api/projects/{id}/highlights          best first, 100 a page (limit up to 1000, offset)
       &kind=soundbite|broll  &min_score=2..5  &folder=Day 1/Cam B
       &pick=open|keep|drop|not_dropped|all   &sort=score|clip  &skipped=1
-PATCH /api/projects/{id}/highlights/{hid}    { "pick": "keep"|"drop"|null, "start"?, "end"? }
+PATCH /api/projects/{id}/highlights/{hid}    { "pick"?: "keep"|"drop"|null, "start"?, "end"?, "speaker"?, "text"? }
 POST  /api/projects/{id}/highlights/items    { "clip": "<clipId>", "start"?, "end"?, "kind"?, "text"? }
 GET   /api/projects/{id}/highlights/export?format=csv|xml&pick=keep|not_dropped&root=&fps=
 ```
 
 `again` reads every clip again; what a person kept or dropped stays as it is.
+A soundbite's `speaker` is who says it as the clip's log describes them; it
+names a person only when the clip itself does (said, shown or logged), so
+correct it with the person's name and title when you know them.
 A highlight is `{ id, clip: { id, name, folder, asset_id }, kind, start, end,
 text, speaker, score, reason, pick }`, times in seconds into the clip: as a
 main-track clip, `{ "type": "video", "src": "asset:<clip.asset_id>",
@@ -177,7 +180,7 @@ in line. `DELETE /api/projects/{id}` deletes the footage a batch at a time: a
 | POST | `/api/projects/{id}/footage/retry` | Puts failed imports and logs back in line → `{ imports, logs }` |
 | POST | `/api/projects/{id}/highlights` | Find the footage's highlights `{ brief?, again? }` (in the background) |
 | GET  | `/api/projects/{id}/highlights` | The highlights, best first, filtered and paged → `{ clips, counts, highlights, next_offset, paused }` |
-| PATCH | `/api/projects/{id}/highlights/{hid}` | A person's call `{ pick: keep\|drop\|null, start?, end? }` |
+| PATCH | `/api/projects/{id}/highlights/{hid}` | A person's call `{ pick?: keep\|drop\|null, start?, end?, speaker?, text? }` |
 | POST | `/api/projects/{id}/highlights/items` | A person's own pick `{ clip, start?, end?, kind?, text? }`, kept |
 | GET  | `/api/projects/{id}/highlights/export` | `format=csv\|xml`: a sheet, or a Premiere Pro / Resolve timeline of the picks |
 | PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |

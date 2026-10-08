@@ -136,7 +136,9 @@ function clipBlock(n: number, c: HighlightClip): string {
   const cues = c.transcript ? parseVtt(c.transcript) : [];
   if (cues.length) {
     // The logger's picks are a hint, not the list: a long talk holds more.
-    if (log.quotes.length) lines.push(`Logger's picks: ${log.quotes.map((q) => `[${stamp(q.start)}] "${q.text}"`).join(" ")}`);
+    if (log.quotes.length) {
+      lines.push(`Logger's picks: ${log.quotes.map((q) => `[${stamp(q.start)}] ${q.speaker ? `${q.speaker}: ` : ""}"${q.text}"`).join(" ")}`);
+    }
     lines.push("Transcript:");
     for (const cue of cues) lines.push(`[${stamp(cue.start)}-${stamp(cue.end)}] ${cue.text}`);
   } else if (log.quotes.length) {
@@ -194,6 +196,8 @@ Two kinds of pick:
 
 Score each pick 1 to 5 against the goal above: 5 could open the video, 4 strong, 3 solid and usable, 2 filler, 1 only if nothing else. Use the whole range; most picks are 3. The reason says in one short sentence what an editor gains: what is said or shown, and why it works (clear sound, energy, emotion, the brand in shot).
 
+A soundbite's speaker is who says it as the log describes them ("man in a red shirt"). Name a person only when the log, the transcript or the screen names them; never guess a name from what someone talks about or who they seem to be.
+
 Picks in a clip never overlap, and the same moment is never picked twice. When two clips show the same moment (two cameras, or a retake), pick from the better one and say so in the other's reason or skip reason.
 
 How many: as many as are worth an editor's look. A 5-second shot has none or one. A long interview or talk: read it all, start to finish, and pick every strong soundbite, roughly one for every two or three minutes of talk and more where it is strong; a 45-minute interview usually gives fifteen or more. The logger's picks are a hint: include the strong ones, and find the others they missed.
@@ -215,6 +219,23 @@ export function snapToCues(start: number, end: number, cues: Cue[], duration: nu
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
 const str = (v: unknown, max: number) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+
+/**
+ * Who says a soundbite. The logger watched the clip, so their description of
+ * whoever says those words wins. Otherwise the model's words stand only when
+ * the clip itself bears out every name in them: a model that cannot see will
+ * otherwise put a famous name on a stranger from what they talk about.
+ */
+export function vetSpeaker(said: string, start: number, end: number, clip: HighlightClip): string {
+  const quoted = clip.log.quotes.find((q) => q.speaker && q.start < end && start < q.end);
+  if (quoted) return quoted.speaker;
+  const material = [clip.log.summary, ...clip.log.visible_text, ...clip.log.quotes.map((q) => q.speaker), clip.transcript ?? ""]
+    .join(" ")
+    .toLowerCase();
+  const names = said.match(/\p{Lu}[\p{L}'.-]*/gu) ?? [];
+  if (names.every((n) => material.includes(n.toLowerCase()))) return said;
+  return clip.log.quotes.find((q) => q.speaker)?.speaker ?? "";
+}
 
 /** The model's answer → a verdict per clip. Clips it left out get none. */
 export function readHighlights(raw: unknown, clips: HighlightClip[]): ClipVerdict[] {
@@ -247,7 +268,7 @@ export function readHighlights(raw: unknown, clips: HighlightClip[]): ClipVerdic
         start: round1(start),
         end: round1(end),
         text,
-        speaker: kind === "soundbite" ? str(h?.speaker, 120) : "",
+        speaker: kind === "soundbite" ? vetSpeaker(str(h?.speaker, 120), start, end, clip) : "",
         score,
         reason: str(h?.reason, 300),
       });
@@ -422,6 +443,19 @@ export async function stepHighlights(cfg: MediaConfig, key: string | undefined, 
     for (const r of reviewed) taken.set(r.footage_id, [...(taken.get(r.footage_id) ?? []), { start: r.src_in, end: r.src_out, text: r.text }]);
   }
 
+  // The rate and size a timeline for the editor's own software needs, for
+  // clips that don't have them yet: fetched together, a few at a time, since
+  // one by one they took most of a step.
+  const missing = rows.filter((r) => r.fps === null && r.media_uid);
+  for (let i = 0; i < missing.length; i += 8) {
+    await Promise.all(
+      missing.slice(i, i + 8).map(async (r) => {
+        const facts = await mediaFacts(cfg, r.media_uid!).catch(() => null);
+        if (facts) await setClip(r.id, { fps: facts.fps, width: facts.width, height: facts.height });
+      }),
+    );
+  }
+
   const clips: HighlightClip[] = [];
   for (const r of rows) {
     let log: ClipLog | null = null;
@@ -441,11 +475,6 @@ export async function stepHighlights(cfg: MediaConfig, key: string | undefined, 
       if (transcript !== null) {
         await run("UPDATE assets SET transcript = ?, transcript_lang = ? WHERE id = ?", [transcript, r.language, r.asset_id]);
       }
-    }
-    // The rate and size a timeline for the editor's own software needs.
-    if (r.fps === null && r.media_uid) {
-      const facts = await mediaFacts(cfg, r.media_uid).catch(() => null);
-      if (facts) await setClip(r.id, { fps: facts.fps, width: facts.width, height: facts.height });
     }
     clips.push({ id: r.id, name: r.name, folder: r.folder, duration: r.duration, log, transcript: transcript || null, taken: taken.get(r.id) });
   }
