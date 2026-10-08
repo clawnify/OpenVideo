@@ -1,13 +1,15 @@
-// Audio fades, as the edit service compiles them (afade on the clip's own
-// clock), so the preview's gain follows the export's envelope exactly.
+// Fades, as the edit service compiles them (on the element's own clock), so
+// the preview's gain and opacity follow the export's envelope exactly: afade
+// on sound, fade to black on a main-track clip, alpha on an overlay.
 
 /** The longest fade the edit service accepts, in or out. */
 export const MAX_FADE_SECONDS = 30;
 
 /**
- * How long an audio clip is heard: its own length, or up to the end of the
- * cut when it runs past it. A fade-out ends here, so a song longer than the
- * video fades out with the video instead of stopping dead.
+ * How long a clip on an audio or overlay track is heard or seen: its own
+ * length, or up to the end of the cut when it runs past it. A fade-out ends
+ * here, so a song longer than the video fades out with the video instead of
+ * stopping dead.
  */
 export function heardFor(startTime: number, duration: number, total: number): number {
   return Math.max(0, Math.min(duration, total - startTime));

@@ -10,7 +10,16 @@
 // with a single undo.
 
 import { MAX_TEXT_CHARS, validateEdl, type Edl, type EdlInvalid } from "./edl";
-import { splitClip } from "../shared/split";
+import { keepEdgeFades, splitClip } from "../shared/split";
+import { MAX_FADE_SECONDS } from "../shared/fade";
+import {
+  DEFAULT_TRANSITION_SECONDS,
+  MAX_TRANSITION_SECONDS,
+  TRANSITION_TYPES,
+  transitionName,
+  type Transition,
+  type TransitionType,
+} from "../shared/transition";
 import { FORMAT_PRESETS, reshape, sizeFor } from "../shared/format";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -39,6 +48,9 @@ export type AppliedOp = string;
 
 interface Clip {
   type: "video" | "image";
+  fadeIn?: number;
+  fadeOut?: number;
+  transition?: Transition;
   duration?: number;
   trimStart?: number;
   volume?: number;
@@ -99,6 +111,36 @@ const OPS = [
         volume: { type: "number", description: "0 to 2" },
       },
       required: ["clip"],
+    },
+  },
+  {
+    name: "fade",
+    description:
+      "Fade a main-track clip up from black and down to black (its own sound fades with it), or fade an on-screen text or overlay in and out. To open the video on a fade, fade in clip 0; to end on one, fade out the last clip; a fade out on one clip and a fade in on the next make a fade through black. Give `clip` for a main-track clip, or `track` and `index` for a text or overlay.",
+    parameters: {
+      type: "object",
+      properties: {
+        clip: { type: "integer", description: "0-based position on the main track" },
+        track: { type: "integer", description: "overlay track of a text or overlay" },
+        index: { type: "integer", description: "its position on that track" },
+        in: { type: "number", description: `seconds to fade in, 0 to remove, at most ${MAX_FADE_SECONDS}` },
+        out: { type: "number", description: `seconds to fade out, 0 to remove, at most ${MAX_FADE_SECONDS}` },
+      },
+    },
+  },
+  {
+    name: "transition",
+    description:
+      "Join a main-track clip to the one before it with a transition instead of a hard cut. It is centred on the cut, half before and half after, and moves no clip: the video keeps its length. `none` removes it. Clip 0 has nothing before it. Give `clip` for one cut, or `every: true` for every cut in the video.",
+    parameters: {
+      type: "object",
+      properties: {
+        clip: { type: "integer", description: "0-based position on the main track of the clip that comes in, 1 or more" },
+        every: { type: "boolean", description: "set it on every clip after the first" },
+        type: { type: "string", enum: ["none", ...TRANSITION_TYPES] },
+        seconds: { type: "number", description: `how long it plays, centred on the cut, default ${DEFAULT_TRANSITION_SECONDS}, at most ${MAX_TRANSITION_SECONDS}` },
+      },
+      required: ["type"],
     },
   },
   {
@@ -203,6 +245,40 @@ export function apply(draft: Edl, name: string, args: Record<string, unknown>): 
       if (typeof args.volume === "number") clip.volume = Math.max(0, Math.min(2, args.volume));
       return { said: args.muted ? `Muted clip ${args.clip}` : `Set clip ${args.clip} volume` };
     }
+    case "fade": {
+      const target: { fadeIn?: number; fadeOut?: number } | null | undefined =
+        args.clip !== undefined ? clipAt(args.clip) : draft.overlays?.[Number(args.track)]?.elements[Number(args.index)];
+      if (!target) return { error: args.clip !== undefined ? `there is no clip ${args.clip}` : "there is no text or overlay there" };
+      if (typeof args.in !== "number" && typeof args.out !== "number") return { error: "give `in` or `out` seconds" };
+      const seconds = (n: number) => Math.round(Math.min(MAX_FADE_SECONDS, Math.max(0, n)) * 10) / 10 || undefined;
+      if (typeof args.in === "number") target.fadeIn = seconds(args.in);
+      if (typeof args.out === "number") target.fadeOut = seconds(args.out);
+      const what = args.clip !== undefined ? `clip ${args.clip}` : `${args.track}.${args.index}`;
+      return { said: target.fadeIn || target.fadeOut ? `Set the fades on ${what}` : `Removed the fades on ${what}` };
+    }
+    case "transition": {
+      const type = String(args.type ?? "");
+      if (type !== "none" && !(TRANSITION_TYPES as readonly string[]).includes(type)) {
+        return { error: `type must be none or one of ${TRANSITION_TYPES.join(", ")}` };
+      }
+      const every = args.every === true;
+      if (every && main.length < 2) return { error: "there is only one clip, so there is no cut to join" };
+      if (!every && Number(args.clip) === 0) return { error: "clip 0 has no clip before it to come in from" };
+      const targets = every ? main.slice(1) : [clipAt(args.clip)];
+      if (targets.some((c) => !c)) return { error: `there is no clip ${args.clip}` };
+      const seconds =
+        typeof args.seconds === "number"
+          ? Math.round(Math.min(MAX_TRANSITION_SECONDS, Math.max(0.1, args.seconds)) * 10) / 10
+          : DEFAULT_TRANSITION_SECONDS;
+      for (const clip of targets as Clip[]) {
+        if (type === "none") delete clip.transition;
+        else clip.transition = { type: type as TransitionType, duration: seconds };
+      }
+      const what = every ? "every cut" : `clip ${args.clip}`;
+      return type === "none"
+        ? { said: `Removed the transition into ${what}` }
+        : { said: `Joined ${what} with a ${seconds.toFixed(1)}s ${transitionName(type as TransitionType).toLowerCase()}` };
+    }
     case "add_text": {
       const text = String(args.text ?? "").slice(0, MAX_TEXT_CHARS);
       if (!text.trim()) return { error: "the text is empty" };
@@ -275,9 +351,21 @@ export async function cleanUp(
     delete (part as { trimEnd?: number }).trimEnd;
     return part;
   });
+  keepEdgeFades(parts);
   draft.main.elements.splice(i, 1, ...parts);
   const removed = before !== null ? ` and removed ${(before - after).toFixed(1)}s` : "";
   return { said: `Cleaned up clip ${i}: kept ${keeps.length} part${keeps.length > 1 ? "s" : ""}${removed}` };
+}
+
+function fades(el: { fadeIn?: number; fadeOut?: number }): string {
+  const parts = [el.fadeIn && `fades in ${el.fadeIn.toFixed(1)}s`, el.fadeOut && `fades out ${el.fadeOut.toFixed(1)}s`].filter(Boolean);
+  return parts.length ? `, ${parts.join(", ")}` : "";
+}
+
+/** How a clip comes in, when it does not simply cut in. */
+function joined(el: { transition?: Transition }, i: number): string {
+  const t = i > 0 ? el.transition : undefined;
+  return t ? `, comes in with a ${t.duration.toFixed(1)}s ${transitionName(t.type).toLowerCase()}` : "";
 }
 
 /** What the model is shown: the cut as a short list, not raw JSON. */
@@ -287,13 +375,13 @@ function describeEdl(edl: Edl, names: Map<string, string>): string {
     const from = el.trimStart ?? 0;
     const playing = "duration" in el && el.duration !== undefined ? `${el.duration.toFixed(1)}s` : "the rest";
     const audio = el.type === "video" && el.sourceAudio === false ? ", muted" : "";
-    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${audio}`;
+    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${audio}${fades(el)}${joined(el, i)}`;
   });
   const texts = (edl.overlays ?? []).flatMap((track, ti) =>
     track.elements.map((el, i) =>
       el.type === "text"
-        ? `  text ${ti}.${i}: "${el.text}" at ${el.startTime.toFixed(1)}s for ${el.duration.toFixed(1)}s`
-        : `  overlay ${ti}.${i}: ${el.type}`,
+        ? `  text ${ti}.${i}: "${el.text}" at ${el.startTime.toFixed(1)}s for ${el.duration.toFixed(1)}s${fades(el)}`
+        : `  overlay ${ti}.${i}: ${el.type}${fades(el)}`,
     ),
   );
   return [

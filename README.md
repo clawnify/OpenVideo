@@ -16,15 +16,18 @@ Most editors keep a project in a format built for their own app, not for you or 
 
 - **Timeline editor**: a main track of clips that play end to end, text on overlay tracks (colour, box and outline, for titles and captions alike), music on audio tracks. Trim, split, reorder and zoom, with filmstrips and waveforms.
 - **Live preview**: one master clock plays the cut back in the browser as you edit.
+- **Footage from a Drive folder**: start a project from a Google Drive folder shared with the link, and every video in it and in the folders inside it comes in as that project's own footage. Each clip is logged as it lands: what it shows, the best lines said with their times, the best moments to cut away to, and anything readable on screen. It runs in the background, so an agent can read a whole shoot's logs and choose what goes in.
 - **Media library**: upload clips, stills and music, or import them from Google Drive, and use them in any project. Videos go straight to the managed media service, resumably and up to 30 GB, so a multi-gigabyte master plays, gets a transcript and exports without passing through the app. Each upload shows its progress, and one that drops picks up where it stopped.
 - **Formats**: 16:9, 9:16 for Reels, TikTok and Shorts, 1:1, 4:5 and 4:3, or the shape of your own footage. Titles and logos keep their size and place when the shape changes, and clips either fit with bars or fill the frame.
 - **Crop**: keep part of any clip, logo or picture-in-picture, free or held to 16:9, 9:16, 1:1, 4:5 or the video's own shape, with a scrubber to check the subject stays inside. The preview places a cropped clip exactly as the export does.
+- **Fades**: fade a clip up from black and down to black, its sound with it, or make a fade through black between two clips. Titles, logos and music fade in and out the same way, and the preview plays each fade as it will export.
+- **Transitions**: put a dissolve, a fade through black or white, a wipe, a slide, a blur or a pixelate on any cut, from the mark between two clips on the timeline, or on every cut at once. A transition is centred on its cut and moves no clip, so titles and music stay where you put them, and the preview draws each one frame for frame as it exports.
 - **Captions**: switch them on for the whole video, pick one of twelve languages and one style. The words come from each clip's transcript, so captions follow every trim, split and reorder.
 - **Ask for a change**: describe an edit in your own words and it is applied to the cut you have. The model calls a fixed set of checked operations, so the edit is always a valid document. One instruction, one undo.
 - **AI assist**: Auto-cut watches several clips together and assembles the strongest sequence for what the video is for, captions included; Clean up trims one clip down to its good parts.
 - **Export to MP4** in draft, standard or high quality, on Clawnify's managed edit service.
 - **Share by link**: one link per project plays an export to anyone you send it to, with no sign-in, and a Download button. The link stays on the export you shared until you move it to a newer one, so a draft never reaches viewers; turning it off ends it for everyone.
-- **Agent-ready**: a REST API (`/api/assets`, `/api/drive`, `/api/projects`, `/api/exports`, `/api/projects/{id}/share`) and an `agent.md`, so an AI agent can assemble, edit and export videos without a human in the loop. Validation errors carry a JSON pointer to the offending node, so an agent's edit loop self-corrects.
+- **Agent-ready**: a REST API (`/api/assets`, `/api/drive`, `/api/projects`, `/api/projects/{id}/footage`, `/api/exports`, `/api/projects/{id}/share`) and an `agent.md`, so an AI agent can assemble, edit and export videos without a human in the loop. Validation errors carry a JSON pointer to the offending node, so an agent's edit loop self-corrects.
 
 ## How an edit works
 

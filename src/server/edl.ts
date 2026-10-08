@@ -1,7 +1,7 @@
 // EDL (edit decision list) — the document behind footage edit projects.
 //
 // Shape: one main track (clips laid end-to-end in array order — the sequence
-// IS the order), overlay tracks that composite on top (startTime-positioned),
+// IS the order; a clip's transition sits on the cut into it), overlay tracks that composite on top (startTime-positioned),
 // and audio tracks that mix under the cut. Times are plain seconds; positions
 // and sizes are fractions of the canvas.
 //
@@ -15,6 +15,7 @@
 
 import { z } from "zod";
 import { MAX_FADE_SECONDS } from "../shared/fade";
+import { MAX_TRANSITION_SECONDS, TRANSITION_TYPES } from "../shared/transition";
 
 export const MAX_ELEMENTS = 100;
 export const MAX_SOURCES = 20;
@@ -74,6 +75,17 @@ const crop = z
   .strict()
   .refine((c) => c.x + c.width <= 1.0001 && c.y + c.height <= 1.0001, "crop must stay inside the frame");
 
+/** How a main-track clip comes in from the one before it: centred on the cut
+ *  for `duration`, shortened to fit when the clips are too short, moving no
+ *  clip (shared/transition.ts). The first clip has nothing to come in from;
+ *  the export leaves it off. */
+const transition = z
+  .object({
+    type: z.enum(TRANSITION_TYPES),
+    duration: seconds.min(0.05).max(MAX_TRANSITION_SECONDS),
+  })
+  .strict();
+
 const mainVideo = z
   .object({
     ...clipBase,
@@ -88,6 +100,11 @@ const mainVideo = z
     fit: fit.optional(),
     anchor: anchor.optional(),
     crop: crop.optional(),
+    /** Seconds to fade up from black, and down to black before the clip
+     *  ends; a video clip's own sound fades with it. shared/fade.ts */
+    fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
+    fadeOut: seconds.max(MAX_FADE_SECONDS).optional(),
+    transition: transition.optional(),
   })
   .strict();
 
@@ -99,6 +116,11 @@ const mainImage = z
     fit: fit.optional(),
     anchor: anchor.optional(),
     crop: crop.optional(),
+    /** Seconds to fade up from black, and down to black before the clip
+     *  ends; a video clip's own sound fades with it. shared/fade.ts */
+    fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
+    fadeOut: seconds.max(MAX_FADE_SECONDS).optional(),
+    transition: transition.optional(),
   })
   .strict();
 
@@ -111,6 +133,10 @@ const overlayBase = {
   x: z.number().finite().min(0).max(1),
   y: z.number().finite().min(0).max(1),
   opacity: z.number().finite().min(0).max(1).optional(),
+  /** Seconds to fade in from transparent, and out to transparent where the
+   *  element is last seen (its end, or the cut's end if it runs past). */
+  fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
+  fadeOut: seconds.max(MAX_FADE_SECONDS).optional(),
 };
 
 const overlayMedia = z

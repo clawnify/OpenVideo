@@ -18,7 +18,10 @@
     "credentials": ["googledrive", "googlesuper"]
   },
   "api": {
-    "public_routes": [{ "path": "/s/**", "methods": ["GET", "HEAD"] }],
+    "public_routes": [
+      { "path": "/s/**", "methods": ["GET", "HEAD"] },
+      { "path": "/api/footage/step", "methods": ["POST"] }
+    ],
     "server_routes": ["/s/*"]
   },
   "deploy": {
