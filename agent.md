@@ -219,7 +219,13 @@ clip shows exactly the crop. Media overlays take `crop` too (a face cut out
 of a screen recording for a picture-in-picture), and their height follows
 what is kept. Leave `crop` out to keep the whole frame;
 `sourceAudio: false` mutes a clip's own sound; images need an
-explicit `duration`. Every clip and overlay takes `fadeIn` and `fadeOut`, in
+explicit `duration`. A video clip takes `speed`, 0.1 to 10 (default 1): `2`
+plays the same footage twice as fast, `0.5` is slow motion, and the sound
+keeps its pitch. `trimStart`, `trimEnd` and `duration` still measure the
+source, so a speed change never changes which footage is used: a clip with
+`duration: 10, speed: 2` lasts 5 seconds of the video. Place overlays,
+music and captions by that output time (the main track can read at most 10
+minutes of footage in all, which only a high speed reaches). Every clip and overlay takes `fadeIn` and `fadeOut`, in
 seconds (0..30). On a main-track clip they fade the picture up from black and
 down to black, and the clip's own sound with it: end the video on a fade with
 `fadeOut` on the last clip, and make a fade through black between two clips
@@ -252,7 +258,7 @@ seconds (0..30) of ramp from and to silence. The fade-out ends where the clip
 is last heard, which is the end of the video when the clip runs past it, so
 music laid under a shorter cut needs no trimming to end cleanly: set
 `fadeOut: 2` and leave its length alone. Output duration (sum of the main
-track) maxes at 5 minutes.
+track, each clip's footage divided by its speed) maxes at 5 minutes.
 
 **Format** (the video's shape) is `output.width` x `output.height`: even
 numbers, at most 3840x2160. At the default resolution the presets are 1280x720

@@ -25,6 +25,7 @@ import {
 import { parseVtt, type Cue } from "../shared/transcript";
 import { fadeGain, heardFor } from "../shared/fade";
 import { sharedPrefix } from "../shared/names";
+import { SPEED_CHOICES, cleanSpeed, speedLabel, speedOf } from "../shared/speed";
 import {
   DEFAULT_TRANSITION_SECONDS,
   MAX_TRANSITION_SECONDS,
@@ -192,6 +193,8 @@ interface MainVideo {
   fadeOut?: number;
   /** How it comes in from the clip before it (shared/transition.ts). */
   transition?: Transition;
+  /** Playback speed; trims and duration still measure the source (shared/speed.ts). */
+  speed?: number;
 }
 interface MainImage {
   id: string;
@@ -414,8 +417,8 @@ function fmtTime(t: number): string {
   return `${m}:${s.toFixed(1).padStart(4, "0")}`;
 }
 
-/** Duration of one main element given known source durations. */
-function mainDur(el: MainElement, srcDur: (src: string) => number | undefined): number {
+/** Seconds of its source one main element plays, given known source durations. */
+function mainSource(el: MainElement, srcDur: (src: string) => number | undefined): number {
   if (el.type === "image") return el.duration;
   const d = srcDur(el.src);
   if (el.duration !== undefined) {
@@ -424,6 +427,11 @@ function mainDur(el: MainElement, srcDur: (src: string) => number | undefined): 
   }
   if (d === undefined) return 0;
   return Math.max(0, d - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
+}
+
+/** How long one main element lasts on the video: its source seconds at its speed. */
+function mainDur(el: MainElement, srcDur: (src: string) => number | undefined): number {
+  return mainSource(el, srcDur) / speedOf(el);
 }
 
 /**
@@ -1105,7 +1113,13 @@ export function EditEditor({
     if (!cfg?.enabled) return null;
     const placed = segments
       .filter((sg) => sg.el.type === "video" && sg.el.src.startsWith("asset:"))
-      .map((sg) => ({ src: sg.el.src, start: sg.start, dur: sg.dur, trimStart: (sg.el as MainVideo).trimStart ?? 0 }));
+      .map((sg) => ({
+        src: sg.el.src,
+        start: sg.start,
+        dur: sg.dur,
+        trimStart: (sg.el as MainVideo).trimStart ?? 0,
+        speed: speedOf(sg.el),
+      }));
     const cues = new Map<string, Cue[]>();
     for (const [src, t] of transcripts) if (t.status === "ready") cues.set(src, t.cues);
     return { lines: captionTimeline(placed, cues, cfg.style.maxChars), style: cfg.style };
@@ -1208,8 +1222,10 @@ export function EditEditor({
         d.main.elements.splice(seg.i + 1, 0, right);
       } else {
         // Its own length, not the whole frames it is drawn at: a play window
-        // rounded up could ask the export for more than the source has.
-        const halves = splitClip(structuredClone(el), off, mainDur(el, srcDur), rid());
+        // rounded up could ask the export for more than the source has. The
+        // cut is made in the source, where the playhead's offset is `speed`
+        // times longer.
+        const halves = splitClip(structuredClone(el), off * speedOf(el), mainSource(el, srcDur), rid());
         if (halves) d.main.elements.splice(seg.i, 1, ...halves);
       }
     });
@@ -2995,7 +3011,7 @@ function Player({
       // A paused or starved element is not a clock: let the wall clock carry
       // on rather than freezing the playhead while the buffer fills.
       if (!v || v.paused || v.readyState < 2) return null;
-      return seg.start + (v.currentTime - (seg.el.trimStart ?? 0));
+      return seg.start + (v.currentTime - (seg.el.trimStart ?? 0)) / speedOf(seg.el);
     };
     return () => {
       mediaClock.current = null;
@@ -3012,14 +3028,19 @@ function Player({
         // In a transition a clip plays past its trims. Where its source has
         // nothing there (it starts at 0:00, or ends) the edge frame holds, as
         // in the export; play() on an ended video would start it over instead.
+        // The element runs on source time, `speed` source seconds per second
+        // of video, and its rate carries that (pitch kept, as in the export).
+        const speed = speedOf(seg.el);
+        if (v.playbackRate !== speed) v.playbackRate = speed;
         const end = Number.isFinite(v.duration) ? v.duration : Infinity;
-        const raw = (seg.el.trimStart ?? 0) + (t - seg.start);
+        const raw = (seg.el.trimStart ?? 0) + (t - seg.start) * speed;
         const wanted = Math.max(0, Math.min(raw, end));
         const hold = raw < 0 || raw >= end - 0.05;
         // Playing, the video leads and needs no correction; only a real jump
         // (a scrub, or a cut to another clip) is worth a seek, because each
-        // one empties the buffer. Paused, follow the playhead closely.
-        const jumped = Math.abs(v.currentTime - wanted) > (playing && !hold ? 0.75 : 0.05);
+        // one empties the buffer. Paused, follow the playhead closely. Both
+        // measured on the video's clock.
+        const jumped = Math.abs(v.currentTime - wanted) / speed > (playing && !hold ? 0.75 : 0.05);
         if (jumped && !v.seeking) v.currentTime = wanted;
         v.volume = Math.min(1, Math.min(1, seg.el.volume ?? 1) * fadeGain(seg.el, seg.dur, t - seg.start) * crossGain(seg));
         v.muted = seg.el.sourceAudio === false;
@@ -3031,7 +3052,7 @@ function Player({
         // first frame, or as far before it as its transition in reaches. A clip
         // that starts where it was last left, within the seek tolerance above,
         // runs ahead of the clock, and the playhead jumps when it takes over.
-        const first = Math.max(0, (seg.el.trimStart ?? 0) - seg.before);
+        const first = Math.max(0, (seg.el.trimStart ?? 0) - seg.before * speedOf(seg.el));
         if (active && seg.i === active.i + 1 && !v.seeking && Math.abs(v.currentTime - first) > 0.05) v.currentTime = first;
       }
     }
@@ -4340,6 +4361,8 @@ function Inspector({
       const set = (fn: (e: MainElement) => void) => update((d) => fn(d.main.elements[sel.i]));
       const dur = srcDur(el.src);
       const seg = segments.find((x) => x.i === sel.i);
+      // The part of its source the clip plays: its length on the video at its speed.
+      const speed = speedOf(el);
       const mainCrop = (clip: MainElement) => {
         const from = clip.type === "video" ? (clip.trimStart ?? 0) : 0;
         return (
@@ -4347,9 +4370,9 @@ function Inspector({
             asset={resolveAsset(clip.src)}
             crop={clip.crop}
             frame={edl.output}
-            window={clip.type === "video" && seg ? { from, to: from + seg.dur } : undefined}
+            window={clip.type === "video" && seg ? { from, to: from + seg.dur * speed } : undefined}
             // The frame under the playhead when it is on this clip, else the clip's first.
-            startAt={() => from + (seg ? Math.min(seg.dur, Math.max(0, playheadRef.current - seg.start)) : 0)}
+            startAt={() => from + (seg ? Math.min(seg.dur, Math.max(0, playheadRef.current - seg.start)) * speed : 0)}
             hint="Keep part of the picture. What you keep fills the clip's place in the frame, scaled up the way it fits or fills."
             onChange={(crop) =>
               set((x) => {
@@ -4386,6 +4409,28 @@ function Inspector({
                 <NumberRow label="Play duration (s)" value={el.duration} min={0.1} onChange={(n) => set((e) => ((e as MainVideo).duration = Math.max(0.1, n)))} />
               ) : (
                 <NumberRow label="Trim end (s)" value={el.trimEnd ?? 0} min={0} onChange={(n) => set((e) => ((e as MainVideo).trimEnd = Math.max(0, n)))} />
+              )}
+              <Field label="Speed">
+                <Choice<number>
+                  label="Speed"
+                  value={speed}
+                  options={SPEED_CHOICES.map((n) => [n, speedLabel(n)])}
+                  onChange={(n) => set((x) => ((x as MainVideo).speed = cleanSpeed(n)))}
+                />
+              </Field>
+              <NumberRow
+                label="Exact speed (x)"
+                value={speed}
+                step={0.05}
+                min={0.1}
+                max={10}
+                // Typing a number is one undo step.
+                onChange={(n) => update((d) => void ((d.main.elements[sel.i] as MainVideo).speed = cleanSpeed(n)), true)}
+              />
+              {speed !== 1 && seg && (
+                <p className="text-fine text-muted -mt-2 mb-3">
+                  Plays {(seg.dur * speed).toFixed(1)}s of footage in {seg.dur.toFixed(1)}s. Its sound keeps its pitch.
+                </p>
               )}
               <ClipFit value={el.fit} onChange={(fit) => set((x) => ((x as MainVideo).fit = fit))} />
               {el.fit === "cover" && (
@@ -4432,7 +4477,7 @@ function Inspector({
                     // stays inside it instead of undoing the trims already made.
                     const seg = segments.find((x) => x.i === sel.i);
                     const from = (el as MainVideo).trimStart ?? 0;
-                    const window = seg ? { start: from, end: from + seg.dur } : undefined;
+                    const window = seg ? { start: from, end: from + seg.dur * speed } : undefined;
                     const r = await api.send<AnalyzeResult>("POST", `/api/assets/${a.id}/analyze`, {
                       // Cuts only. Captions are their own deliberate step: added
                       // here they landed on top of subtitles already in the footage.
@@ -5063,7 +5108,8 @@ function TimelinePanel({
     const orig = structuredClone(el);
     const src = el.type === "video" ? srcDur(el.src) : undefined;
     const move = (ev: PointerEvent) => {
-      const ds = (ev.clientX - startX) / zoom;
+      // Seconds of source under the drag: a sped-up clip covers more footage per pixel.
+      const ds = ((ev.clientX - startX) / zoom) * speedOf(el);
       update((d) => {
         const t = d.main.elements[i];
         if (t.type === "image") {
@@ -5245,14 +5291,14 @@ function TimelinePanel({
                       <FrameStrip
                         asset={a}
                         from={(seg.el as MainVideo).trimStart ?? 0}
-                        to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
+                        to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur * speedOf(seg.el)}
                         width={Math.round(w)}
                       />
                     ) : (
                       <FilmStrip
                         url={assetUrl(a)}
                         from={(seg.el as MainVideo).trimStart ?? 0}
-                        to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
+                        to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur * speedOf(seg.el)}
                         width={Math.round(w)}
                         height={MAIN_H - 8}
                       />
@@ -5261,6 +5307,11 @@ function TimelinePanel({
                     <img src={assetUrl(a)} className="w-full h-full object-cover" />
                   ) : null}
                   <FadeRamps fadeIn={seg.el.fadeIn} fadeOut={seg.el.fadeOut} heard={seg.dur} zoom={zoom} height={MAIN_H - 8} />
+                  {speedOf(seg.el) !== 1 && (
+                    <div className={`absolute ${seg.i > 0 ? "left-3" : "left-1"} top-0.5 rounded-xs bg-black/60 px-1 text-fine text-on-accent tabular-nums`}>
+                      {speedLabel(speedOf(seg.el))}
+                    </div>
+                  )}
                   {/* Clear of the cut's mark, which sits half over a clip's start. */}
                   <div className={`absolute ${seg.i > 0 ? "left-3" : "left-1"} bottom-0.5 text-fine text-on-accent/90 drop-shadow truncate max-w-[90%] tabular-nums`}>
                     {a?.name} · {seg.dur.toFixed(1)}s

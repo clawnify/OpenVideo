@@ -15,6 +15,7 @@ import { drawnStroke } from "../shared/outline";
 import { captionText, captionTimeline, type PlacedClip } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
 import { layOut } from "../shared/transition";
+import { speedOf } from "../shared/speed";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -173,13 +174,14 @@ export async function expandCaptions(edl: Edl): Promise<Edl> {
       const row = await get<{ duration: number | null }>("SELECT duration FROM assets WHERE id = ?", [el.src.slice(6)]);
       plays = row?.duration ? row.duration - (el.trimStart ?? 0) - (el.trimEnd ?? 0) : 0;
     }
-    lengths.push(Math.max(0, plays ?? 0));
+    // Source seconds, played at the clip's speed.
+    lengths.push(Math.max(0, plays ?? 0) / speedOf(el));
   }
   // Where each clip sits, in the whole frames the preview and the render use.
   const { placed: at } = layOut(lengths, edl.main.elements.map((el) => el.transition), edl.output.fps);
   for (const [i, el] of edl.main.elements.entries()) {
     if (el.type === "video" && el.src.startsWith("asset:")) {
-      placed.push({ src: el.src, start: at[i].start, dur: at[i].dur, trimStart: el.trimStart ?? 0 });
+      placed.push({ src: el.src, start: at[i].start, dur: at[i].dur, trimStart: el.trimStart ?? 0, speed: speedOf(el) });
       if (!cues.has(el.src)) {
         const row = await get<{ transcript: string | null; transcript_lang: string | null }>(
           "SELECT transcript, transcript_lang FROM assets WHERE id = ?",

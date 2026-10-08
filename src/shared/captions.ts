@@ -49,10 +49,12 @@ export interface PlacedClip {
   src: string;
   /** Seconds on the finished video. */
   start: number;
-  /** Seconds it plays. */
+  /** Seconds it plays on the finished video. */
   dur: number;
   /** Seconds into the source where it starts. */
   trimStart: number;
+  /** Source seconds per second of video (shared/speed.ts). Default 1. */
+  speed?: number;
 }
 
 export interface CaptionLine {
@@ -68,9 +70,10 @@ export function captionTimeline(clips: PlacedClip[], cuesBySrc: Map<string, Cue[
   for (const clip of clips) {
     const cues = cuesBySrc.get(clip.src);
     if (!cues || cues.length === 0 || clip.dur <= 0) continue;
-    const window = { start: clip.trimStart, end: clip.trimStart + clip.dur };
+    const speed = clip.speed ?? 1;
+    const window = { start: clip.trimStart, end: clip.trimStart + clip.dur * speed };
     for (const chunk of captionChunks(cues, window, maxChars)) {
-      out.push({ from: clip.start + chunk.from, to: clip.start + chunk.to, text: chunk.text });
+      out.push({ from: clip.start + chunk.from / speed, to: clip.start + chunk.to / speed, text: chunk.text });
     }
   }
   return out;
