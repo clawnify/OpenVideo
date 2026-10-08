@@ -10,9 +10,9 @@
 // array — reordering is a splice, splitting is two trims), saved with a
 // debounced PUT; validation errors surface with their JSON pointer.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
-import { splitClip } from "../shared/split";
+import { keepEdgeFades, splitClip } from "../shared/split";
 import { drawnStroke, maxStrokeWidth, outlineShadow } from "../shared/outline";
 import {
   DEFAULT_CAPTIONS,
@@ -24,6 +24,17 @@ import {
 } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
 import { fadeGain, heardFor } from "../shared/fade";
+import { sharedPrefix } from "../shared/names";
+import {
+  DEFAULT_TRANSITION_SECONDS,
+  MAX_TRANSITION_SECONDS,
+  TRANSITION_GROUPS,
+  layOut,
+  transitionLook,
+  transitionName,
+  type Transition,
+  type TransitionType,
+} from "../shared/transition";
 import {
   FULL,
   cropToRatio,
@@ -71,6 +82,7 @@ import {
   Play,
   Plus,
   Redo2,
+  RefreshCw,
   Scissors,
   Sparkles,
   Trash2,
@@ -124,6 +136,42 @@ export interface Asset {
   media_uid?: string | null;
 }
 
+/** A clip from one of the project's Drive folders. The log here is its short form. */
+interface FootageItem {
+  id: string;
+  name: string;
+  /** Where it sits, the shared folder's own name first: "Day 1/Cam B". */
+  folder: string;
+  status: "waiting" | "importing" | "ready" | "failed";
+  error: string | null;
+  asset: Asset | null;
+  log_status: "preparing" | "running" | "done" | "failed" | null;
+  log_error: string | null;
+  log: { summary: string; kind: "interview" | "stage" | "b-roll" | "other"; quality: "good" | "usable" | "unusable" } | null;
+}
+
+interface FootageList {
+  sources: { id: string; name: string; url: string }[];
+  counts: {
+    total: number;
+    waiting: number;
+    importing: number;
+    ready: number;
+    failed: number;
+    logged: number;
+    logging: number;
+    log_failed: number;
+  };
+  /** Why nothing more is starting, when the workspace has hit a limit. */
+  imports_paused: string | null;
+  logging_paused: string | null;
+  items: FootageItem[];
+}
+
+/** The clips that can go on the timeline: imported, and so assets. */
+const readyFootage = (f: FootageList): Asset[] =>
+  f.items.flatMap((i) => (i.status === "ready" && i.asset ? [i.asset] : []));
+
 interface MainVideo {
   id: string;
   type: "video";
@@ -139,6 +187,11 @@ interface MainVideo {
   anchor?: Anchor;
   /** The part of the source kept, cut out before fitting (shared/crop.ts). */
   crop?: Crop;
+  /** Seconds to fade from and to black (shared/fade.ts). */
+  fadeIn?: number;
+  fadeOut?: number;
+  /** How it comes in from the clip before it (shared/transition.ts). */
+  transition?: Transition;
 }
 interface MainImage {
   id: string;
@@ -148,6 +201,10 @@ interface MainImage {
   fit?: "contain" | "cover";
   anchor?: Anchor;
   crop?: Crop;
+  /** Seconds to fade from and to black (shared/fade.ts). */
+  fadeIn?: number;
+  fadeOut?: number;
+  transition?: Transition;
 }
 type MainElement = MainVideo | MainImage;
 
@@ -164,6 +221,9 @@ interface OverlayMedia {
   trimStart?: number;
   trimEnd?: number;
   crop?: Crop;
+  /** Seconds to fade from and to transparent, the out ending where it is last seen. */
+  fadeIn?: number;
+  fadeOut?: number;
 }
 interface OverlayText {
   id: string;
@@ -181,6 +241,9 @@ interface OverlayText {
   /** Outline around the letters, `width` px at output resolution. */
   stroke?: { color: string; width: number };
   align?: "left" | "center" | "right";
+  /** Seconds to fade from and to transparent, the out ending where it is last seen. */
+  fadeIn?: number;
+  fadeOut?: number;
 }
 type OverlayElement = OverlayMedia | OverlayText;
 interface OverlayTrack {
@@ -363,15 +426,25 @@ function mainDur(el: MainElement, srcDur: (src: string) => number | undefined): 
   return Math.max(0, d - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
 }
 
-/** Segments of the main track on the output timeline. */
+/**
+ * Segments of the main track on the output timeline: end to end, in whole
+ * output frames as the export renders them, each with the transition into it
+ * around its start (`before` / `after` the cut), shortened to fit as the
+ * export does (shared/transition.ts).
+ */
 function mainSegments(edl: Edl, srcDur: (src: string) => number | undefined) {
-  let t = 0;
-  return edl.main.elements.map((el, i) => {
-    const dur = mainDur(el, srcDur);
-    const seg = { el, i, start: t, dur };
-    t += dur;
-    return seg;
-  });
+  const els = edl.main.elements;
+  const { placed } = layOut(
+    els.map((el) => mainDur(el, srcDur)),
+    els.map((el) => el.transition),
+    edl.output.fps,
+  );
+  return els.map((el, i) => ({ el, i, ...placed[i] }));
+}
+
+/** Where the cut ends: the last clip's end, in the same whole frames. */
+function cutEnd(segments: { start: number; dur: number }[]): number {
+  return segments.reduce((end, s) => Math.max(end, s.start + s.dur), 0);
 }
 
 // ── media metadata / filmstrip / waveform caches (module-level) ─────────────
@@ -611,6 +684,8 @@ type ProjectSummary = Omit<EditProject, "edl" | "brief"> & {
   cover_asset: string | null;
   /** Set when the cover clip lives on the media service, not in app storage. */
   cover_media: string | null;
+  /** Clips taken from the project's Drive folders. */
+  footage: number;
 };
 
 /** The frame a project is recognised by: its opening shot, or a blank tile. */
@@ -652,6 +727,10 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmDel, setConfirmDel] = useState<ProjectSummary | null>(null);
+  const [fromFolder, setFromFolder] = useState(false);
+  // A project with a lot of footage is deleted over several calls.
+  const [removing, setRemoving] = useState<{ id: string; left: number } | null>(null);
+  const [removeErr, setRemoveErr] = useState("");
 
   useEffect(() => {
     api.get<ProjectSummary[]>("/api/projects").then(setProjects).catch(() => setProjects([]));
@@ -659,8 +738,24 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
 
   const remove = async (p: ProjectSummary) => {
     setConfirmDel(null);
-    await api.send("DELETE", `/api/projects/${p.id}`);
-    setProjects((cur) => cur?.filter((x) => x.id !== p.id) ?? null);
+    setRemoveErr("");
+    setRemoving({ id: p.id, left: p.footage });
+    try {
+      let left = Infinity;
+      for (;;) {
+        const r = await api.send<{ ok: boolean; remaining?: number }>("DELETE", `/api/projects/${p.id}`);
+        if (r.ok) break;
+        // No progress means the media service is unreachable: stop, and say so.
+        if ((r.remaining ?? 0) >= left) throw new Error("some of its footage could not be deleted yet. Try again in a minute");
+        left = r.remaining ?? 0;
+        setRemoving({ id: p.id, left });
+      }
+      setProjects((cur) => cur?.filter((x) => x.id !== p.id) ?? null);
+    } catch (e) {
+      setRemoveErr(`“${p.name}”: ${String((e as Error).message)}`);
+    } finally {
+      setRemoving(null);
+    }
   };
 
   const create = async () => {
@@ -677,6 +772,11 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
     <>
       {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} New project
     </>
+  );
+  const fromFolderButton = (
+    <button onClick={() => setFromFolder(true)} className={btnSecondary}>
+      <Folder className="w-4 h-4" /> From a Drive folder
+    </button>
   );
 
   return (
@@ -699,11 +799,15 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
             </p>
           </div>
           {projects && projects.length > 0 && (
-            <button onClick={create} disabled={busy} className={`${btnPrimary} shrink-0`}>
-              {newProject}
-            </button>
+            <div className="flex gap-2 shrink-0">
+              {fromFolderButton}
+              <button onClick={create} disabled={busy} className={btnPrimary}>
+                {newProject}
+              </button>
+            </div>
           )}
         </div>
+        {removeErr && <p className="text-body-sm text-danger mb-4">Could not delete {removeErr}</p>}
 
         {projects === null ? (
           /* Loading is the shape of the answer, never a spinner. */
@@ -724,9 +828,12 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
             title="No projects yet"
             body="Start a project, upload a clip, and cut it down."
             action={
-              <button onClick={create} disabled={busy} className={btnPrimary}>
-                {newProject}
-              </button>
+              <div className="flex gap-2 justify-center">
+                {fromFolderButton}
+                <button onClick={create} disabled={busy} className={btnPrimary}>
+                  {newProject}
+                </button>
+              </div>
             }
           />
         ) : (
@@ -743,11 +850,16 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
                   <ProjectCover p={p} />
                   <div className="pl-4 pr-12 py-3">
                     <div className="text-body-sm font-medium truncate">{p.name}</div>
-                    <div className="text-fine text-faint mt-0.5">Edited {fmtDate(p.updated_at)}</div>
+                    <div className="text-fine text-faint mt-0.5">
+                      {removing?.id === p.id
+                        ? `Deleting${removing.left ? `, ${removing.left} clips to go` : ""}`
+                        : `Edited ${fmtDate(p.updated_at)}${p.footage ? ` · ${p.footage} clips from Drive` : ""}`}
+                    </div>
                   </div>
                 </button>
                 <button
                   onClick={() => setConfirmDel(p)}
+                  disabled={removing?.id === p.id}
                   className={`${btnIcon} absolute right-2 bottom-3 hover:text-danger`}
                   aria-label={`Delete ${p.name}`}
                   title="Delete project"
@@ -762,9 +874,25 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
         {confirmDel && (
           <ConfirmDialog
             title={`Delete “${confirmDel.name}”?`}
-            body="The project and its export history go with it. Your footage stays in the media library."
+            body={
+              confirmDel.footage
+                ? `The project, its export history and its ${confirmDel.footage} clips from Drive go with it. The originals in Google Drive are not touched, and footage from your media library stays there.`
+                : "The project and its export history go with it. Your footage stays in the media library."
+            }
             onConfirm={() => remove(confirmDel)}
             onClose={() => setConfirmDel(null)}
+          />
+        )}
+
+        {fromFolder && (
+          <FolderLinkDialog
+            title="New project from a Drive folder"
+            submitLabel="Create project"
+            onSubmit={async (url) => {
+              const p = await api.send<EditProject>("POST", "/api/projects", { folder: url });
+              navigate(`/edits/${p.id}`);
+            }}
+            onClose={() => setFromFolder(false)}
           />
         )}
       </div>
@@ -779,6 +907,8 @@ type Pane = "library" | "canvas" | "inspector";
 
 type Sel =
   | { area: "main"; i: number }
+  /** The cut into main clip `i`, where its transition sits. */
+  | { area: "cut"; i: number }
   | { area: "ovl"; ti: number; i: number }
   | { area: "aud"; ti: number; i: number }
   | null;
@@ -786,13 +916,22 @@ type Sel =
 export function EditRoute({ id, navigate }: { id: string; navigate: (to: string) => void }) {
   const [project, setProject] = useState<EditProject | null>(null);
   const [assets, setAssets] = useState<Asset[] | null>(null);
+  const [footage, setFootage] = useState<FootageList | null>(null);
   const [err, setErr] = useState("");
 
   useEffect(() => {
-    Promise.all([api.get<EditProject>(`/api/projects/${id}`), api.get<Asset[]>("/api/assets")])
-      .then(([p, a]) => {
+    Promise.all([
+      api.get<EditProject>(`/api/projects/${id}`),
+      api.get<Asset[]>("/api/assets"),
+      // A first look only: the panel's own reads move the footage on.
+      api.get<FootageList>(`/api/projects/${id}/footage?logs=0&step=0`),
+    ])
+      .then(([p, a, f]) => {
         setProject(p);
-        setAssets(a);
+        // The project's own clips from Drive sit beside the library's, so
+        // the timeline can play them.
+        setAssets([...a, ...readyFootage(f)]);
+        setFootage(f);
       })
       .catch((e) => setErr(String(e.message || e)));
   }, [id]);
@@ -812,16 +951,24 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
         />
       </div>
     );
-  if (!project || !assets)
+  if (!project || !assets || !footage)
     return (
       <div className="flex-1 grid place-items-center text-faint">
         <Loader2 className="w-5 h-5 animate-spin" />
       </div>
     );
-  return <EditEditor initial={project} initialAssets={assets} />;
+  return <EditEditor initial={project} initialAssets={assets} initialFootage={footage} />;
 }
 
-export function EditEditor({ initial, initialAssets }: { initial: EditProject; initialAssets: Asset[] }) {
+export function EditEditor({
+  initial,
+  initialAssets,
+  initialFootage,
+}: {
+  initial: EditProject;
+  initialAssets: Asset[];
+  initialFootage: FootageList;
+}) {
   const [name, setName] = useState(initial.name);
   const [brief, setBrief] = useState(initial.brief ?? "");
   const [edl, setEdl] = useState<Edl>(initial.edl);
@@ -944,7 +1091,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
 
   // ── derived timeline ──────────────────────────────────────────────────────
   const segments = useMemo(() => mainSegments(edl, srcDur), [edl, srcDur]);
-  const total = segments.reduce((a, s) => a + s.dur, 0);
+  const total = cutEnd(segments);
 
   // Captions: the transcripts of the videos on the timeline, and the caption
   // lines they give once laid onto it. Worked out, never stored.
@@ -1057,9 +1204,12 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       if (el.type === "image") {
         const right = { ...structuredClone(el), id: rid(), duration: el.duration - off };
         el.duration = off;
+        keepEdgeFades([el, right]);
         d.main.elements.splice(seg.i + 1, 0, right);
       } else {
-        const halves = splitClip(structuredClone(el), off, seg.dur, rid());
+        // Its own length, not the whole frames it is drawn at: a play window
+        // rounded up could ask the export for more than the source has.
+        const halves = splitClip(structuredClone(el), off, mainDur(el, srcDur), rid());
         if (halves) d.main.elements.splice(seg.i, 1, ...halves);
       }
     });
@@ -1071,6 +1221,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
     if (!sel) return;
     update((d) => {
       if (sel.area === "main") d.main.elements.splice(sel.i, 1);
+      if (sel.area === "cut") delete d.main.elements[sel.i]?.transition;
       if (sel.area === "ovl") d.overlays?.[sel.ti]?.elements.splice(sel.i, 1);
       if (sel.area === "aud") d.audio?.[sel.ti]?.elements.splice(sel.i, 1);
     });
@@ -1238,6 +1389,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       {/* three-panel middle */}
       <div className="flex-1 flex min-h-0">
         <LeftPanel
+          projectId={initial.id}
+          initialFootage={initialFootage}
           pane={pane}
           tab={tab}
           setTab={setTab}
@@ -1398,6 +1551,8 @@ function AutocutModal({
 // ── left panel ──────────────────────────────────────────────────────────────
 
 function LeftPanel({
+  projectId,
+  initialFootage,
   pane,
   tab,
   setTab,
@@ -1409,6 +1564,8 @@ function LeftPanel({
   update,
   transcripts,
 }: {
+  projectId: string;
+  initialFootage: FootageList;
   pane: Pane;
   tab: RailTab;
   setTab: (t: RailTab) => void;
@@ -1422,7 +1579,18 @@ function LeftPanel({
 }) {
   const uploads = useUploads();
   useEffect(() => onUploaded((a) => setAssets((prev) => (prev.some((x) => x.id === a.id) ? prev : [a, ...prev]))), [setAssets]);
-  const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(assets);
+  // The project's clips from Drive are listed apart from the library, and
+  // their readiness comes with that list: asking the media service about each
+  // of a shoot's hundreds of clips one by one is what this avoids.
+  const footage = useFootage(projectId, initialFootage, setAssets);
+  const footageIds = useMemo(
+    () => new Set(footage.list.items.flatMap((i) => (i.asset ? [i.asset.id] : []))),
+    [footage.list],
+  );
+  const hasFootage = footage.list.sources.length > 0;
+  const [view, setView] = useState<"project" | "library">(hasFootage ? "project" : "library");
+  const library = useMemo(() => assets.filter((a) => !footageIds.has(a.id)), [assets, footageIds]);
+  const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(library);
   const [deleting, setDeleting] = useState<Asset | null>(null);
   const [deleteErr, setDeleteErr] = useState("");
 
@@ -1431,6 +1599,7 @@ function LeftPanel({
     try {
       await api.send("DELETE", `/api/assets/${a.id}`);
       setAssets((prev) => prev.filter((x) => x.id !== a.id));
+      if (footageIds.has(a.id)) footage.refresh();
     } catch (e) {
       // Refused while a project still uses it: the message names the projects.
       setDeleteErr(String((e as Error).message));
@@ -1438,10 +1607,12 @@ function LeftPanel({
   };
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
+  const [folderOpen, setFolderOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const list =
-    tab === "media" ? assets.filter((a) => isVideoAsset(a) || isImageAsset(a)) : tab === "audio" ? assets.filter(isAudioAsset) : [];
+    tab === "media" ? library.filter((a) => isVideoAsset(a) || isImageAsset(a)) : tab === "audio" ? library.filter(isAudioAsset) : [];
+  const showFootage = tab === "media" && hasFootage && view === "project";
 
   return (
     /* The rail is surface-sunken; the canvas beside it stays white. The step
@@ -1488,6 +1659,67 @@ function LeftPanel({
           </button>
         ) : (
           <>
+            {tab === "media" && hasFootage && (
+              <div className="grid grid-cols-2 gap-0.5 p-0.5 mb-3 rounded-sm bg-surface shadow-edge">
+                {(
+                  [
+                    ["project", "This project"],
+                    ["library", "Library"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setView(key)}
+                    aria-pressed={view === key}
+                    className={`h-7 rounded-xs text-fine ${
+                      view === key ? "bg-surface-sunken text-foreground" : "text-muted hover:text-foreground"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+            {folderOpen && (
+              <FolderLinkDialog
+                title="Add a Drive folder"
+                submitLabel="Add folder"
+                onSubmit={async (url) => {
+                  await api.send("POST", `/api/projects/${projectId}/footage/folders`, { url });
+                  footage.refresh();
+                  setView("project");
+                  setFolderOpen(false);
+                }}
+                onClose={() => setFolderOpen(false)}
+              />
+            )}
+            {deleteErr && <div className="text-fine text-danger mb-2">{deleteErr}</div>}
+            {deleting && (
+              <ConfirmDialog
+                title={`Delete “${deleting.name}”?`}
+                body={
+                  footageIds.has(deleting.id)
+                    ? "Its copy in this project is deleted. The original in Google Drive is not touched, and checking the folder for new files does not bring it back."
+                    : "It is removed from the library for everyone in your workspace, and cannot be recovered here. The original in Google Drive, if it came from there, is not touched."
+                }
+                onConfirm={() => {
+                  const a = deleting;
+                  setDeleting(null);
+                  void deleteAsset(a);
+                }}
+                onClose={() => setDeleting(null)}
+              />
+            )}
+            {showFootage ? (
+              <FootagePanel
+                projectId={projectId}
+                footage={footage}
+                onAdd={onAdd}
+                onDelete={setDeleting}
+                onAddFolder={() => setFolderOpen(true)}
+              />
+            ) : (
+          <>
             <button
               onClick={() => fileRef.current?.click()}
               className="w-full h-8 mb-2 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
@@ -1496,10 +1728,18 @@ function LeftPanel({
             </button>
             <button
               onClick={() => setDriveOpen(true)}
-              className="w-full h-8 mb-3 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
+              className="w-full h-8 mb-2 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
             >
               <Cloud className="w-4 h-4" /> Google Drive
             </button>
+            {tab === "media" && (
+              <button
+                onClick={() => setFolderOpen(true)}
+                className="w-full h-8 mb-3 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
+              >
+                <Link2 className="w-4 h-4" /> Drive folder link
+              </button>
+            )}
             {driveOpen && (
               <DriveDialog
                 kind={tab === "audio" ? "audio" : "media"}
@@ -1522,19 +1762,6 @@ function LeftPanel({
               }}
             />
             {uploads.length > 0 && <UploadTray uploads={uploads} />}
-            {deleteErr && <div className="text-fine text-danger mb-2">{deleteErr}</div>}
-            {deleting && (
-              <ConfirmDialog
-                title={`Delete "${deleting.name}"?`}
-                body="It is removed from the library for everyone in your workspace, and cannot be recovered here. The original in Google Drive, if it came from there, is not touched."
-                onConfirm={() => {
-                  const a = deleting;
-                  setDeleting(null);
-                  void deleteAsset(a);
-                }}
-                onClose={() => setDeleting(null)}
-              />
-            )}
             <div className="space-y-2">
               {list.map((a) => {
                 const preparing = !!a.media_uid && !mediaReady.has(a.id);
@@ -1594,9 +1821,316 @@ function LeftPanel({
               )}
             </div>
           </>
+            )}
+          </>
         )}
       </div>
     </div>
+  );
+}
+
+// ── footage from Drive folders ──────────────────────────────────────────────
+
+/**
+ * The project's clips from its Drive folders. Each read moves their import
+ * and logging on by a step, so it is read again while any are on their way;
+ * a clip that has come in joins the editor's assets.
+ */
+function useFootage(
+  projectId: string,
+  initial: FootageList,
+  setAssets: React.Dispatch<React.SetStateAction<Asset[]>>,
+): { list: FootageList; refresh: () => void } {
+  const [list, setList] = useState(initial);
+  const [tick, setTick] = useState(0);
+  const refresh = useCallback(() => setTick((t) => t + 1), []);
+
+  useEffect(() => {
+    if (tick === 0 && initial.sources.length === 0) return;
+    let dead = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = async () => {
+      try {
+        const l = await api.get<FootageList>(`/api/projects/${projectId}/footage?logs=0`);
+        if (dead) return;
+        setList(l);
+        const ready = readyFootage(l);
+        setAssets((prev) => {
+          const have = new Set(prev.map((a) => a.id));
+          const add = ready.filter((a) => !have.has(a.id));
+          return add.length ? [...prev, ...add] : prev;
+        });
+        const c = l.counts;
+        const inFlight = c.importing + c.logging;
+        const queued = c.waiting + (c.ready - c.logged - c.log_failed - c.logging);
+        // Held by a limit with nothing in flight: reading again changes nothing.
+        const held = (l.imports_paused || l.logging_paused) && inFlight === 0;
+        if (inFlight + queued > 0 && !held) timer = setTimeout(read, 10_000);
+      } catch {
+        if (!dead) timer = setTimeout(read, 30_000);
+      }
+    };
+    void read();
+    return () => {
+      dead = true;
+      clearTimeout(timer);
+    };
+  }, [projectId, tick, setAssets, initial.sources.length]);
+
+  return { list, refresh };
+}
+
+/** A small text action that fits the 184px media rail. */
+const railAction =
+  "inline-flex items-center gap-1 h-6 px-1.5 rounded-xs text-fine text-muted hover:text-foreground hover:bg-surface-sunken disabled:opacity-50";
+
+const KIND_LABEL: Record<NonNullable<FootageItem["log"]>["kind"], string> = {
+  interview: "Interview",
+  stage: "Stage",
+  "b-roll": "B-roll",
+  other: "Other",
+};
+
+/** What a clip is doing, or what its log says it is. */
+function footageLine(i: FootageItem): string {
+  if (i.status === "waiting") return "Waiting to import";
+  if (i.status === "importing") return "Importing";
+  if (i.status === "failed") return `Not imported: ${i.error ?? "unknown error"}`;
+  if (i.log_status === "done" && i.log) return i.log.summary;
+  if (i.log_status === "failed") return `Not logged: ${i.log_error ?? "unknown error"}`;
+  return "Logging";
+}
+
+function FootagePanel({
+  projectId,
+  footage,
+  onAdd,
+  onDelete,
+  onAddFolder,
+}: {
+  projectId: string;
+  footage: { list: FootageList; refresh: () => void };
+  onAdd: (a: Asset) => void;
+  onDelete: (a: Asset) => void;
+  onAddFolder: () => void;
+}) {
+  const { list, refresh } = footage;
+  const c = list.counts;
+  const [busy, setBusy] = useState<"sync" | "retry" | null>(null);
+  const [note, setNote] = useState("");
+  const groups = useMemo(() => {
+    // With one folder its name heads the panel, so the groups drop it:
+    // "Cam B", not "Day 1/Cam B" on every group.
+    const single = list.sources.length === 1 ? `${list.sources[0].name}/` : null;
+    const by = new Map<string, FootageItem[]>();
+    for (const i of list.items) {
+      const k = (single && i.folder.startsWith(single) ? i.folder.slice(single.length) : i.folder) || list.sources[0]?.name || "Drive folder";
+      by.set(k, [...(by.get(k) ?? []), i]);
+    }
+    return [...by].map(([folder, items]) => ({ folder, items, prefix: sharedPrefix(items.map((i) => i.name)) }));
+  }, [list.items, list.sources]);
+
+  const act = async (kind: "sync" | "retry") => {
+    setBusy(kind);
+    setNote("");
+    try {
+      if (kind === "sync") {
+        const r = await api.send<{ added: number }>("POST", `/api/projects/${projectId}/footage/sync`);
+        setNote(r.added ? `${r.added} new ${r.added === 1 ? "clip" : "clips"} found` : "No new files");
+      } else {
+        await api.send("POST", `/api/projects/${projectId}/footage/retry`);
+      }
+      refresh();
+    } catch (e) {
+      setNote(String((e as Error).message));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const failed = c.failed + c.log_failed;
+  const coming = c.waiting + c.importing;
+  return (
+    <div>
+      <div className="mb-2 text-fine text-muted">
+        <div className="text-foreground truncate" title={list.sources.map((s) => s.name).join(", ")}>
+          {list.sources.map((s) => s.name).join(", ")} · {c.total} {c.total === 1 ? "clip" : "clips"}
+        </div>
+        <div className="tabular-nums">
+          {coming > 0 ? `${c.ready} of ${c.total} imported` : "All imported"}
+          {c.ready > 0 && ` · ${c.logged} logged`}
+        </div>
+      </div>
+      {(list.imports_paused || list.logging_paused) && (
+        <div className="mb-2 rounded-sm bg-warning-tint px-2 py-1.5 text-fine text-foreground">
+          {list.imports_paused && <p>Importing is paused: {list.imports_paused}</p>}
+          {list.logging_paused && <p>Logging is paused: {list.logging_paused}</p>}
+          <button onClick={refresh} className="mt-1 text-link hover:underline">
+            Try again
+          </button>
+        </div>
+      )}
+      <div className="flex flex-wrap gap-x-1 gap-y-0.5 mb-3 -ml-1.5">
+        <button onClick={() => act("sync")} disabled={busy !== null} className={railAction} title="Look in the folders again for files added since">
+          {busy === "sync" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} Check for new files
+        </button>
+        {failed > 0 && (
+          <button onClick={() => act("retry")} disabled={busy !== null} className={railAction}>
+            {busy === "retry" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Redo2 className="w-3.5 h-3.5" />} Retry {failed} failed
+          </button>
+        )}
+        <button onClick={onAddFolder} className={railAction}>
+          <Plus className="w-3.5 h-3.5" /> Add folder
+        </button>
+      </div>
+      {note && <p className="text-fine text-muted mb-2">{note}</p>}
+      {groups.map(({ folder, items, prefix }) => (
+        <details key={folder} open className="group/folder mb-2">
+          <summary className="flex items-center gap-1 py-1 text-fine text-muted cursor-pointer list-none [&::-webkit-details-marker]:hidden hover:text-foreground">
+            <ChevronRight className="w-3.5 h-3.5 shrink-0 transition-transform group-open/folder:rotate-90" />
+            <span className="truncate">{folder}</span>
+            <span className="ml-auto tabular-nums text-faint">{items.length}</span>
+          </summary>
+          <div className="mt-1 space-y-0.5">
+            {items.map((i) => (
+              <FootageRow key={i.id} item={i} label={i.name.slice(prefix.length)} onAdd={onAdd} onDelete={onDelete} />
+            ))}
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
+function FootageRow({
+  item,
+  label,
+  onAdd,
+  onDelete,
+}: {
+  item: FootageItem;
+  /** The name less what the folder's names share. */
+  label: string;
+  onAdd: (a: Asset) => void;
+  onDelete: (a: Asset) => void;
+}) {
+  const asset = item.status === "ready" ? item.asset : null;
+  const line = footageLine(item);
+  const failed = item.status === "failed" || item.log_status === "failed";
+  return (
+    <div className="relative group/tile">
+      <button
+        onClick={() => asset && onAdd(asset)}
+        disabled={!asset}
+        title={`${item.name}\n${line}${asset ? "\n\nAdd to timeline" : ""}`}
+        aria-label={asset ? `Add ${item.name} to the timeline` : `${item.name}: ${line}`}
+        className="w-full p-1 rounded-sm text-left hover:bg-surface disabled:hover:bg-transparent"
+      >
+        <div className="flex gap-2 items-start">
+          <div className="w-14 h-8 shrink-0 rounded-xs overflow-hidden bg-surface-sunken grid place-items-center text-faint">
+            {asset ? (
+              <img src={frameUrl(asset, 1)} alt="" loading="lazy" className="w-full h-full object-cover bg-black" />
+            ) : item.status === "importing" ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : item.status === "failed" ? (
+              <X className="w-3.5 h-3.5 text-danger" />
+            ) : (
+              <Film className="w-3.5 h-3.5" />
+            )}
+          </div>
+          <div className={`min-w-0 flex-1 text-fine text-foreground break-all line-clamp-2 ${asset ? "pr-5" : ""}`}>{label}</div>
+        </div>
+        <div className={`mt-0.5 text-fine line-clamp-2 ${failed ? "text-danger" : "text-muted"}`}>
+          {item.log && (
+            <span className="text-faint">
+              {KIND_LABEL[item.log.kind]}
+              {item.log.quality === "unusable" && ", unusable"} ·{" "}
+            </span>
+          )}
+          {line}
+        </div>
+      </button>
+      {asset && (
+        <button
+          onClick={() => onDelete(asset)}
+          data-hover-only
+          className="absolute right-1 top-1 grid place-items-center w-6 h-6 rounded-xs text-faint hover:text-danger hover:bg-danger-tint opacity-0 transition-opacity group-hover/tile:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+          aria-label={`Delete ${item.name} from this project`}
+          title="Delete from this project"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A link to a Drive folder anyone with the link can view: its videos, and
+ * those in every folder inside it, become the project's footage.
+ */
+function FolderLinkDialog({
+  title,
+  submitLabel,
+  onSubmit,
+  onClose,
+}: {
+  title: string;
+  submitLabel: string;
+  /** Throws with the reason the folder can't be used. */
+  onSubmit: (url: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const submit = async () => {
+    if (!url.trim() || busy) return;
+    setBusy(true);
+    setErr("");
+    try {
+      await onSubmit(url.trim());
+    } catch (e) {
+      setErr(String((e as Error).message));
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog
+      title={title}
+      icon={<Folder className="w-4 h-4 text-muted" />}
+      description="Paste the link to a Google Drive folder that anyone with the link can view. Every video in it, and in the folders inside it, is copied into this project and logged clip by clip: what it shows, what is said, and its best moments. That runs in the background, so you can close the project meanwhile."
+      onClose={onClose}
+      footer={
+        <>
+          <button onClick={onClose} className={btnGhost}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button onClick={submit} disabled={!url.trim() || busy} className={btnPrimary}>
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Folder className="w-4 h-4" />}
+            {busy ? "Reading the folder" : submitLabel}
+          </button>
+        </>
+      }
+    >
+      <form
+        className="mt-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <input
+          className={inputCls}
+          placeholder="https://drive.google.com/drive/folders/…"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          aria-label="Google Drive folder link"
+          data-autofocus
+        />
+      </form>
+      {err && <p className="mt-2 text-fine text-danger">{err}</p>}
+    </Dialog>
   );
 }
 
@@ -2400,7 +2934,33 @@ function Player({
   }, [edl.output.width, edl.output.height]);
 
   const active = segments.find((s) => playhead >= s.start && playhead < s.start + s.dur) ?? segments[segments.length - 1];
-  const cutLength = segments.reduce((n, s) => n + s.dur, 0);
+  const cutLength = cutEnd(segments);
+  // A transition under way, centred on its cut: both clips on screen from
+  // `before` ahead of the cut to `after` past it. The clip under the playhead
+  // stays `active`, the one the clock follows; the other plays alongside it,
+  // into the footage past its trim.
+  const across = segments.find(
+    (s) => s.i > 0 && s.before + s.after > 0 && playhead >= s.start - s.before && playhead < s.start + s.after,
+  );
+  const blend =
+    across?.el.transition
+      ? {
+          from: segments[across.i - 1],
+          to: across,
+          look: transitionLook(across.el.transition.type, (playhead - (across.start - across.before)) / (across.before + across.after), edl.output),
+        }
+      : null;
+  type Seg = (typeof segments)[number];
+  /** On screen and playing: the active clip, and both sides of a transition. */
+  const live = (seg: Seg) => seg.dur > 0 && (seg === active || (!!blend && (seg === blend.from || seg === blend.to)));
+  /** How a clip's layer is drawn now: as itself, or partway through a transition. */
+  const layerLook = (seg: Seg) => (blend && seg === blend.from ? blend.look.from : blend && seg === blend.to ? blend.look.to : undefined);
+  /** A clip's sound in a transition, on acrossfade's curve; 1 otherwise. */
+  const crossGain = (seg: Seg) => (blend && seg === blend.from ? blend.look.gains[0] : blend && seg === blend.to ? blend.look.gains[1] : 1);
+  const filterId = useId().replace(/:/g, "");
+  /** An overlay's opacity right now: its own times its fades. */
+  const overlayOpacity = (el: { startTime: number; duration: number; opacity?: number; fadeIn?: number; fadeOut?: number }) =>
+    (el.opacity ?? 1) * fadeGain(el, heardFor(el.startTime, el.duration, cutLength), playhead - el.startTime);
 
   // A cropped clip is placed from its source's own size (shared/crop.ts).
   const cropped: Asset[] = [];
@@ -2448,19 +3008,32 @@ function Player({
     for (const seg of segments) {
       const v = videoRefs.current.get(seg.el.id);
       if (!v || seg.el.type !== "video") continue;
-      const isActive = seg === active && seg.dur > 0;
-      const wanted = (seg.el.trimStart ?? 0) + (t - seg.start);
-      if (isActive) {
+      if (live(seg)) {
+        // In a transition a clip plays past its trims. Where its source has
+        // nothing there (it starts at 0:00, or ends) the edge frame holds, as
+        // in the export; play() on an ended video would start it over instead.
+        const end = Number.isFinite(v.duration) ? v.duration : Infinity;
+        const raw = (seg.el.trimStart ?? 0) + (t - seg.start);
+        const wanted = Math.max(0, Math.min(raw, end));
+        const hold = raw < 0 || raw >= end - 0.05;
         // Playing, the video leads and needs no correction; only a real jump
         // (a scrub, or a cut to another clip) is worth a seek, because each
         // one empties the buffer. Paused, follow the playhead closely.
-        const jumped = Math.abs(v.currentTime - wanted) > (playing ? 0.75 : 0.05);
+        const jumped = Math.abs(v.currentTime - wanted) > (playing && !hold ? 0.75 : 0.05);
         if (jumped && !v.seeking) v.currentTime = wanted;
-        v.volume = Math.min(1, seg.el.volume ?? 1);
+        v.volume = Math.min(1, Math.min(1, seg.el.volume ?? 1) * fadeGain(seg.el, seg.dur, t - seg.start) * crossGain(seg));
         v.muted = seg.el.sourceAudio === false;
-        if (playing && v.paused) v.play().catch(() => {});
-        if (!playing && !v.paused) v.pause();
-      } else if (!v.paused) v.pause();
+        if (playing && !hold && v.paused) v.play().catch(() => {});
+        if ((!playing || hold) && !v.paused) v.pause();
+      } else {
+        if (!v.paused) v.pause();
+        // The clip after the active one waits where it will start playing: its
+        // first frame, or as far before it as its transition in reaches. A clip
+        // that starts where it was last left, within the seek tolerance above,
+        // runs ahead of the clock, and the playhead jumps when it takes over.
+        const first = Math.max(0, (seg.el.trimStart ?? 0) - seg.before);
+        if (active && seg.i === active.i + 1 && !v.seeking && Math.abs(v.currentTime - first) > 0.05) v.currentTime = first;
+      }
     }
     for (const [ti, track] of (edl.audio ?? []).entries()) {
       for (const el of track.elements) {
@@ -2479,7 +3052,7 @@ function Player({
       }
       void ti;
     }
-  }, [playhead, playing, segments, active, edl.audio]);
+  }, [playhead, playing, segments, active, blend?.to, edl.audio]);
 
   // Drag overlays on the stage (position as canvas fractions).
   const dragOverlay = (ti: number, i: number) => (e: React.PointerEvent) => {
@@ -2573,11 +3146,23 @@ function Player({
           style={{ background: edl.output.background ?? "#000" }}
           onPointerDown={stagePointerDown}
         >
-          {/* main track media (stacked; active visible) */}
+          {/* main track media: a full-frame layer per clip, the active one shown,
+              and in a transition the clip coming in drawn over it */}
+          {blend?.look.through && (
+            <div className="absolute inset-0 pointer-events-none" style={{ background: blend.look.through }} />
+          )}
+          {blend && (blend.look.blurBox || blend.look.block) ? (
+            <TransitionFilter id={filterId} blurBox={blend.look.blurBox} block={blend.look.block} scale={scale} />
+          ) : null}
           {segments.map((seg) => {
             const a = resolveAsset(seg.el.src);
             if (!a) return null;
-            const visible = seg === active && seg.dur > 0;
+            const visible = live(seg);
+            const look = layerLook(seg);
+            const effect = look && ((blend?.look.blurBox ?? 0) > 1 || (blend?.look.block ?? 0) * scale >= 1) ? `url(#${filterId})` : undefined;
+            // The clip's own fade, as the export draws it before any transition
+            // joins it to the next: the whole frame to black.
+            const gain = visible ? fadeGain(seg.el, seg.dur, playhead - seg.start) : 1;
             const fit = seg.el.fit ?? "contain";
             const at = fit === "cover" ? (seg.el.anchor ?? CENTRE) : CENTRE;
             const shape = seg.el.crop ? shapeFor(a) : undefined;
@@ -2594,13 +3179,22 @@ function Player({
               onLoadedMetadata: noteSize(a.id),
               onLoad: noteSize(a.id),
             };
-            // The same wrapper either way, so cropping never reloads the video.
             return (
               <div
                 key={seg.el.id}
-                className={`absolute ${place ? "overflow-hidden" : "inset-0"} ${visible ? "" : "hidden"}`}
-                style={place ? pct(place.box) : undefined}
+                className={`absolute inset-0 ${visible ? "" : "hidden"}`}
+                // The background fills the bars, so a clip blends, wipes and
+                // slides together with them, as each is one frame in the export.
+                style={{
+                  background: edl.output.background ?? "#000",
+                  opacity: look?.opacity,
+                  transform: look?.transform,
+                  clipPath: look?.clipPath,
+                  filter: effect,
+                }}
               >
+              {/* The same wrapper either way, so cropping never reloads the video. */}
+              <div className={`absolute ${place ? "overflow-hidden" : "inset-0"}`} style={place ? pct(place.box) : undefined}>
                 {seg.el.type === "video" ? (
                   a.media_uid ? (
                     <MediaVideo
@@ -2628,6 +3222,12 @@ function Player({
                 ) : (
                   <img key={seg.el.id} src={assetUrl(a)} {...common} />
                 )}
+              </div>
+              {/* its fade to black, over the clip and under everything laid on it */}
+              {gain < 1 && (
+                // The export's fade colour, whatever the project's background.
+                <div className="absolute inset-0 pointer-events-none" style={{ background: "#000", opacity: 1 - gain }} />
+              )}
               </div>
             );
           })}
@@ -2657,7 +3257,7 @@ function Player({
                     return (
                       <TextOnStage
                         key={el.id}
-                        t={el as OverlayText}
+                        t={{ ...(el as OverlayText), opacity: overlayOpacity(el) }}
                         frame={edl.output}
                         scale={scale}
                         selected={selected}
@@ -2682,7 +3282,7 @@ function Player({
                           top: `${m.y * 100}%`,
                           width: `${m.width * 100}%`,
                           aspectRatio: `${kept.width} / ${kept.height}`,
-                          opacity: m.opacity ?? 1,
+                          opacity: overlayOpacity(m),
                         }}
                       >
                         {m.type === "image" ? (
@@ -2698,7 +3298,7 @@ function Player({
                       key={el.id}
                       onPointerDown={dragOverlay(ti, i)}
                       className={`absolute cursor-move ${selected ? "outline outline-2 outline-ring" : ""}`}
-                      style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: m.opacity ?? 1 }}
+                      style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: overlayOpacity(m) }}
                     >
                       {m.type === "image" ? (
                         <img src={assetUrl(a)} onLoad={noteSize(a.id)} className="w-full h-auto pointer-events-none" />
@@ -2735,6 +3335,35 @@ function Player({
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * A blur or pixelate transition's effect, as an SVG filter both clips' layers
+ * use. Sizes come in output pixels (shared/transition.ts) and are drawn at the
+ * stage's scale. The blur is centred where xfade's box runs right of each
+ * pixel, which does not read at half a frame's spread; the blocks sample each
+ * square at its centre, as xfade does.
+ */
+function TransitionFilter({ id, blurBox, block, scale }: { id: string; blurBox?: number; block?: number; scale: number }) {
+  const b = (block ?? 0) * scale;
+  return (
+    <svg className="absolute w-0 h-0" aria-hidden>
+      <filter id={id} x="0" y="0" width="100%" height="100%" colorInterpolationFilters="sRGB">
+        {blurBox && blurBox > 1 ? (
+          // A box of width w spreads like a Gaussian of deviation w/√12.
+          <feGaussianBlur stdDeviation={`${(blurBox / Math.sqrt(12)) * scale} 0`} edgeMode="duplicate" />
+        ) : b >= 1 ? (
+          <>
+            <feFlood x={b / 2} y={b / 2} width={1} height={1} />
+            <feComposite width={b} height={b} />
+            <feTile result="grid" />
+            <feComposite in="SourceGraphic" in2="grid" operator="in" />
+            <feMorphology operator="dilate" radius={b / 2} />
+          </>
+        ) : null}
+      </filter>
+    </svg>
   );
 }
 
@@ -3419,15 +4048,16 @@ function SliderRow({ label, value, onChange, min = 0, max = 1, step = 0.01 }: { 
 }
 
 /**
- * Fade in and out for an audio clip. The fade-out ends where the clip is last
- * heard, so on music longer than the cut it ends with the video.
+ * Fade in and out for any clip. `heard` is how long it is seen or heard: the
+ * fade-out ends there, so music or a logo running past the cut fades out with
+ * the video.
  */
-function AudioFades({
+function Fades({
   el,
   heard,
   onChange,
 }: {
-  el: AudioElement;
+  el: { fadeIn?: number; fadeOut?: number };
   heard: number;
   onChange: (key: "fadeIn" | "fadeOut", seconds: number) => void;
 }) {
@@ -3457,6 +4087,168 @@ function AudioFades({
     <>
       {row("fadeIn", "Fade in")}
       {row("fadeOut", "Fade out")}
+    </>
+  );
+}
+
+/**
+ * A style's icon: how the picture changes, drawn small. Wipes and slides are
+ * drawn moving left and turned for the other directions.
+ */
+function TransitionIcon({ type, className = "w-4 h-4" }: { type?: TransitionType; className?: string }) {
+  const turn = type?.endsWith("-right") ? 180 : type?.endsWith("-up") ? 90 : type?.endsWith("-down") ? -90 : 0;
+  const glyph = (() => {
+    switch (type) {
+      case undefined:
+        // A cut: two clips meeting, the mark editors put on an edit.
+        return <path d="M2.5 4v8l5.5-4zM13.5 4v8L8 8z" fill="currentColor" stroke="none" />;
+      case "dissolve":
+        return (
+          <>
+            <rect x="1.75" y="3.25" width="8.5" height="8.5" rx="1.5" />
+            <rect x="5.75" y="4.25" width="8.5" height="8.5" rx="1.5" fill="currentColor" fillOpacity={0.35} />
+          </>
+        );
+      case "fade-black":
+      case "fade-white":
+        // Out of one frame, through a solid one (or a blank one), into the next.
+        return (
+          <>
+            <rect x="1" y="4.5" width="4" height="7" rx="1" />
+            <rect x="6" y="4.5" width="4" height="7" rx="1" fill={type === "fade-black" ? "currentColor" : "none"} />
+            <rect x="11" y="4.5" width="4" height="7" rx="1" />
+          </>
+        );
+      case "blur":
+        return (
+          <>
+            <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" />
+            <path d="M4.5 6.5h7M3.5 8h9M5 9.5h5.5" />
+          </>
+        );
+      case "pixelize":
+        return (
+          <>
+            <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" />
+            <path d="M2 3h6v5H2zM8 8h6v5H8z" fill="currentColor" fillOpacity={0.45} stroke="none" />
+          </>
+        );
+      default:
+        return type.startsWith("wipe") ? (
+          // The edge sweeping across the frame.
+          <>
+            <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" />
+            <path d="M8 2.75v10.5" />
+            <path d="M8.75 3h4a1.25 1.25 0 0 1 1.25 1.25v7.5A1.25 1.25 0 0 1 12.75 13h-4z" fill="currentColor" fillOpacity={0.35} stroke="none" />
+            <path d="M6.5 8H3.5M5 6.5 3.5 8 5 9.5" />
+          </>
+        ) : (
+          // The next frame pushing in, the arrow its way.
+          <>
+            <rect x="6.25" y="3.75" width="8" height="8.5" rx="1.5" fill="currentColor" fillOpacity={0.35} />
+            <path d="M4.25 8H1M2.5 6.5 1 8l1.5 1.5" />
+          </>
+        );
+    }
+  })();
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.25}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={turn ? { transform: `rotate(${turn}deg)` } : undefined}
+      aria-hidden
+    >
+      {glyph}
+    </svg>
+  );
+}
+
+/** A tile's short name: its group says the rest ("Wipe" over "Left"). */
+const tileName = (name: string) => {
+  const short = name.replace(/^(Wipe|Slide|Fade) /, "");
+  return short.charAt(0).toUpperCase() + short.slice(1);
+};
+
+/**
+ * The transition on one cut: a style from the tiles (or none, a cut), its
+ * length, and a way to put the same one on every cut. `plays` is what it
+ * actually gets once shortened to fit the clips on either side
+ * (shared/transition.ts).
+ */
+function TransitionPanel({
+  value,
+  plays,
+  shortened,
+  onChange,
+  onApplyToAll,
+}: {
+  value?: Transition;
+  plays: number;
+  shortened: boolean;
+  onChange: (t: Transition | undefined, coalesce?: boolean) => void;
+  onApplyToAll: (t: Transition) => void;
+}) {
+  const tile = (key: string, chosen: boolean, title: string, label: string, icon: React.ReactNode, pick: () => void) => (
+    <button
+      key={key}
+      onClick={pick}
+      title={title}
+      aria-pressed={chosen}
+      className={`flex flex-col items-center gap-1 rounded-sm px-1 py-2 text-fine leading-tight text-center ${
+        chosen ? "bg-surface-sunken text-foreground shadow-edge" : "text-muted hover:bg-surface-sunken hover:text-foreground"
+      }`}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+  return (
+    <>
+      <div className="grid grid-cols-3 gap-1 mb-3">
+        {tile("cut", !value, "Cut: no transition", "Cut", <TransitionIcon className="w-6 h-6" />, () => onChange(undefined))}
+      </div>
+      {TRANSITION_GROUPS.map((group) => (
+        <div key={group.label} className="mb-3">
+          <span className="block text-label text-muted mb-1">{group.label}</span>
+          <div className="grid grid-cols-3 gap-1">
+            {group.items.map((item) =>
+              tile(item.type, item.type === value?.type, item.name, tileName(item.name), <TransitionIcon type={item.type} className="w-6 h-6" />, () =>
+                onChange({ type: item.type, duration: value?.duration ?? DEFAULT_TRANSITION_SECONDS }),
+              ),
+            )}
+          </div>
+        </div>
+      ))}
+      {value && (
+        <Row label={`Length: ${value.duration.toFixed(1)}s`}>
+          <input
+            type="range"
+            className="w-full"
+            aria-label="Transition length"
+            value={value.duration}
+            min={0.1}
+            max={MAX_TRANSITION_SECONDS}
+            step={0.1}
+            // One drag, one undo step, as on the fade sliders.
+            onChange={(e) => onChange({ ...value, duration: Number(e.target.value) }, true)}
+          />
+        </Row>
+      )}
+      {value && shortened && (
+        <p className="text-fine text-muted -mt-2 mb-3">
+          Plays {plays.toFixed(1)}s: the clips on either side are too short for more.
+        </p>
+      )}
+      {value && (
+        <button onClick={() => onApplyToAll(value)} className={`${btnSecondary} ${stretch}`}>
+          Apply to every cut
+        </button>
+      )}
     </>
   );
 }
@@ -3516,6 +4308,32 @@ function Inspector({
         </div>
       );
 
+    if (sel.area === "cut") {
+      const el = edl.main.elements[sel.i];
+      const seg = segments.find((x) => x.i === sel.i);
+      if (!el || !seg || sel.i === 0) return null;
+      const plays = seg.before + seg.after;
+      return (
+        <>
+          <Zone>Transition</Zone>
+          <TransitionPanel
+            value={el.transition}
+            plays={plays}
+            // Within half a frame is the length asked for, rounded to frames.
+            shortened={!!el.transition && plays < el.transition.duration - 0.5 / edl.output.fps}
+            onChange={(t, coalesce) =>
+              update((d) => {
+                const clip = d.main.elements[sel.i];
+                if (t) clip.transition = t;
+                else delete clip.transition;
+              }, coalesce)
+            }
+            onApplyToAll={(t) => update((d) => d.main.elements.forEach((clip, k) => k > 0 && (clip.transition = { ...t })))}
+          />
+        </>
+      );
+    }
+
     if (sel.area === "main") {
       const el = edl.main.elements[sel.i];
       if (!el) return null;
@@ -3542,6 +4360,22 @@ function Inspector({
           />
         );
       };
+      const mainFades = seg && (
+        <>
+          <Fades
+            el={el}
+            heard={seg.dur}
+            // One drag, one undo step, as on audio clips.
+            onChange={(k, n) => update((d) => void (d.main.elements[sel.i][k] = n > 0 ? n : undefined), true)}
+          />
+          {(el.fadeIn || el.fadeOut) && (
+            <p className="text-fine text-muted -mt-2 mb-3">
+              {el.type === "video" ? "Fades from and to black, with the clip's sound." : "Fades from and to black."} A fade out
+              here and a fade in on the next clip make a fade through black.
+            </p>
+          )}
+        </>
+      );
       return (
         <>
           <Zone>{el.type === "video" ? "Video clip" : "Image"}</Zone>
@@ -3572,6 +4406,7 @@ function Inspector({
                 </button>
               </Row>
               <SliderRow label="Volume" value={el.volume ?? 1} max={2} onChange={(n) => set((e) => ((e as MainVideo).volume = n))} />
+              {mainFades}
               <button
                 disabled={analyzing}
                 onClick={async () => {
@@ -3617,6 +4452,7 @@ function Inspector({
                         delete p.trimEnd;
                         return p;
                       });
+                      keepEdgeFades(parts);
                       d.main.elements.splice(sel.i, 1, ...parts);
                     });
                     setAnalyzeMsg(
@@ -3651,6 +4487,7 @@ function Inspector({
                 />
               )}
               {mainCrop(el)}
+              {mainFades}
             </>
           )}
         </>
@@ -3749,6 +4586,11 @@ function Inspector({
             onPlace={(place) => set((x) => Object.assign(x, place))}
           />
           <SliderRow label="Opacity" value={el.opacity ?? 1} onChange={(n) => set((x) => (x.opacity = n))} />
+          <Fades
+            el={el}
+            heard={heardFor(el.startTime, el.duration, cutEnd(segments))}
+            onChange={(k, n) => update((d) => void (d.overlays![sel.ti].elements[sel.i][k] = n > 0 ? n : undefined), true)}
+          />
           <div className="grid grid-cols-2 gap-2">
             <NumberRow label="Start (s)" value={el.startTime} min={0} onChange={(n) => set((x) => (x.startTime = Math.max(0, n)))} />
             <NumberRow label="Duration (s)" value={el.duration} min={0.1} onChange={(n) => set((x) => (x.duration = Math.max(0.1, n)))} />
@@ -3761,12 +4603,12 @@ function Inspector({
     if (!el) return null;
     const set = (fn: (e: AudioElement) => void) => update((d) => fn(d.audio![sel.ti].elements[sel.i]));
     const clipDur = el.duration ?? Math.max(0, (srcDur(el.src) ?? 0) - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
-    const heard = heardFor(el.startTime, clipDur, segments.reduce((n, s) => n + s.dur, 0));
+    const heard = heardFor(el.startTime, clipDur, cutEnd(segments));
     return (
       <>
         <Zone>Audio</Zone>
         <SliderRow label="Volume" value={el.volume ?? 1} max={2} onChange={(n) => set((x) => (x.volume = n))} />
-        <AudioFades
+        <Fades
           el={el}
           heard={heard}
           // One drag, one undo step: commit() folds edits under 600 ms apart.
@@ -3784,9 +4626,9 @@ function Inspector({
   return (
     <div className={`${pane === "inspector" ? "block" : "hidden"} lg:block w-full lg:w-64 shrink-0 border-l border-border bg-surface overflow-y-auto p-4`}>
       {body()}
-      {sel && (
+      {sel && (sel.area !== "cut" || edl.main.elements[sel.i]?.transition) && (
         <button onClick={onDelete} className={`${btnDanger} ${stretch} mt-2`}>
-          <Trash2 className="w-4 h-4" /> Delete
+          <Trash2 className="w-4 h-4" /> {sel.area === "cut" ? "Remove transition" : "Delete"}
         </button>
       )}
     </div>
@@ -4130,7 +4972,7 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
 // ── timeline ────────────────────────────────────────────────────────────────
 
 const RULER_H = 22;
-const MAIN_H = 52;
+const MAIN_H = 40;
 /** Space between neighbouring clips on the main track, in pixels. */
 const CLIP_GAP = 4;
 const ROW_H = 30;
@@ -4356,7 +5198,7 @@ function TimelinePanel({
           </div>
 
           {/* main track */}
-          <TrackRow label="Video" height={MAIN_H}>
+          <TrackRow label="Video" height={MAIN_H} group>
             {segments.map((seg) => {
               const a = resolveAsset(seg.el.src);
               const selected = sel?.area === "main" && sel.i === seg.i;
@@ -4418,7 +5260,9 @@ function TimelinePanel({
                   ) : a ? (
                     <img src={assetUrl(a)} className="w-full h-full object-cover" />
                   ) : null}
-                  <div className="absolute left-1 bottom-0.5 text-fine text-on-accent/90 drop-shadow truncate max-w-[90%] tabular-nums">
+                  <FadeRamps fadeIn={seg.el.fadeIn} fadeOut={seg.el.fadeOut} heard={seg.dur} zoom={zoom} height={MAIN_H - 8} />
+                  {/* Clear of the cut's mark, which sits half over a clip's start. */}
+                  <div className={`absolute ${seg.i > 0 ? "left-3" : "left-1"} bottom-0.5 text-fine text-on-accent/90 drop-shadow truncate max-w-[90%] tabular-nums`}>
                     {a?.name} · {seg.dur.toFixed(1)}s
                   </div>
                   <div onPointerDown={trimDrag(seg.i, "l")} className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize bg-white/0 hover:bg-white/30" />
@@ -4442,6 +5286,41 @@ function TimelinePanel({
                   </ContextMenuItem>
                 </ContextMenuContent>
                 </ContextMenu>
+              );
+            })}
+            {/* Each cut between two clips carries a mark, centred in the gap: its
+                transition's icon, or (on hover) the way to add one. A transition
+                also tints the stretch it plays, half each side of the cut, without
+                taking the pointer from the clips' trim handles under it. */}
+            {segments.slice(1).map((seg) => {
+              const t = seg.el.transition;
+              const span = seg.before + seg.after;
+              const chosen = sel?.area === "cut" && sel.i === seg.i;
+              const at = seg.start * zoom - CLIP_GAP / 2;
+              return (
+                <div key={`cut-${seg.el.id}`}>
+                  {t && span > 0 && (
+                    <div
+                      className="absolute z-[4] top-1 bottom-1 rounded-xs bg-white/15 ring-1 ring-inset ring-white/60 pointer-events-none"
+                      style={{ left: (seg.start - seg.before) * zoom, width: span * zoom }}
+                    />
+                  )}
+                  <button
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={() => {
+                      if (!t) update((d) => void (d.main.elements[seg.i].transition = { type: "dissolve", duration: DEFAULT_TRANSITION_SECONDS }));
+                      setSel({ area: "cut", i: seg.i });
+                    }}
+                    className={`absolute z-[6] top-1/2 grid place-items-center w-5 h-5 rounded-xs bg-surface shadow-raised ${
+                      t ? "text-foreground" : "text-muted opacity-0 group-hover/track:opacity-100 focus-visible:opacity-100"
+                    } ${chosen ? "ring-2 ring-ring opacity-100" : ""}`}
+                    style={{ left: at, transform: "translate(-50%, -50%)" }}
+                    title={t ? `${transitionName(t.type)}, ${span.toFixed(1)}s` : "Add transition"}
+                    aria-label={t ? `${transitionName(t.type)} between clips ${seg.i} and ${seg.i + 1}` : `Add a transition between clips ${seg.i} and ${seg.i + 1}`}
+                  >
+                    <TransitionIcon type={t?.type} className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               );
             })}
           </TrackRow>
@@ -4473,8 +5352,10 @@ function TimelinePanel({
                     } ${el.type === "text" ? "bg-track-text-tint text-track-text" : "bg-track-image-tint text-track-image"} ${track.hidden ? "opacity-40" : ""}`}
                     style={{ left: el.startTime * zoom, width: Math.max(14, el.duration * zoom) }}
                   >
-                    {el.type === "text" ? <TypeIcon className="w-3 h-3 shrink-0" /> : <ImageIcon className="w-3 h-3 shrink-0" />}
-                    <span className="truncate">{el.type === "text" ? (el as OverlayText).text : resolveAsset((el as OverlayMedia).src)?.name}</span>
+                    <FadeRamps fadeIn={el.fadeIn} fadeOut={el.fadeOut} heard={heardFor(el.startTime, el.duration, total)} zoom={zoom} height={ROW_H - 8} />
+                    {/* relative: above the ramps, which are positioned */}
+                    {el.type === "text" ? <TypeIcon className="relative w-3 h-3 shrink-0" /> : <ImageIcon className="relative w-3 h-3 shrink-0" />}
+                    <span className="relative truncate">{el.type === "text" ? (el as OverlayText).text : resolveAsset((el as OverlayMedia).src)?.name}</span>
                     <div onPointerDown={floatDrag("ovl", ti, i, "resize")} className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize" />
                   </div>
                 );
@@ -4533,7 +5414,7 @@ function TimelinePanel({
   );
 }
 
-/** The fade ramps on an audio clip: the part a fade silences is dimmed under a sloped edge. */
+/** The fade ramps on a clip: the part a fade takes away is dimmed under a sloped edge. */
 function FadeRamps({ fadeIn, fadeOut, heard, zoom, height }: { fadeIn?: number; fadeOut?: number; heard: number; zoom: number; height: number }) {
   const fin = Math.min(fadeIn ?? 0, heard) * zoom;
   const fout = Math.min(fadeOut ?? 0, heard) * zoom;
@@ -4549,14 +5430,27 @@ function FadeRamps({ fadeIn, fadeOut, heard, zoom, height }: { fadeIn?: number; 
   );
 }
 
-function TrackRow({ label, height, action, children }: { label: string; height: number; action?: React.ReactNode; children: React.ReactNode }) {
+function TrackRow({
+  label,
+  height,
+  action,
+  group = false,
+  children,
+}: {
+  label: string;
+  height: number;
+  action?: React.ReactNode;
+  /** Lets marks inside show on hover of the whole track (`group-hover/track:`). */
+  group?: boolean;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex" style={{ height }}>
       <div style={{ width: HEAD_W }} className="shrink-0 border-r border-b border-border px-2 flex items-center justify-between bg-surface sticky left-0 z-10">
         <span className="text-fine text-muted truncate">{label}</span>
         {action}
       </div>
-      <div className="relative flex-1 border-b border-border bg-surface-sunken/50" data-empty>
+      <div className={`relative flex-1 border-b border-border bg-surface-sunken/50 ${group ? "group/track" : ""}`} data-empty>
         {children}
       </div>
     </div>

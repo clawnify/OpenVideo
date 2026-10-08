@@ -23,6 +23,19 @@ describe("splitClip", () => {
     expect(second).toEqual({ id: "b", trimStart: 4, trimEnd: 3 });
   });
 
+  it("keeps a clip's transition on its first half, where the clip comes in", () => {
+    const transition = { type: "dissolve", duration: 0.5 };
+    const [first, second] = splitClip({ id: "a", duration: 10, transition }, 4, 10, "b")!;
+    expect(first).toEqual({ id: "a", duration: 4, transition });
+    expect(second).toEqual({ id: "b", trimStart: 4, duration: 6 });
+  });
+
+  it("keeps each fade on the outer edge it was set on, so the new cut is hard", () => {
+    const [first, second] = splitClip({ id: "a", duration: 10, fadeIn: 1, fadeOut: 2 }, 4, 10, "b")!;
+    expect(first).toEqual({ id: "a", duration: 4, fadeIn: 1 });
+    expect(second).toEqual({ id: "b", trimStart: 4, duration: 6, fadeOut: 2 });
+  });
+
   it("refuses a point outside the clip", () => {
     expect(splitClip({ id: "a", duration: 10 }, 0, 10, "b")).toBeNull();
     expect(splitClip({ id: "a", duration: 10 }, 10, 10, "b")).toBeNull();

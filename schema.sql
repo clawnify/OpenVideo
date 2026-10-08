@@ -106,3 +106,48 @@ CREATE TABLE IF NOT EXISTS media_uploads (
 -- there. The row stays 'exporting' until a read of the job finds the outcome
 -- and settles it, so a closed tab or a long render never loses the export.
 ALTER TABLE export_jobs ADD COLUMN service_job_id TEXT;
+
+-- Google Drive folders a project takes its footage from: shared "with the
+-- link", so nothing is connected and anyone with the link could read them.
+-- `language` is what the clips' speech is transcribed in.
+CREATE TABLE IF NOT EXISTS footage_sources (
+  project_id TEXT NOT NULL,
+  folder_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  language TEXT NOT NULL DEFAULT 'en',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (project_id, folder_id)
+);
+
+-- One row per video in those folders and every folder inside them. The video
+-- belongs to its project: the media library lists it with that project only,
+-- and deleting the project deletes it. It moves on by itself (see
+-- src/server/footage.ts):
+--   status:     waiting | importing | ready | failed | removed
+--   log_status: NULL (not started) | preparing | running | done | failed
+-- `log` is the analysis's log of the clip as JSON (ClipLog), times in seconds.
+-- `folder` is the path below the shared folder, its own name first ("Day 1/Cam B").
+CREATE TABLE IF NOT EXISTS project_footage (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  project_id TEXT NOT NULL,
+  drive_file_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  folder TEXT NOT NULL DEFAULT '',
+  language TEXT NOT NULL DEFAULT 'en',
+  status TEXT NOT NULL DEFAULT 'waiting',
+  error TEXT,
+  asset_id TEXT,
+  log_status TEXT,
+  log_job TEXT,
+  log TEXT,
+  log_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (project_id, drive_file_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_footage_asset ON project_footage(asset_id);
+
+-- When the project's next footage step is booked on the platform queue
+-- (ISO time). NULL: none booked.
+ALTER TABLE edit_projects ADD COLUMN footage_step_at TEXT;

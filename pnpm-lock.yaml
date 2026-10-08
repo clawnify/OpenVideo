@@ -17,6 +17,9 @@ importers:
       '@clawnify/db':
         specifier: ^0.4.2
         version: 0.4.2(@cloudflare/workers-types@4.20260613.1)
+      '@clawnify/queue':
+        specifier: ^0.1.1
+        version: 0.1.1
       '@fontsource-variable/inter':
         specifier: ^5.3.0
         version: 5.3.0
@@ -202,6 +205,9 @@ packages:
 
   '@clawnify/integrations@0.4.0':
     resolution: {integrity: sha512-epX7r9VHczmjHJuegsn1ogRM9SG8CsYLsyF6hfxN3uV4nDYjdWazNingZnAgOI+ynVj0ZLV8x2rUnNoUUnSuQw==}
+
+  '@clawnify/queue@0.1.1':
+    resolution: {integrity: sha512-6gfaz4B3rVVFWMB0IjJ0mt3ausETXpiWodRqShMBTRwVtNyCXJ4FO4/f3qc/TYtnA9ZZBPVeBLjbzg5nTqvULw==}
 
   '@clawnify/routes@0.2.2':
     resolution: {integrity: sha512-+s7gjRyH8bmIUHQDHmmwGyUeEcV5m+IoWEYr2tLiWdVW7WKlFlgeKIuJ61vW9mc9k4TizL+B+Tg8qJ72zAbvOA==}
@@ -2774,6 +2780,8 @@ snapshots:
       - sqlite3
 
   '@clawnify/integrations@0.4.0': {}
+
+  '@clawnify/queue@0.1.1': {}
 
   '@clawnify/routes@0.2.2(@hono/zod-openapi@0.19.10(hono@4.12.25)(zod@3.25.76))(hono@4.12.25)':
     dependencies:
