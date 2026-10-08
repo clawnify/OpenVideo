@@ -23,14 +23,17 @@ import {
 import {
   DRIVE_FILE_ID,
   SHARED_WITH_ME,
+  driveCopyForImport,
+  driveCreateFolder,
   driveDownloadLink,
+  driveRemove,
   driveFolderName,
   driveStatus,
   listDriveFiles,
   withinFolder,
 } from "./drive";
 import { parseDriveLink, type FolderVideo } from "./drive-link";
-import { addFolderVideos, bookStep, readFolder, stepFootage, type DriveDownload, type StepOutcome } from "./footage";
+import { addFolderVideos, bookStep, readFolder, stepFootage, type DriveSource, type StepOutcome } from "./footage";
 import { HIGHLIGHTS_NO_KEY, highlightsPending, stepHighlights, type HighlightKind } from "./highlights";
 import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
@@ -818,11 +821,18 @@ app.delete("/api/projects/:id", async (c) => {
   // service, counted against the org's storage until it is deleted there, so
   // a big shoot is deleted a batch per call: 202 says how many are left, and
   // calling again carries on. A clip another project uses stays, in the library.
-  const footage = await query<{ id: string; asset_id: string | null; media_uid: string | null }>(
-    `SELECT f.id, f.asset_id, a.media_uid FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+  const footage = await query<{ id: string; asset_id: string | null; media_uid: string | null; copy_id: string | null }>(
+    `SELECT f.id, f.asset_id, a.media_uid, f.copy_id FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
       WHERE f.project_id = ? LIMIT ?`,
     [id, FOOTAGE_DELETE_BATCH],
   );
+  // A copy made in the connected account's Drive for an import still under
+  // way goes too: it is the size of the original.
+  const copies = footage.filter((f) => f.copy_id);
+  if (copies.length) {
+    const drive = await driveSource(c.env);
+    if (drive) await Promise.all(copies.map((f) => drive.remove(f.copy_id!).catch(() => {})));
+  }
   if (footage.length > 0) {
     await Promise.all(
       footage.map(async (f) => {
@@ -894,17 +904,45 @@ async function addFolder(
 }
 
 /** The org's Google Drive connection as a footage source, when it has one. */
-async function driveDownloader(env: Bindings): Promise<DriveDownload | undefined> {
+async function driveSource(env: Bindings): Promise<DriveSource | undefined> {
   if (!env.CREDENTIALS) return undefined;
   const status = await driveStatus(env).catch(() => ({ connected: false }));
   if (!status.connected) return undefined;
-  return async (fileId) => {
-    try {
-      const file = await driveDownloadLink(env, fileId);
-      return { url: file.url, mimeType: file.mimeType };
-    } catch (e) {
-      return { error: e instanceof Error ? e.message : String(e) };
-    }
+  const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+  // Copies for import land in one folder of the connected account's Drive,
+  // made the first time one is needed (and again if someone deleted it).
+  const copyFolder = async (fresh: boolean): Promise<string> => {
+    const row = fresh ? null : await get<{ value: string }>("SELECT value FROM app_settings WHERE key = 'drive_copy_folder'");
+    if (row?.value) return row.value;
+    const id = await driveCreateFolder(env, "OpenVideo imports (temporary)");
+    await run(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('drive_copy_folder', ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      [id],
+    );
+    return id;
+  };
+  return {
+    async download(fileId) {
+      try {
+        const file = await driveDownloadLink(env, fileId);
+        return { url: file.url, mimeType: file.mimeType };
+      } catch (e) {
+        return { error: message(e) };
+      }
+    },
+    async copy(fileId, name) {
+      try {
+        return { fileId: await driveCopyForImport(env, fileId, name, await copyFolder(false)) };
+      } catch {
+        try {
+          return { fileId: await driveCopyForImport(env, fileId, name, await copyFolder(true)) };
+        } catch (e) {
+          return { error: message(e) };
+        }
+      }
+    },
+    remove: (fileId) => driveRemove(env, fileId),
   };
 }
 
@@ -926,10 +964,10 @@ async function advanceFootage(
 ): Promise<{ outcome: StepOutcome; nextStepAt: string | null }> {
   // With the org's Drive connection, clips come in through it, on deliveries
   // only: a download through it takes from seconds to minutes.
-  const download = await driveDownloader(c.env);
+  const drive = await driveSource(c.env);
   const outcome = await stepFootage(mediaCfg(c.env), projectId, {
-    download: after === "delivery" ? download : undefined,
-    startImports: !(download && after === "read"),
+    drive: after === "delivery" ? drive : undefined,
+    startImports: !(drive && after === "read"),
   });
   // Highlights are read only on a delivery: a model call takes up to half a
   // minute, and a read answers at once. A read still keeps the chain booked.
