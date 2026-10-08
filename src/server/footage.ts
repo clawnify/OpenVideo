@@ -16,7 +16,7 @@
 
 import { enqueueJob, type QueueEnv } from "@clawnify/queue";
 import { query, get, run } from "./db";
-import { importMedia, mediaState, prepareMedia, type MediaConfig } from "./media";
+import { deleteMedia, importMedia, mediaState, prepareMedia, type MediaConfig } from "./media";
 import { directDownloadUrl, folderListingUrl, judgeLinkResponse, listFolderVideos, type FolderVideo } from "./drive-link";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -519,6 +519,13 @@ async function startImport(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWi
     return { orgWide: false, detail: /<title>[^<]*quota exceeded/i.test(page) ? DRIVE_QUOTA : (verdict.reason ?? "that file isn't a video") };
   }
 
+  // A copy from an attempt that failed is of no use and still counts against
+  // the org's storage: it goes before the clip is imported again.
+  if (r.asset_id) {
+    if (r.media_uid) await deleteMedia(cfg, r.media_uid).catch(() => {});
+    await run("DELETE FROM assets WHERE id = ?", [r.asset_id]);
+    await setRow(r.id, { asset_id: null });
+  }
   const imported = await importMedia(cfg, url, r.name);
   if ("failure" in imported) {
     return { orgWide: ORG_LIMITS.has(imported.failure.error), detail: imported.failure.detail };

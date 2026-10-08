@@ -168,6 +168,24 @@ export function frameUrl(playback: MediaPlayback, seconds: number): string {
   return playback.thumbnail.replace("{time}", String(Math.max(0, Math.round(seconds * 10) / 10)));
 }
 
+/**
+ * The original's frame rate and size. The size is the service's; the rate is
+ * read off the adaptive playlist, whose renditions keep the source's rate.
+ */
+export async function mediaFacts(
+  cfg: MediaConfig,
+  uid: string,
+): Promise<{ fps: number | null; width: number | null; height: number | null } | null> {
+  const state = await mediaState(cfg, uid);
+  const play = await mediaPlayback(cfg, uid);
+  if ("failure" in state || "failure" in play) return null;
+  const list = await fetch(play.playback.hls)
+    .then((r) => (r.ok ? r.text() : ""))
+    .catch(() => "");
+  const rates = [...list.matchAll(/FRAME-RATE=([\d.]+)/g)].map((m) => Number(m[1])).filter((n) => n > 0 && n < 1000);
+  return { fps: rates.length ? Math.max(...rates) : null, width: state.media.width, height: state.media.height };
+}
+
 export async function deleteMedia(cfg: MediaConfig, uid: string): Promise<void> {
   await call(cfg, `/${uid}`, { method: "DELETE" });
 }
