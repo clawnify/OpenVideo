@@ -221,20 +221,28 @@ const round1 = (n: number) => Math.round(n * 10) / 10;
 const str = (v: unknown, max: number) => (typeof v === "string" ? v.trim().slice(0, max) : "");
 
 /**
- * Who says a soundbite. The logger watched the clip, so their description of
- * whoever says those words wins. Otherwise the model's words stand only when
- * the clip itself bears out every name in them: a model that cannot see will
- * otherwise put a famous name on a stranger from what they talk about.
+ * Who says a soundbite. A model that cannot see will put a famous name on a
+ * stranger from what they talk about, so a name stands only when the clip
+ * itself bears it out (said in the transcript, shown on screen, or in the
+ * log); a guess gives way to the logger's description of whoever says those
+ * words, since the logger watched the clip. A description without a name
+ * gives way to the logger's too, for the same reason. Names match as whole
+ * words: "Ho" is not borne out by "who".
  */
 export function vetSpeaker(said: string, start: number, end: number, clip: HighlightClip): string {
-  const quoted = clip.log.quotes.find((q) => q.speaker && q.start < end && start < q.end);
-  if (quoted) return quoted.speaker;
-  const material = [clip.log.summary, ...clip.log.visible_text, ...clip.log.quotes.map((q) => q.speaker), clip.transcript ?? ""]
-    .join(" ")
-    .toLowerCase();
-  const names = said.match(/\p{Lu}[\p{L}'.-]*/gu) ?? [];
-  if (names.every((n) => material.includes(n.toLowerCase()))) return said;
-  return clip.log.quotes.find((q) => q.speaker)?.speaker ?? "";
+  const logged =
+    clip.log.quotes.find((q) => q.speaker && q.start < end && start < q.end)?.speaker ??
+    clip.log.quotes.find((q) => q.speaker)?.speaker ??
+    "";
+  const material = [clip.log.summary, ...clip.log.visible_text, ...clip.log.quotes.map((q) => q.speaker), clip.transcript ?? ""].join(" ");
+  const words = said.match(/\p{Lu}[\p{L}'.-]*/gu) ?? [];
+  const bornOut = (w: string) => new RegExp(`(?<!\\p{L})${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?!\\p{L})`, "iu").test(material);
+  if (!words.every(bornOut)) return logged;
+  // A name is a capitalised word anywhere but the start of a description
+  // ("Ada Lovelace", "man with a NightForce badge"), or one standing alone.
+  const parts = said.trim().split(/\s+/);
+  const named = parts.length === 1 ? words.length === 1 : words.some((w) => w !== parts[0]);
+  return named ? said : logged || said;
 }
 
 /** The model's answer → a verdict per clip. Clips it left out get none. */
