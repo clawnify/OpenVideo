@@ -25,6 +25,7 @@ import {
 import { parseVtt, type Cue } from "../shared/transcript";
 import { fadeGain, heardFor } from "../shared/fade";
 import { DUCK_CHOICES, duckEnvelope, envelopeGain, speechSpans, type EnvelopePoint } from "../shared/duck";
+import { sharedPrefix } from "../shared/names";
 import {
   DEFAULT_TRANSITION_SECONDS,
   MAX_TRANSITION_SECONDS,
@@ -82,6 +83,7 @@ import {
   Play,
   Plus,
   Redo2,
+  RefreshCw,
   Scissors,
   Sparkles,
   Trash2,
@@ -134,6 +136,42 @@ export interface Asset {
   /** Set when the footage lives on the media service rather than in storage. */
   media_uid?: string | null;
 }
+
+/** A clip from one of the project's Drive folders. The log here is its short form. */
+interface FootageItem {
+  id: string;
+  name: string;
+  /** Where it sits, the shared folder's own name first: "Day 1/Cam B". */
+  folder: string;
+  status: "waiting" | "importing" | "ready" | "failed";
+  error: string | null;
+  asset: Asset | null;
+  log_status: "preparing" | "running" | "done" | "failed" | null;
+  log_error: string | null;
+  log: { summary: string; kind: "interview" | "stage" | "b-roll" | "other"; quality: "good" | "usable" | "unusable" } | null;
+}
+
+interface FootageList {
+  sources: { id: string; name: string; url: string }[];
+  counts: {
+    total: number;
+    waiting: number;
+    importing: number;
+    ready: number;
+    failed: number;
+    logged: number;
+    logging: number;
+    log_failed: number;
+  };
+  /** Why nothing more is starting, when the workspace has hit a limit. */
+  imports_paused: string | null;
+  logging_paused: string | null;
+  items: FootageItem[];
+}
+
+/** The clips that can go on the timeline: imported, and so assets. */
+const readyFootage = (f: FootageList): Asset[] =>
+  f.items.flatMap((i) => (i.status === "ready" && i.asset ? [i.asset] : []));
 
 interface MainVideo {
   id: string;
@@ -649,6 +687,8 @@ type ProjectSummary = Omit<EditProject, "edl" | "brief"> & {
   cover_asset: string | null;
   /** Set when the cover clip lives on the media service, not in app storage. */
   cover_media: string | null;
+  /** Clips taken from the project's Drive folders. */
+  footage: number;
 };
 
 /** The frame a project is recognised by: its opening shot, or a blank tile. */
@@ -690,6 +730,10 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmDel, setConfirmDel] = useState<ProjectSummary | null>(null);
+  const [fromFolder, setFromFolder] = useState(false);
+  // A project with a lot of footage is deleted over several calls.
+  const [removing, setRemoving] = useState<{ id: string; left: number } | null>(null);
+  const [removeErr, setRemoveErr] = useState("");
 
   useEffect(() => {
     api.get<ProjectSummary[]>("/api/projects").then(setProjects).catch(() => setProjects([]));
@@ -697,8 +741,24 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
 
   const remove = async (p: ProjectSummary) => {
     setConfirmDel(null);
-    await api.send("DELETE", `/api/projects/${p.id}`);
-    setProjects((cur) => cur?.filter((x) => x.id !== p.id) ?? null);
+    setRemoveErr("");
+    setRemoving({ id: p.id, left: p.footage });
+    try {
+      let left = Infinity;
+      for (;;) {
+        const r = await api.send<{ ok: boolean; remaining?: number }>("DELETE", `/api/projects/${p.id}`);
+        if (r.ok) break;
+        // No progress means the media service is unreachable: stop, and say so.
+        if ((r.remaining ?? 0) >= left) throw new Error("some of its footage could not be deleted yet. Try again in a minute");
+        left = r.remaining ?? 0;
+        setRemoving({ id: p.id, left });
+      }
+      setProjects((cur) => cur?.filter((x) => x.id !== p.id) ?? null);
+    } catch (e) {
+      setRemoveErr(`“${p.name}”: ${String((e as Error).message)}`);
+    } finally {
+      setRemoving(null);
+    }
   };
 
   const create = async () => {
@@ -715,6 +775,11 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
     <>
       {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} New project
     </>
+  );
+  const fromFolderButton = (
+    <button onClick={() => setFromFolder(true)} className={btnSecondary}>
+      <Folder className="w-4 h-4" /> From a Drive folder
+    </button>
   );
 
   return (
@@ -737,11 +802,15 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
             </p>
           </div>
           {projects && projects.length > 0 && (
-            <button onClick={create} disabled={busy} className={`${btnPrimary} shrink-0`}>
-              {newProject}
-            </button>
+            <div className="flex gap-2 shrink-0">
+              {fromFolderButton}
+              <button onClick={create} disabled={busy} className={btnPrimary}>
+                {newProject}
+              </button>
+            </div>
           )}
         </div>
+        {removeErr && <p className="text-body-sm text-danger mb-4">Could not delete {removeErr}</p>}
 
         {projects === null ? (
           /* Loading is the shape of the answer, never a spinner. */
@@ -762,9 +831,12 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
             title="No projects yet"
             body="Start a project, upload a clip, and cut it down."
             action={
-              <button onClick={create} disabled={busy} className={btnPrimary}>
-                {newProject}
-              </button>
+              <div className="flex gap-2 justify-center">
+                {fromFolderButton}
+                <button onClick={create} disabled={busy} className={btnPrimary}>
+                  {newProject}
+                </button>
+              </div>
             }
           />
         ) : (
@@ -781,11 +853,16 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
                   <ProjectCover p={p} />
                   <div className="pl-4 pr-12 py-3">
                     <div className="text-body-sm font-medium truncate">{p.name}</div>
-                    <div className="text-fine text-faint mt-0.5">Edited {fmtDate(p.updated_at)}</div>
+                    <div className="text-fine text-faint mt-0.5">
+                      {removing?.id === p.id
+                        ? `Deleting${removing.left ? `, ${removing.left} clips to go` : ""}`
+                        : `Edited ${fmtDate(p.updated_at)}${p.footage ? ` · ${p.footage} clips from Drive` : ""}`}
+                    </div>
                   </div>
                 </button>
                 <button
                   onClick={() => setConfirmDel(p)}
+                  disabled={removing?.id === p.id}
                   className={`${btnIcon} absolute right-2 bottom-3 hover:text-danger`}
                   aria-label={`Delete ${p.name}`}
                   title="Delete project"
@@ -800,9 +877,25 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
         {confirmDel && (
           <ConfirmDialog
             title={`Delete “${confirmDel.name}”?`}
-            body="The project and its export history go with it. Your footage stays in the media library."
+            body={
+              confirmDel.footage
+                ? `The project, its export history and its ${confirmDel.footage} clips from Drive go with it. The originals in Google Drive are not touched, and footage from your media library stays there.`
+                : "The project and its export history go with it. Your footage stays in the media library."
+            }
             onConfirm={() => remove(confirmDel)}
             onClose={() => setConfirmDel(null)}
+          />
+        )}
+
+        {fromFolder && (
+          <FolderLinkDialog
+            title="New project from a Drive folder"
+            submitLabel="Create project"
+            onSubmit={async (url) => {
+              const p = await api.send<EditProject>("POST", "/api/projects", { folder: url });
+              navigate(`/edits/${p.id}`);
+            }}
+            onClose={() => setFromFolder(false)}
           />
         )}
       </div>
@@ -826,13 +919,22 @@ type Sel =
 export function EditRoute({ id, navigate }: { id: string; navigate: (to: string) => void }) {
   const [project, setProject] = useState<EditProject | null>(null);
   const [assets, setAssets] = useState<Asset[] | null>(null);
+  const [footage, setFootage] = useState<FootageList | null>(null);
   const [err, setErr] = useState("");
 
   useEffect(() => {
-    Promise.all([api.get<EditProject>(`/api/projects/${id}`), api.get<Asset[]>("/api/assets")])
-      .then(([p, a]) => {
+    Promise.all([
+      api.get<EditProject>(`/api/projects/${id}`),
+      api.get<Asset[]>("/api/assets"),
+      // A first look only: the panel's own reads move the footage on.
+      api.get<FootageList>(`/api/projects/${id}/footage?logs=0&step=0`),
+    ])
+      .then(([p, a, f]) => {
         setProject(p);
-        setAssets(a);
+        // The project's own clips from Drive sit beside the library's, so
+        // the timeline can play them.
+        setAssets([...a, ...readyFootage(f)]);
+        setFootage(f);
       })
       .catch((e) => setErr(String(e.message || e)));
   }, [id]);
@@ -852,16 +954,24 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
         />
       </div>
     );
-  if (!project || !assets)
+  if (!project || !assets || !footage)
     return (
       <div className="flex-1 grid place-items-center text-faint">
         <Loader2 className="w-5 h-5 animate-spin" />
       </div>
     );
-  return <EditEditor initial={project} initialAssets={assets} />;
+  return <EditEditor initial={project} initialAssets={assets} initialFootage={footage} />;
 }
 
-export function EditEditor({ initial, initialAssets }: { initial: EditProject; initialAssets: Asset[] }) {
+export function EditEditor({
+  initial,
+  initialAssets,
+  initialFootage,
+}: {
+  initial: EditProject;
+  initialAssets: Asset[];
+  initialFootage: FootageList;
+}) {
   const [name, setName] = useState(initial.name);
   const [brief, setBrief] = useState(initial.brief ?? "");
   const [edl, setEdl] = useState<Edl>(initial.edl);
@@ -1320,6 +1430,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       {/* three-panel middle */}
       <div className="flex-1 flex min-h-0">
         <LeftPanel
+          projectId={initial.id}
+          initialFootage={initialFootage}
           pane={pane}
           tab={tab}
           setTab={setTab}
@@ -1483,6 +1595,8 @@ function AutocutModal({
 // ── left panel ──────────────────────────────────────────────────────────────
 
 function LeftPanel({
+  projectId,
+  initialFootage,
   pane,
   tab,
   setTab,
@@ -1494,6 +1608,8 @@ function LeftPanel({
   update,
   transcripts,
 }: {
+  projectId: string;
+  initialFootage: FootageList;
   pane: Pane;
   tab: RailTab;
   setTab: (t: RailTab) => void;
@@ -1507,7 +1623,18 @@ function LeftPanel({
 }) {
   const uploads = useUploads();
   useEffect(() => onUploaded((a) => setAssets((prev) => (prev.some((x) => x.id === a.id) ? prev : [a, ...prev]))), [setAssets]);
-  const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(assets);
+  // The project's clips from Drive are listed apart from the library, and
+  // their readiness comes with that list: asking the media service about each
+  // of a shoot's hundreds of clips one by one is what this avoids.
+  const footage = useFootage(projectId, initialFootage, setAssets);
+  const footageIds = useMemo(
+    () => new Set(footage.list.items.flatMap((i) => (i.asset ? [i.asset.id] : []))),
+    [footage.list],
+  );
+  const hasFootage = footage.list.sources.length > 0;
+  const [view, setView] = useState<"project" | "library">(hasFootage ? "project" : "library");
+  const library = useMemo(() => assets.filter((a) => !footageIds.has(a.id)), [assets, footageIds]);
+  const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(library);
   const [deleting, setDeleting] = useState<Asset | null>(null);
   const [deleteErr, setDeleteErr] = useState("");
 
@@ -1516,6 +1643,7 @@ function LeftPanel({
     try {
       await api.send("DELETE", `/api/assets/${a.id}`);
       setAssets((prev) => prev.filter((x) => x.id !== a.id));
+      if (footageIds.has(a.id)) footage.refresh();
     } catch (e) {
       // Refused while a project still uses it: the message names the projects.
       setDeleteErr(String((e as Error).message));
@@ -1523,10 +1651,12 @@ function LeftPanel({
   };
   const [driveOpen, setDriveOpen] = useState(false);
   const closeDrive = useCallback(() => setDriveOpen(false), []);
+  const [folderOpen, setFolderOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const list =
-    tab === "media" ? assets.filter((a) => isVideoAsset(a) || isImageAsset(a)) : tab === "audio" ? assets.filter(isAudioAsset) : [];
+    tab === "media" ? library.filter((a) => isVideoAsset(a) || isImageAsset(a)) : tab === "audio" ? library.filter(isAudioAsset) : [];
+  const showFootage = tab === "media" && hasFootage && view === "project";
 
   return (
     /* The rail is surface-sunken; the canvas beside it stays white. The step
@@ -1573,6 +1703,67 @@ function LeftPanel({
           </button>
         ) : (
           <>
+            {tab === "media" && hasFootage && (
+              <div className="grid grid-cols-2 gap-0.5 p-0.5 mb-3 rounded-sm bg-surface shadow-edge">
+                {(
+                  [
+                    ["project", "This project"],
+                    ["library", "Library"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setView(key)}
+                    aria-pressed={view === key}
+                    className={`h-7 rounded-xs text-fine ${
+                      view === key ? "bg-surface-sunken text-foreground" : "text-muted hover:text-foreground"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+            {folderOpen && (
+              <FolderLinkDialog
+                title="Add a Drive folder"
+                submitLabel="Add folder"
+                onSubmit={async (url) => {
+                  await api.send("POST", `/api/projects/${projectId}/footage/folders`, { url });
+                  footage.refresh();
+                  setView("project");
+                  setFolderOpen(false);
+                }}
+                onClose={() => setFolderOpen(false)}
+              />
+            )}
+            {deleteErr && <div className="text-fine text-danger mb-2">{deleteErr}</div>}
+            {deleting && (
+              <ConfirmDialog
+                title={`Delete “${deleting.name}”?`}
+                body={
+                  footageIds.has(deleting.id)
+                    ? "Its copy in this project is deleted. The original in Google Drive is not touched, and checking the folder for new files does not bring it back."
+                    : "It is removed from the library for everyone in your workspace, and cannot be recovered here. The original in Google Drive, if it came from there, is not touched."
+                }
+                onConfirm={() => {
+                  const a = deleting;
+                  setDeleting(null);
+                  void deleteAsset(a);
+                }}
+                onClose={() => setDeleting(null)}
+              />
+            )}
+            {showFootage ? (
+              <FootagePanel
+                projectId={projectId}
+                footage={footage}
+                onAdd={onAdd}
+                onDelete={setDeleting}
+                onAddFolder={() => setFolderOpen(true)}
+              />
+            ) : (
+          <>
             <button
               onClick={() => fileRef.current?.click()}
               className="w-full h-8 mb-2 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
@@ -1581,10 +1772,18 @@ function LeftPanel({
             </button>
             <button
               onClick={() => setDriveOpen(true)}
-              className="w-full h-8 mb-3 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
+              className="w-full h-8 mb-2 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
             >
               <Cloud className="w-4 h-4" /> Google Drive
             </button>
+            {tab === "media" && (
+              <button
+                onClick={() => setFolderOpen(true)}
+                className="w-full h-8 mb-3 rounded-sm border border-dashed border-border text-body-sm text-muted hover:text-foreground hover:border-faint flex items-center justify-center gap-1.5"
+              >
+                <Link2 className="w-4 h-4" /> Drive folder link
+              </button>
+            )}
             {driveOpen && (
               <DriveDialog
                 kind={tab === "audio" ? "audio" : "media"}
@@ -1607,19 +1806,6 @@ function LeftPanel({
               }}
             />
             {uploads.length > 0 && <UploadTray uploads={uploads} />}
-            {deleteErr && <div className="text-fine text-danger mb-2">{deleteErr}</div>}
-            {deleting && (
-              <ConfirmDialog
-                title={`Delete "${deleting.name}"?`}
-                body="It is removed from the library for everyone in your workspace, and cannot be recovered here. The original in Google Drive, if it came from there, is not touched."
-                onConfirm={() => {
-                  const a = deleting;
-                  setDeleting(null);
-                  void deleteAsset(a);
-                }}
-                onClose={() => setDeleting(null)}
-              />
-            )}
             <div className="space-y-2">
               {list.map((a) => {
                 const preparing = !!a.media_uid && !mediaReady.has(a.id);
@@ -1679,9 +1865,316 @@ function LeftPanel({
               )}
             </div>
           </>
+            )}
+          </>
         )}
       </div>
     </div>
+  );
+}
+
+// ── footage from Drive folders ──────────────────────────────────────────────
+
+/**
+ * The project's clips from its Drive folders. Each read moves their import
+ * and logging on by a step, so it is read again while any are on their way;
+ * a clip that has come in joins the editor's assets.
+ */
+function useFootage(
+  projectId: string,
+  initial: FootageList,
+  setAssets: React.Dispatch<React.SetStateAction<Asset[]>>,
+): { list: FootageList; refresh: () => void } {
+  const [list, setList] = useState(initial);
+  const [tick, setTick] = useState(0);
+  const refresh = useCallback(() => setTick((t) => t + 1), []);
+
+  useEffect(() => {
+    if (tick === 0 && initial.sources.length === 0) return;
+    let dead = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = async () => {
+      try {
+        const l = await api.get<FootageList>(`/api/projects/${projectId}/footage?logs=0`);
+        if (dead) return;
+        setList(l);
+        const ready = readyFootage(l);
+        setAssets((prev) => {
+          const have = new Set(prev.map((a) => a.id));
+          const add = ready.filter((a) => !have.has(a.id));
+          return add.length ? [...prev, ...add] : prev;
+        });
+        const c = l.counts;
+        const inFlight = c.importing + c.logging;
+        const queued = c.waiting + (c.ready - c.logged - c.log_failed - c.logging);
+        // Held by a limit with nothing in flight: reading again changes nothing.
+        const held = (l.imports_paused || l.logging_paused) && inFlight === 0;
+        if (inFlight + queued > 0 && !held) timer = setTimeout(read, 10_000);
+      } catch {
+        if (!dead) timer = setTimeout(read, 30_000);
+      }
+    };
+    void read();
+    return () => {
+      dead = true;
+      clearTimeout(timer);
+    };
+  }, [projectId, tick, setAssets, initial.sources.length]);
+
+  return { list, refresh };
+}
+
+/** A small text action that fits the 184px media rail. */
+const railAction =
+  "inline-flex items-center gap-1 h-6 px-1.5 rounded-xs text-fine text-muted hover:text-foreground hover:bg-surface-sunken disabled:opacity-50";
+
+const KIND_LABEL: Record<NonNullable<FootageItem["log"]>["kind"], string> = {
+  interview: "Interview",
+  stage: "Stage",
+  "b-roll": "B-roll",
+  other: "Other",
+};
+
+/** What a clip is doing, or what its log says it is. */
+function footageLine(i: FootageItem): string {
+  if (i.status === "waiting") return "Waiting to import";
+  if (i.status === "importing") return "Importing";
+  if (i.status === "failed") return `Not imported: ${i.error ?? "unknown error"}`;
+  if (i.log_status === "done" && i.log) return i.log.summary;
+  if (i.log_status === "failed") return `Not logged: ${i.log_error ?? "unknown error"}`;
+  return "Logging";
+}
+
+function FootagePanel({
+  projectId,
+  footage,
+  onAdd,
+  onDelete,
+  onAddFolder,
+}: {
+  projectId: string;
+  footage: { list: FootageList; refresh: () => void };
+  onAdd: (a: Asset) => void;
+  onDelete: (a: Asset) => void;
+  onAddFolder: () => void;
+}) {
+  const { list, refresh } = footage;
+  const c = list.counts;
+  const [busy, setBusy] = useState<"sync" | "retry" | null>(null);
+  const [note, setNote] = useState("");
+  const groups = useMemo(() => {
+    // With one folder its name heads the panel, so the groups drop it:
+    // "Cam B", not "Day 1/Cam B" on every group.
+    const single = list.sources.length === 1 ? `${list.sources[0].name}/` : null;
+    const by = new Map<string, FootageItem[]>();
+    for (const i of list.items) {
+      const k = (single && i.folder.startsWith(single) ? i.folder.slice(single.length) : i.folder) || list.sources[0]?.name || "Drive folder";
+      by.set(k, [...(by.get(k) ?? []), i]);
+    }
+    return [...by].map(([folder, items]) => ({ folder, items, prefix: sharedPrefix(items.map((i) => i.name)) }));
+  }, [list.items, list.sources]);
+
+  const act = async (kind: "sync" | "retry") => {
+    setBusy(kind);
+    setNote("");
+    try {
+      if (kind === "sync") {
+        const r = await api.send<{ added: number }>("POST", `/api/projects/${projectId}/footage/sync`);
+        setNote(r.added ? `${r.added} new ${r.added === 1 ? "clip" : "clips"} found` : "No new files");
+      } else {
+        await api.send("POST", `/api/projects/${projectId}/footage/retry`);
+      }
+      refresh();
+    } catch (e) {
+      setNote(String((e as Error).message));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const failed = c.failed + c.log_failed;
+  const coming = c.waiting + c.importing;
+  return (
+    <div>
+      <div className="mb-2 text-fine text-muted">
+        <div className="text-foreground truncate" title={list.sources.map((s) => s.name).join(", ")}>
+          {list.sources.map((s) => s.name).join(", ")} · {c.total} {c.total === 1 ? "clip" : "clips"}
+        </div>
+        <div className="tabular-nums">
+          {coming > 0 ? `${c.ready} of ${c.total} imported` : "All imported"}
+          {c.ready > 0 && ` · ${c.logged} logged`}
+        </div>
+      </div>
+      {(list.imports_paused || list.logging_paused) && (
+        <div className="mb-2 rounded-sm bg-warning-tint px-2 py-1.5 text-fine text-foreground">
+          {list.imports_paused && <p>Importing is paused: {list.imports_paused}</p>}
+          {list.logging_paused && <p>Logging is paused: {list.logging_paused}</p>}
+          <button onClick={refresh} className="mt-1 text-link hover:underline">
+            Try again
+          </button>
+        </div>
+      )}
+      <div className="flex flex-wrap gap-x-1 gap-y-0.5 mb-3 -ml-1.5">
+        <button onClick={() => act("sync")} disabled={busy !== null} className={railAction} title="Look in the folders again for files added since">
+          {busy === "sync" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} Check for new files
+        </button>
+        {failed > 0 && (
+          <button onClick={() => act("retry")} disabled={busy !== null} className={railAction}>
+            {busy === "retry" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Redo2 className="w-3.5 h-3.5" />} Retry {failed} failed
+          </button>
+        )}
+        <button onClick={onAddFolder} className={railAction}>
+          <Plus className="w-3.5 h-3.5" /> Add folder
+        </button>
+      </div>
+      {note && <p className="text-fine text-muted mb-2">{note}</p>}
+      {groups.map(({ folder, items, prefix }) => (
+        <details key={folder} open className="group/folder mb-2">
+          <summary className="flex items-center gap-1 py-1 text-fine text-muted cursor-pointer list-none [&::-webkit-details-marker]:hidden hover:text-foreground">
+            <ChevronRight className="w-3.5 h-3.5 shrink-0 transition-transform group-open/folder:rotate-90" />
+            <span className="truncate">{folder}</span>
+            <span className="ml-auto tabular-nums text-faint">{items.length}</span>
+          </summary>
+          <div className="mt-1 space-y-0.5">
+            {items.map((i) => (
+              <FootageRow key={i.id} item={i} label={i.name.slice(prefix.length)} onAdd={onAdd} onDelete={onDelete} />
+            ))}
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
+function FootageRow({
+  item,
+  label,
+  onAdd,
+  onDelete,
+}: {
+  item: FootageItem;
+  /** The name less what the folder's names share. */
+  label: string;
+  onAdd: (a: Asset) => void;
+  onDelete: (a: Asset) => void;
+}) {
+  const asset = item.status === "ready" ? item.asset : null;
+  const line = footageLine(item);
+  const failed = item.status === "failed" || item.log_status === "failed";
+  return (
+    <div className="relative group/tile">
+      <button
+        onClick={() => asset && onAdd(asset)}
+        disabled={!asset}
+        title={`${item.name}\n${line}${asset ? "\n\nAdd to timeline" : ""}`}
+        aria-label={asset ? `Add ${item.name} to the timeline` : `${item.name}: ${line}`}
+        className="w-full p-1 rounded-sm text-left hover:bg-surface disabled:hover:bg-transparent"
+      >
+        <div className="flex gap-2 items-start">
+          <div className="w-14 h-8 shrink-0 rounded-xs overflow-hidden bg-surface-sunken grid place-items-center text-faint">
+            {asset ? (
+              <img src={frameUrl(asset, 1)} alt="" loading="lazy" className="w-full h-full object-cover bg-black" />
+            ) : item.status === "importing" ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : item.status === "failed" ? (
+              <X className="w-3.5 h-3.5 text-danger" />
+            ) : (
+              <Film className="w-3.5 h-3.5" />
+            )}
+          </div>
+          <div className={`min-w-0 flex-1 text-fine text-foreground break-all line-clamp-2 ${asset ? "pr-5" : ""}`}>{label}</div>
+        </div>
+        <div className={`mt-0.5 text-fine line-clamp-2 ${failed ? "text-danger" : "text-muted"}`}>
+          {item.log && (
+            <span className="text-faint">
+              {KIND_LABEL[item.log.kind]}
+              {item.log.quality === "unusable" && ", unusable"} ·{" "}
+            </span>
+          )}
+          {line}
+        </div>
+      </button>
+      {asset && (
+        <button
+          onClick={() => onDelete(asset)}
+          data-hover-only
+          className="absolute right-1 top-1 grid place-items-center w-6 h-6 rounded-xs text-faint hover:text-danger hover:bg-danger-tint opacity-0 transition-opacity group-hover/tile:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+          aria-label={`Delete ${item.name} from this project`}
+          title="Delete from this project"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A link to a Drive folder anyone with the link can view: its videos, and
+ * those in every folder inside it, become the project's footage.
+ */
+function FolderLinkDialog({
+  title,
+  submitLabel,
+  onSubmit,
+  onClose,
+}: {
+  title: string;
+  submitLabel: string;
+  /** Throws with the reason the folder can't be used. */
+  onSubmit: (url: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const submit = async () => {
+    if (!url.trim() || busy) return;
+    setBusy(true);
+    setErr("");
+    try {
+      await onSubmit(url.trim());
+    } catch (e) {
+      setErr(String((e as Error).message));
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog
+      title={title}
+      icon={<Folder className="w-4 h-4 text-muted" />}
+      description="Paste the link to a Google Drive folder that anyone with the link can view. Every video in it, and in the folders inside it, is copied into this project and logged clip by clip: what it shows, what is said, and its best moments. That runs in the background, so you can close the project meanwhile."
+      onClose={onClose}
+      footer={
+        <>
+          <button onClick={onClose} className={btnGhost}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button onClick={submit} disabled={!url.trim() || busy} className={btnPrimary}>
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Folder className="w-4 h-4" />}
+            {busy ? "Reading the folder" : submitLabel}
+          </button>
+        </>
+      }
+    >
+      <form
+        className="mt-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <input
+          className={inputCls}
+          placeholder="https://drive.google.com/drive/folders/…"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          aria-label="Google Drive folder link"
+          data-autofocus
+        />
+      </form>
+      {err && <p className="mt-2 text-fine text-danger">{err}</p>}
+    </Dialog>
   );
 }
 
