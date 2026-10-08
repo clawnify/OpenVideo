@@ -314,7 +314,7 @@ async function errJson(r: Response): Promise<{ error?: string; detail?: string; 
   return (await r.json().catch(() => ({}))) as { error?: string; detail?: string; path?: string };
 }
 
-const api = {
+export const api = {
   async get<T>(url: string): Promise<T> {
     const r = await fetch(url);
     if (!r.ok) throw new Error((await errJson(r)).error || r.statusText);
@@ -357,7 +357,7 @@ const assetUrl = (a: Asset) => `/api/assets/${encodeURIComponent(a.id)}/source`;
  * the smallest stream. The library is fetched only when such a source actually
  * plays, and Safari needs none of it.
  */
-function MediaVideo({
+export function MediaVideo({
   asset,
   elementRef,
   startAt = 0,
@@ -474,7 +474,7 @@ function follow(m: HTMLMediaElement, wanted: number, playing: boolean) {
 const MAX_HOLD_S = 6;
 
 /** A frame of media-service footage, which beats decoding the video for one. */
-const frameUrl = (a: Pick<Asset, "id">, at = 0) => `/api/assets/${encodeURIComponent(a.id)}/frame?t=${Math.max(0, at).toFixed(1)}`;
+export const frameUrl = (a: Pick<Asset, "id">, at = 0) => `/api/assets/${encodeURIComponent(a.id)}/frame?t=${Math.max(0, at).toFixed(1)}`;
 const isVideoAsset = (a: Asset) => a.content_type.startsWith("video/");
 const isImageAsset = (a: Asset) => a.content_type.startsWith("image/");
 const isAudioAsset = (a: Asset) => a.content_type.startsWith("audio/");
@@ -1028,17 +1028,27 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
         <Loader2 className="w-5 h-5 animate-spin" />
       </div>
     );
-  return <EditEditor initial={project} initialAssets={assets} initialFootage={footage} />;
+  return (
+    <EditEditor
+      initial={project}
+      initialAssets={assets}
+      initialFootage={footage}
+      onOpenHighlights={() => navigate(`/edits/${id}/highlights`)}
+    />
+  );
 }
 
 export function EditEditor({
   initial,
   initialAssets,
   initialFootage,
+  onOpenHighlights,
 }: {
   initial: EditProject;
   initialAssets: Asset[];
   initialFootage: FootageList;
+  /** Opens the footage's highlights. */
+  onOpenHighlights?: () => void;
 }) {
   const [name, setName] = useState(initial.name);
   const [brief, setBrief] = useState(initial.brief ?? "");
@@ -1490,6 +1500,7 @@ export function EditEditor({
         <LeftPanel
           projectId={initial.id}
           initialFootage={initialFootage}
+          onOpenHighlights={onOpenHighlights}
           pane={pane}
           tab={tab}
           setTab={setTab}
@@ -1654,6 +1665,7 @@ function AutocutModal({
 function LeftPanel({
   projectId,
   initialFootage,
+  onOpenHighlights,
   pane,
   tab,
   setTab,
@@ -1667,6 +1679,7 @@ function LeftPanel({
 }: {
   projectId: string;
   initialFootage: FootageList;
+  onOpenHighlights?: () => void;
   pane: Pane;
   tab: RailTab;
   setTab: (t: RailTab) => void;
@@ -1818,6 +1831,7 @@ function LeftPanel({
                 onAdd={onAdd}
                 onDelete={setDeleting}
                 onAddFolder={() => setFolderOpen(true)}
+                onOpenHighlights={onOpenHighlights}
               />
             ) : (
           <>
@@ -2008,12 +2022,14 @@ function FootagePanel({
   onAdd,
   onDelete,
   onAddFolder,
+  onOpenHighlights,
 }: {
   projectId: string;
   footage: { list: FootageList; refresh: () => void };
   onAdd: (a: Asset) => void;
   onDelete: (a: Asset) => void;
   onAddFolder: () => void;
+  onOpenHighlights?: () => void;
 }) {
   const { list, refresh } = footage;
   const c = list.counts;
@@ -2084,6 +2100,19 @@ function FootagePanel({
           <Plus className="w-3.5 h-3.5" /> Add folder
         </button>
       </div>
+      {onOpenHighlights && c.logged > 0 && (
+        <button
+          onClick={onOpenHighlights}
+          className="w-full mb-3 p-2 rounded-sm bg-surface shadow-raised hover:bg-surface-sunken text-left flex items-start gap-2"
+        >
+          <Sparkles className="w-4 h-4 mt-0.5 shrink-0 text-muted" />
+          <span className="min-w-0">
+            <span className="block text-body-sm text-foreground">Highlights</span>
+            <span className="block text-fine text-muted">The soundbites and b-roll worth a look in every clip, and why</span>
+          </span>
+          <ChevronRight className="w-4 h-4 mt-0.5 ml-auto shrink-0 text-faint" />
+        </button>
+      )}
       {note && <p className="text-fine text-muted mb-2">{note}</p>}
       {groups.map(({ folder, items, prefix }) => (
         <details key={folder} open className="group/folder mb-2">

@@ -31,9 +31,11 @@ import {
 } from "./drive";
 import { parseDriveLink, type FolderVideo } from "./drive-link";
 import { addFolderVideos, bookStep, readFolder, stepFootage, type StepOutcome } from "./footage";
+import { HIGHLIGHTS_NO_KEY, highlightsPending, stepHighlights, type HighlightKind } from "./highlights";
+import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
-import { instructEdit } from "./instruct";
+import { instructEdit, type InstructHighlight } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
 
@@ -656,6 +658,29 @@ app.put("/api/projects/:id", async (c) => {
  * operations rather than writing the document, and the whole instruction
  * lands as one edit, so the editor can undo it in one step.
  */
+/** The project's highlights for the AI editor: never a dropped one; kept first, then the best. */
+async function instructHighlights(projectId: string): Promise<InstructHighlight[]> {
+  const rows = await query<{ id: string; asset_id: string; kind: HighlightKind; src_in: number; src_out: number; text: string; speaker: string; score: number; pick: string | null }>(
+    `SELECT h.id, f.asset_id, h.kind, h.src_in, h.src_out, h.text, h.speaker, h.score, h.pick
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id
+      WHERE h.project_id = ? AND f.status = 'ready' AND f.asset_id IS NOT NULL AND (h.pick IS NULL OR h.pick = 'keep')
+      ORDER BY h.pick IS NULL, h.score DESC, f.folder, f.name, h.src_in
+      LIMIT 120`,
+    [projectId],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    src: `asset:${r.asset_id}`,
+    kind: r.kind,
+    start: r.src_in,
+    end: r.src_out,
+    text: r.text,
+    speaker: r.speaker,
+    score: r.score,
+    kept: r.pick === "keep",
+  }));
+}
+
 app.post("/api/projects/:id/instruct", async (c) => {
   const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
   if (!project) return c.json({ error: "Project not found" }, 404);
@@ -698,6 +723,7 @@ app.post("/api/projects/:id/instruct", async (c) => {
         notes: r.result.notes,
       };
     },
+    await instructHighlights(project.id),
   );
   if ("failure" in out) return c.json(out.failure, 422);
 
@@ -821,6 +847,7 @@ app.delete("/api/projects/:id", async (c) => {
     if (left && left.n > 0) return c.json({ ok: false, remaining: left.n }, 202);
   }
   await run("DELETE FROM footage_sources WHERE project_id = ?", [id]);
+  await run("DELETE FROM footage_highlights WHERE project_id = ?", [id]);
   // Drop each completed export's rendered file from storage before the rows go,
   // otherwise the renders/*.mp4 objects outlive the only rows that point to them
   // and are orphaned forever. Best-effort: a storage hiccup must not strand the
@@ -882,7 +909,13 @@ async function advanceFootage(
   after: "delivery" | "read",
 ): Promise<{ outcome: StepOutcome; nextStepAt: string | null }> {
   const outcome = await stepFootage(mediaCfg(c.env), projectId);
-  const nextStepAt = outcome.moving ? await keepFootageMoving(c, projectId, after) : null;
+  // Highlights are read only on a delivery: a model call takes up to half a
+  // minute, and a read answers at once. A read still keeps the chain booked.
+  const highlightsMoving =
+    after === "delivery"
+      ? (await stepHighlights(mediaCfg(c.env), c.env.OPENROUTER_API_KEY, projectId)).moving
+      : !!c.env.OPENROUTER_API_KEY && (await highlightsPending(projectId)) > 0;
+  const nextStepAt = outcome.moving || highlightsMoving ? await keepFootageMoving(c, projectId, after) : null;
   return { outcome, nextStepAt };
 }
 
@@ -1073,6 +1106,307 @@ app.post("/api/projects/:id/footage/retry", async (c) => {
   );
   if (imports.changes + logs.changes > 0) await keepFootageMoving(c, id, "read");
   return c.json({ imports: imports.changes, logs: logs.changes });
+});
+
+// ── Highlights ───────────────────────────────────────────────────────
+// The selects: for every logged clip, whether it is worth an editor's time
+// and the parts to cut from, each with a score and the reason. Found in the
+// background from the logs and transcripts (src/server/highlights.ts); a
+// person keeps or drops each one; the kept ones export to an editor's own
+// software (src/server/nle.ts).
+
+interface HighlightListRow {
+  id: string;
+  footage_id: string;
+  kind: HighlightKind;
+  src_in: number;
+  src_out: number;
+  text: string;
+  speaker: string;
+  score: number;
+  reason: string;
+  pick: "keep" | "drop" | null;
+  origin: string;
+  name: string;
+  folder: string;
+  drive_file_id: string;
+  asset_id: string | null;
+  media_uid: string | null;
+  duration: number | null;
+  fps: number | null;
+  width: number | null;
+  height: number | null;
+}
+
+function highlightOut(r: HighlightListRow) {
+  return {
+    id: r.id,
+    clip: { id: r.footage_id, name: r.name, folder: r.folder, asset_id: r.asset_id, media_uid: r.media_uid, duration: r.duration },
+    kind: r.kind,
+    start: r.src_in,
+    end: r.src_out,
+    text: r.text,
+    speaker: r.speaker,
+    score: r.score,
+    reason: r.reason,
+    pick: r.pick,
+    origin: r.origin,
+  };
+}
+
+const PICKS = ["open", "keep", "drop", "not_dropped", "all"] as const;
+type PickFilter = (typeof PICKS)[number];
+
+/** The WHERE for a project's highlights, narrowed by the list's and export's shared filters. */
+function highlightFilter(projectId: string, q: (k: string) => string | undefined, defaultPick: PickFilter) {
+  const where = ["h.project_id = ?", "f.status != 'removed'"];
+  const params: unknown[] = [projectId];
+  const kind = q("kind");
+  if (kind === "soundbite" || kind === "broll") {
+    where.push("h.kind = ?");
+    params.push(kind);
+  }
+  const min = Number.parseInt(q("min_score") ?? "", 10);
+  if (min >= 2 && min <= 5) {
+    where.push("h.score >= ?");
+    params.push(min);
+  }
+  const pick = (PICKS as readonly string[]).includes(q("pick") ?? "") ? (q("pick") as PickFilter) : defaultPick;
+  if (pick === "open") where.push("h.pick IS NULL");
+  else if (pick === "keep") where.push("h.pick = 'keep'");
+  else if (pick === "drop") where.push("h.pick = 'drop'");
+  else if (pick === "not_dropped") where.push("(h.pick IS NULL OR h.pick = 'keep')");
+  const folder = q("folder")?.replace(/\/+$/, "");
+  if (folder) {
+    where.push("(f.folder = ? OR substr(f.folder, 1, ?) = ?)");
+    params.push(folder, folder.length + 1, `${folder}/`);
+  }
+  return { where: where.join(" AND "), params, pick };
+}
+
+const HIGHLIGHT_COLUMNS = `h.id, h.footage_id, h.kind, h.src_in, h.src_out, h.text, h.speaker, h.score, h.reason, h.pick, h.origin,
+       f.name, f.folder, f.drive_file_id, f.asset_id, f.fps, f.width, f.height, a.media_uid, a.duration`;
+
+// Ask for highlights, or ask again. Without `again`, only clips not yet read
+// (and ones that failed) are read; with it, every logged clip is read again,
+// and what a person kept or dropped stays as it is. `brief`, when given,
+// becomes the project's brief: what the video is for.
+app.post("/api/projects/:id/highlights", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const b = await c.req.json<{ brief?: unknown; again?: unknown }>().catch(() => ({}) as { brief?: unknown; again?: unknown });
+  const brief = typeof b.brief === "string" ? b.brief.trim().slice(0, 2000) : null;
+  await run(
+    "UPDATE edit_projects SET highlights_at = COALESCE(highlights_at, datetime('now')), brief = COALESCE(?, brief) WHERE id = ?",
+    [brief, id],
+  );
+  await run(
+    `UPDATE project_footage SET highlights_status = 'waiting', highlights_error = NULL
+      WHERE project_id = ? AND status = 'ready' AND log_status = 'done'
+        AND (highlights_status IS NULL OR highlights_status = 'failed' OR (? AND highlights_status = 'done'))`,
+    [id, b.again === true ? 1 : 0],
+  );
+  const pending = await highlightsPending(id);
+  const nextStepAt = pending > 0 && c.env.OPENROUTER_API_KEY ? await keepFootageMoving(c, id, "read") : null;
+  return c.json({ ok: true, pending, next_step_at: nextStepAt, paused: c.env.OPENROUTER_API_KEY ? null : HIGHLIGHTS_NO_KEY }, 202);
+});
+
+// The highlights, best first by default. Filters: kind=soundbite|broll,
+// min_score=2..5, pick=open|keep|drop|not_dropped|all (default all),
+// folder= (a folder and everything inside it), sort=score|clip. Pages of 100,
+// at most 1000. skipped=1 adds the clips judged not worth using, and why.
+app.get("/api/projects/:id/highlights", async (c) => {
+  const id = c.req.param("id");
+  const project = await get<{ brief: string; highlights_at: string | null }>("SELECT brief, highlights_at FROM edit_projects WHERE id = ?", [id]);
+  if (!project) return c.json({ error: "Not found" }, 404);
+  const q = (k: string) => c.req.query(k);
+  const { where, params } = highlightFilter(id, q, "all");
+  const limit = intParam(q("limit"), 100, 1, 1000);
+  const offset = intParam(q("offset"), 0, 0, 1_000_000);
+  const order = q("sort") === "clip" ? "f.folder, f.name, h.src_in" : "h.score DESC, f.folder, f.name, h.src_in";
+  const rows = await query<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE ${where}
+      ORDER BY ${order}, h.id
+      LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+  const clips = await query<{ highlights_status: string | null; skipped: number; n: number }>(
+    `SELECT highlights_status, skip_reason IS NOT NULL AS skipped, COUNT(*) AS n FROM project_footage
+      WHERE project_id = ? AND status = 'ready' AND log_status = 'done' GROUP BY highlights_status, skipped`,
+    [id],
+  );
+  const picks = await query<{ kind: string; pick: string | null; n: number }>(
+    `SELECT h.kind, h.pick, COUNT(*) AS n FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id
+      WHERE h.project_id = ? AND f.status != 'removed' GROUP BY h.kind, h.pick`,
+    [id],
+  );
+  const clipCount = (pick: (r: { highlights_status: string | null; skipped: number }) => boolean) =>
+    clips.filter(pick).reduce((sum, r) => sum + r.n, 0);
+  const pickCount = (pick: (r: { kind: string; pick: string | null }) => boolean) =>
+    picks.filter(pick).reduce((sum, r) => sum + r.n, 0);
+  const pending = clipCount((r) => r.highlights_status === "waiting" || r.highlights_status === "running");
+  const nextStepAt = pending > 0 && c.env.OPENROUTER_API_KEY ? await keepFootageMoving(c, id, "read") : null;
+  const skipped =
+    q("skipped") === "1"
+      ? await query<{ id: string; name: string; folder: string; skip_reason: string; asset_id: string | null; media_uid: string | null; duration: number | null }>(
+          `SELECT f.id, f.name, f.folder, f.skip_reason, f.asset_id, a.media_uid, a.duration
+             FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+            WHERE f.project_id = ? AND f.status = 'ready' AND f.skip_reason IS NOT NULL
+            ORDER BY f.folder, f.name`,
+          [id],
+        )
+      : undefined;
+  return c.json({
+    asked: !!project.highlights_at,
+    brief: project.brief,
+    clips: {
+      logged: clipCount(() => true),
+      done: clipCount((r) => r.highlights_status === "done"),
+      pending,
+      failed: clipCount((r) => r.highlights_status === "failed"),
+      skipped: clipCount((r) => r.highlights_status === "done" && r.skipped === 1),
+      not_asked: clipCount((r) => r.highlights_status === null),
+    },
+    counts: {
+      total: pickCount(() => true),
+      soundbites: pickCount((r) => r.kind === "soundbite"),
+      broll: pickCount((r) => r.kind === "broll"),
+      kept: pickCount((r) => r.pick === "keep"),
+      dropped: pickCount((r) => r.pick === "drop"),
+      open: pickCount((r) => r.pick === null),
+    },
+    paused: project.highlights_at && pending > 0 && !c.env.OPENROUTER_API_KEY ? HIGHLIGHTS_NO_KEY : null,
+    next_step_at: nextStepAt,
+    highlights: rows.map(highlightOut),
+    next_offset: rows.length === limit ? offset + limit : null,
+    ...(skipped ? { skipped: skipped.map((s) => ({ id: s.id, name: s.name, folder: s.folder, reason: s.skip_reason, asset_id: s.asset_id, media_uid: s.media_uid, duration: s.duration })) } : {}),
+  });
+});
+
+// A person's call on one highlight: pick keep | drop | null (back to
+// unreviewed), and its in and out (seconds into the clip) if they move them.
+app.patch("/api/projects/:id/highlights/:hid", async (c) => {
+  const row = await get<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE h.project_id = ? AND h.id = ?`,
+    [c.req.param("id"), c.req.param("hid")],
+  );
+  if (!row) return c.json({ error: "Not found" }, 404);
+  const b = await c.req.json<{ pick?: unknown; start?: unknown; end?: unknown }>().catch(() => ({}) as { pick?: unknown; start?: unknown; end?: unknown });
+  let pick = row.pick;
+  if (b.pick !== undefined) {
+    if (b.pick !== null && b.pick !== "keep" && b.pick !== "drop") return c.json({ error: "invalid_request", detail: "pick is keep, drop or null" }, 400);
+    pick = b.pick;
+  }
+  const length = row.duration ?? Infinity;
+  const start = b.start === undefined ? row.src_in : Number(b.start);
+  const end = b.end === undefined ? row.src_out : Number(b.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end > length + 0.05 || end - start < 0.2) {
+    return c.json({ error: "invalid_request", detail: "start and end must lie inside the clip, end after start" }, 400);
+  }
+  await run("UPDATE footage_highlights SET pick = ?, src_in = ?, src_out = ?, updated_at = datetime('now') WHERE id = ?", [
+    pick,
+    Math.round(start * 100) / 100,
+    Math.round(Math.min(end, length) * 100) / 100,
+    row.id,
+  ]);
+  const updated = await get<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE h.id = ?`,
+    [row.id],
+  );
+  return c.json(highlightOut(updated!));
+});
+
+// A person's own pick, for a part the model passed over or a clip it skipped.
+// It starts out kept.
+app.post("/api/projects/:id/highlights/items", async (c) => {
+  const id = c.req.param("id");
+  const b = await c.req
+    .json<{ clip?: unknown; start?: unknown; end?: unknown; kind?: unknown; text?: unknown }>()
+    .catch(() => ({}) as Record<string, unknown>);
+  const clip = await get<{ id: string; duration: number | null }>(
+    `SELECT f.id, a.duration FROM project_footage f JOIN assets a ON a.id = f.asset_id WHERE f.project_id = ? AND f.id = ? AND f.status = 'ready'`,
+    [id, String(b.clip ?? "")],
+  );
+  if (!clip) return c.json({ error: "Not found", detail: "no such clip in this project" }, 404);
+  const length = clip.duration ?? Infinity;
+  const start = b.start === undefined ? 0 : Number(b.start);
+  const end = b.end === undefined ? length : Number(b.end);
+  const kind = b.kind === "soundbite" ? "soundbite" : "broll";
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end > length + 0.05 || end - start < 0.2) {
+    return c.json({ error: "invalid_request", detail: "start and end must lie inside the clip, end after start" }, 400);
+  }
+  const hid = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  await run(
+    `INSERT INTO footage_highlights (id, project_id, footage_id, kind, src_in, src_out, text, score, reason, pick, origin)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 3, '', 'keep', 'person')`,
+    [hid, id, clip.id, kind, Math.round(start * 100) / 100, Math.round(Math.min(end, length) * 100) / 100, typeof b.text === "string" ? b.text.trim().slice(0, 1000) : ""],
+  );
+  const row = await get<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE h.id = ?`,
+    [hid],
+  );
+  return c.json(highlightOut(row!), 201);
+});
+
+// The highlights as a file for an editor's own software. format=csv (a sheet)
+// or xml (a Premiere Pro / DaVinci Resolve timeline). Same filters as the
+// list; by default everything not dropped.
+app.get("/api/projects/:id/highlights/export", async (c) => {
+  const id = c.req.param("id");
+  const project = await get<{ name: string }>("SELECT name FROM edit_projects WHERE id = ?", [id]);
+  if (!project) return c.json({ error: "Not found" }, 404);
+  const q = (k: string) => c.req.query(k);
+  const { where, params } = highlightFilter(id, q, "not_dropped");
+  const rows = await query<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE ${where}
+      ORDER BY f.folder, f.name, h.src_in, h.id
+      LIMIT 5000`,
+    params,
+  );
+  const base = `${project.name.replace(/[^\w .-]+/g, "").trim() || "highlights"} highlights`;
+  const format = q("format") === "xml" ? "xml" : "csv";
+  if (format === "csv") {
+    return new Response(highlightsCsv(rows), {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${base}.csv"`,
+      },
+    });
+  }
+  // A timeline: the picks on the camera files, for Premiere Pro or Resolve.
+  // root= is where the editor downloaded the footage folder, so the files are
+  // found without relinking; fps= sets the timeline's rate.
+  const fps = Number(q("fps"));
+  const xml = highlightsXml(
+    `${project.name.trim() || "Highlights"} highlights`,
+    rows.map((r) => ({
+      kind: r.kind,
+      src_in: r.src_in,
+      src_out: r.src_out,
+      text: r.text,
+      speaker: r.speaker,
+      score: r.score,
+      reason: r.reason,
+      file: { id: r.footage_id, name: r.name, folder: r.folder, duration: r.duration ?? r.src_out, fps: r.fps, width: r.width, height: r.height },
+    })),
+    { root: (q("root") ?? "").slice(0, 1000), rate: fps >= 10 && fps <= 120 ? rateOf(fps) : undefined },
+  );
+  return new Response(xml, {
+    headers: {
+      "Content-Type": "application/xml; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${base}.xml"`,
+    },
+  });
 });
 
 // The platform queue's call for the next background step. Public, because the

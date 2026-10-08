@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { apply, cleanUp } from "../src/server/instruct";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { apply, cleanUp, instructEdit, type InstructHighlight } from "../src/server/instruct";
 import type { Edl } from "../src/server/edl";
 
 const edl = (): Edl => ({
@@ -111,5 +111,49 @@ describe("Ask operations", () => {
     const out = await cleanUp(d, { clip: 0 }, new Map(), async () => ({ keeps: [{ start: 5, end: 25 }], notes: "clean" }));
     expect(out).toMatchObject({ said: expect.stringContaining("nothing to cut") });
     expect(d.main.elements).toHaveLength(2);
+  });
+});
+
+describe("highlights in Ask", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const picks: InstructHighlight[] = [
+    { id: "h1", src: "asset:interview", kind: "soundbite", start: 313.3, end: 317.9, text: "Shipping fast is the whole point.", speaker: "woman in a green blazer", score: 5, kept: true },
+    { id: "h2", src: "asset:camb", kind: "broll", start: 0, end: 5.5, text: "Crowd at the booth", speaker: "", score: 4, kept: false },
+  ];
+  const byId = new Map(picks.map((h) => [h.id, h]));
+
+  it("places a highlight as a clip trimmed to it: a soundbite with its sound, b-roll without", () => {
+    const d = edl();
+    expect(apply(d, "add_highlight", { highlight: "h1", at: 0 }, byId)).toEqual({ said: 'Added the soundbite "Shipping fast is the whole point." at position 0' });
+    expect(apply(d, "add_highlight", { highlight: "h2" }, byId)).toHaveProperty("said");
+    const [first, , , last] = d.main.elements;
+    expect(first).toMatchObject({ type: "video", src: "asset:interview", trimStart: 313.3, duration: 4.6 });
+    expect(first).not.toHaveProperty("sourceAudio");
+    expect(last).toMatchObject({ src: "asset:camb", trimStart: 0, duration: 5.5, sourceAudio: false });
+    expect(apply(d, "add_highlight", { highlight: "h2", sound: true }, byId)).toHaveProperty("said");
+    expect(d.main.elements.at(-1)).not.toHaveProperty("sourceAudio");
+  });
+
+  it("refuses a highlight it was not given, and a place off the track", () => {
+    expect(apply(edl(), "add_highlight", { highlight: "nope" }, byId)).toEqual({ error: 'there is no highlight "nope"' });
+    expect(apply(edl(), "add_highlight", { highlight: "h1", at: 9 }, byId)).toHaveProperty("error");
+  });
+
+  it("lists the highlights with the cut, and offers add_highlight only when there are some", async () => {
+    const bodies: { messages: { content: string }[]; tools: { function: { name: string } }[] }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        bodies.push(JSON.parse(init.body as string));
+        return new Response(JSON.stringify({ choices: [{ message: { content: "Nothing to do." } }] }));
+      }),
+    );
+    await instructEdit(edl(), "make a 30s cut", new Map(), { openrouterKey: "k" }, new Map(), undefined, picks);
+    await instructEdit(edl(), "make a 30s cut", new Map(), { openrouterKey: "k" });
+    expect(bodies[0].messages[1].content).toContain('h1: soundbite, score 5, kept, 4.6s, woman in a green blazer: "Shipping fast is the whole point."');
+    expect(bodies[0].messages[1].content).toContain("h2: broll, score 4, 5.5s, Crowd at the booth");
+    expect(bodies[0].tools.map((t) => t.function.name)).toContain("add_highlight");
+    expect(bodies[1].tools.map((t) => t.function.name)).not.toContain("add_highlight");
+    expect(bodies[1].messages[1].content).not.toContain("Highlights from the footage");
   });
 });
