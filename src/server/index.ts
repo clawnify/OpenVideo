@@ -898,9 +898,10 @@ async function keepFootageMoving(
   c: Context<{ Bindings: Bindings }>,
   projectId: string,
   after: "delivery" | "read",
+  at: string | null = null,
 ): Promise<string | null> {
   const row = await get<{ footage_step_at: string | null }>("SELECT footage_step_at FROM edit_projects WHERE id = ?", [projectId]);
-  return bookStep(c.env, new URL(c.req.url).origin, projectId, { after, bookedAt: row?.footage_step_at ?? null });
+  return bookStep(c.env, new URL(c.req.url).origin, projectId, { after, bookedAt: row?.footage_step_at ?? null, at });
 }
 
 async function advanceFootage(
@@ -915,7 +916,12 @@ async function advanceFootage(
     after === "delivery"
       ? (await stepHighlights(mediaCfg(c.env), c.env.OPENROUTER_API_KEY, projectId)).moving
       : !!c.env.OPENROUTER_API_KEY && (await highlightsPending(projectId)) > 0;
-  const nextStepAt = outcome.moving || highlightsMoving ? await keepFootageMoving(c, projectId, after) : null;
+  const nextStepAt =
+    outcome.moving || highlightsMoving
+      ? await keepFootageMoving(c, projectId, after)
+      : outcome.nextAt
+        ? await keepFootageMoving(c, projectId, after, outcome.nextAt)
+        : null;
   return { outcome, nextStepAt };
 }
 
@@ -928,6 +934,7 @@ interface FootageItemRow {
   log_status: string | null;
   log_error: string | null;
   log: string | null;
+  retry_at: string | null;
   asset_id: string | null;
   key: string | null;
   content_type: string | null;
@@ -943,6 +950,8 @@ function footageOut(r: FootageItemRow) {
     folder: r.folder,
     status: r.status,
     error: r.error,
+    // Set while the clip waits on Google Drive: when it is tried again.
+    retry_at: r.retry_at,
     asset: r.asset_id
       ? {
           id: r.asset_id,
@@ -960,7 +969,7 @@ function footageOut(r: FootageItemRow) {
   };
 }
 
-const FOOTAGE_COLUMNS = `f.id, f.name, f.folder, f.status, f.error, f.log_status, f.log_error, f.asset_id,
+const FOOTAGE_COLUMNS = `f.id, f.name, f.folder, f.status, f.error, f.retry_at, f.log_status, f.log_error, f.asset_id,
        a.key, a.content_type, a.size, a.duration, a.media_uid`;
 
 function intParam(v: string | undefined, fallback: number, min: number, max: number): number {
@@ -1012,12 +1021,12 @@ app.get("/api/projects/:id/footage", async (c) => {
       LIMIT ? OFFSET ?`,
     [full ? 1 : 0, ...params, limit, offset],
   );
-  const tally = await query<{ status: string; log_status: string | null; n: number }>(
-    `SELECT status, log_status, COUNT(*) AS n FROM project_footage
-      WHERE project_id = ? AND status != 'removed' GROUP BY status, log_status`,
+  const tally = await query<{ status: string; log_status: string | null; on_drive: number; n: number }>(
+    `SELECT status, log_status, retry_at IS NOT NULL AS on_drive, COUNT(*) AS n FROM project_footage
+      WHERE project_id = ? AND status != 'removed' GROUP BY status, log_status, on_drive`,
     [id],
   );
-  const count = (pick: (t: { status: string; log_status: string | null }) => boolean) =>
+  const count = (pick: (t: { status: string; log_status: string | null; on_drive: number }) => boolean) =>
     tally.filter(pick).reduce((sum, t) => sum + t.n, 0);
   const sources = await query<{ folder_id: string; name: string; language: string }>(
     "SELECT folder_id, name, language FROM footage_sources WHERE project_id = ? ORDER BY created_at",
@@ -1033,6 +1042,8 @@ app.get("/api/projects/:id/footage", async (c) => {
     counts: {
       total: count(() => true),
       waiting: count((t) => t.status === "waiting"),
+      // Of those, the ones waiting until Google Drive hands them over.
+      drive_waiting: count((t) => t.status === "waiting" && t.on_drive === 1),
       importing: count((t) => t.status === "importing"),
       ready: count((t) => t.status === "ready"),
       failed: count((t) => t.status === "failed"),
@@ -1096,7 +1107,8 @@ app.post("/api/projects/:id/footage/sync", async (c) => {
 app.post("/api/projects/:id/footage/retry", async (c) => {
   const id = c.req.param("id");
   const imports = await run(
-    "UPDATE project_footage SET status = 'waiting', error = NULL, updated_at = datetime('now') WHERE project_id = ? AND status = 'failed'",
+    `UPDATE project_footage SET status = 'waiting', error = NULL, retry_at = NULL, drive_tries = 0, updated_at = datetime('now')
+      WHERE project_id = ? AND (status = 'failed' OR (status = 'waiting' AND retry_at IS NOT NULL))`,
     [id],
   );
   const logs = await run(

@@ -145,6 +145,8 @@ interface FootageItem {
   folder: string;
   status: "waiting" | "importing" | "ready" | "failed";
   error: string | null;
+  /** Set while it waits on Google Drive: when it is tried again. */
+  retry_at?: string | null;
   asset: Asset | null;
   log_status: "preparing" | "running" | "done" | "failed" | null;
   log_error: string | null;
@@ -156,6 +158,7 @@ interface FootageList {
   counts: {
     total: number;
     waiting: number;
+    drive_waiting?: number;
     importing: number;
     ready: number;
     failed: number;
@@ -2008,6 +2011,10 @@ const KIND_LABEL: Record<NonNullable<FootageItem["log"]>["kind"], string> = {
 
 /** What a clip is doing, or what its log says it is. */
 function footageLine(i: FootageItem): string {
+  if (i.status === "waiting" && i.retry_at) {
+    const at = new Date(i.retry_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return `Waiting for Google Drive, which is limiting downloads of this file. Trying again at ${at}`;
+  }
   if (i.status === "waiting") return "Waiting to import";
   if (i.status === "importing") return "Importing";
   if (i.status === "failed") return `Not imported: ${i.error ?? "unknown error"}`;
@@ -2082,8 +2089,10 @@ function FootagePanel({
         <div className="mb-2 rounded-sm bg-warning-tint px-2 py-1.5 text-fine text-foreground">
           {list.imports_paused && <p>Importing is paused: {list.imports_paused}</p>}
           {list.logging_paused && <p>Logging is paused: {list.logging_paused}</p>}
-          <button onClick={refresh} className="mt-1 text-link hover:underline">
-            Try again
+          {/* Clips waiting on Drive are only tried at their time, so trying
+              now means asking for them again, not just looking again. */}
+          <button onClick={() => (c.drive_waiting ? act("retry") : refresh())} disabled={busy !== null} className="mt-1 text-link hover:underline">
+            {c.drive_waiting ? "Try Google Drive again now" : "Try again"}
           </button>
         </div>
       )}
