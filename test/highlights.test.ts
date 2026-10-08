@@ -183,23 +183,35 @@ describe("vetSpeaker", () => {
   const talk: HighlightClip = {
     ...interview,
     log: log({
-      summary: "A man in a red patterned shirt addresses colleagues, then draws on a whiteboard.",
+      summary: "A man in a red patterned shirt addresses colleagues, then draws on a whiteboard. Who is next?",
       quotes: [{ start: 21.9, end: 25.4, text: "We're actually starting to wake up.", speaker: "man in a red patterned shirt" }],
       visible_text: ["JUST SUCCEED"],
     }),
     transcript: "WEBVTT\n\n1\n00:00:21.900 --> 00:00:25.400\nWe're actually starting to wake up.\n",
   };
+  // A testimonial where the speaker says who they are.
+  const intro: HighlightClip = {
+    ...talk,
+    log: log({ quotes: [{ start: 1, end: 3, text: "I'm Niraj, I build wallets.", speaker: "man in a white shirt" }] }),
+    transcript: "WEBVTT\n\n1\n00:00:01.000 --> 00:00:03.000\nI'm Niraj, I build wallets.\n",
+  };
 
-  it("takes the logger's description of whoever says those words", () => {
+  it("never keeps a name the clip doesn't bear out", () => {
     expect(vetSpeaker("Some Famous Founder", 20.6, 25.9, talk)).toBe("man in a red patterned shirt");
+    expect(vetSpeaker("Some Famous Founder", 40, 45, talk)).toBe("man in a red patterned shirt");
+    // Matched as a whole word: "Ho" is not in "Who".
+    expect(vetSpeaker("Ho", 40, 45, talk)).toBe("man in a red patterned shirt");
   });
 
-  it("never keeps a name the clip doesn't bear out, and keeps one it does", () => {
-    // Outside the logged quote: the model's guess has nothing in the clip behind it.
-    expect(vetSpeaker("Some Famous Founder", 40, 45, talk)).toBe("man in a red patterned shirt");
-    expect(vetSpeaker("presenter at the whiteboard", 40, 45, talk)).toBe("presenter at the whiteboard");
-    const named = { ...talk, log: { ...talk.log, visible_text: ["Ada Lovelace, CTO"] } };
-    expect(vetSpeaker("Ada Lovelace", 40, 45, named)).toBe("Ada Lovelace");
+  it("keeps a name the clip says, shows or logs", () => {
+    expect(vetSpeaker("Niraj", 1, 3, intro)).toBe("Niraj");
+    const shown = { ...talk, log: { ...talk.log, visible_text: ["Ada Lovelace, CTO"] } };
+    expect(vetSpeaker("Ada Lovelace", 40, 45, shown)).toBe("Ada Lovelace");
+  });
+
+  it("prefers the logger's description to the model's, which never saw the clip", () => {
+    expect(vetSpeaker("Presenter in black shirt", 20.6, 25.9, talk)).toBe("man in a red patterned shirt");
+    expect(vetSpeaker("man at the whiteboard", 40, 45, talk)).toBe("man in a red patterned shirt");
   });
 
   it("falls back to nothing rather than a guess when the log names no speaker", () => {
