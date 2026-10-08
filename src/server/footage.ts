@@ -301,18 +301,25 @@ interface WorkRow {
   retry_at: string | null;
   drive_tries: number;
   link_only: number;
+  copy_id: string | null;
 }
 
 /**
- * The org's Google Drive connection, when it has one: a short-lived link to a
- * file's bytes, fetched as the connected account. Drive's limit on how often
- * a file shared with the link is downloaded doesn't apply to it.
+ * The org's Google Drive connection, when it has one. Drive's limit on how
+ * often a file shared with the link is downloaded doesn't apply to it.
  */
-export type DriveDownload = (fileId: string) => Promise<{ url: string; mimeType: string } | { error: string }>;
+export interface DriveSource {
+  /** A short-lived link to the file's bytes, fetched as the connected account. */
+  download(fileId: string): Promise<{ url: string; mimeType: string } | { error: string }>;
+  /** For a file too big to download that way: a copy in the connected account, shared with the link. */
+  copy(fileId: string, name: string): Promise<{ fileId: string } | { error: string }>;
+  /** Delete such a copy once its import is over. */
+  remove(fileId: string): Promise<void>;
+}
 
 export interface StepOptions {
   /** Import through the org's Drive connection; the shared link stays the fallback. */
-  download?: DriveDownload;
+  drive?: DriveSource;
   /** False: start no imports this step (a read, while imports go through the connection, which is slow). */
   startImports?: boolean;
 }
@@ -352,17 +359,26 @@ async function setRow(id: string, fields: Record<string, unknown>, where = ""): 
  */
 export async function stepFootage(cfg: MediaConfig, projectId: string, opts: StepOptions = {}): Promise<StepOutcome> {
   // With a connection, clips waiting on the shared link's limit can come in
-  // now: only those the connection already couldn't take keep waiting.
-  if (opts.download) {
+  // now: only those the connection already couldn't take keep waiting. And a
+  // copy made for an import that is over goes.
+  if (opts.drive) {
     await run(
       `UPDATE project_footage SET retry_at = NULL, error = NULL
-        WHERE project_id = ? AND status = 'waiting' AND retry_at IS NOT NULL AND link_only = 0`,
+        WHERE project_id = ? AND status = 'waiting' AND retry_at IS NOT NULL AND link_only < 2`,
       [projectId],
     );
+    const done = await query<{ id: string; copy_id: string }>(
+      "SELECT id, copy_id FROM project_footage WHERE project_id = ? AND copy_id IS NOT NULL AND status IN ('ready', 'failed', 'removed')",
+      [projectId],
+    );
+    for (const d of done) {
+      await opts.drive.remove(d.copy_id).catch(() => {});
+      await setRow(d.id, { copy_id: null });
+    }
   }
   const rows = await query<WorkRow>(
     `SELECT f.id, f.status, f.drive_file_id, f.name, f.folder, f.language, f.asset_id, f.log_status, f.log_job,
-            f.updated_at, f.retry_at, f.drive_tries, f.link_only, a.media_uid, a.duration
+            f.updated_at, f.retry_at, f.drive_tries, f.link_only, f.copy_id, a.media_uid, a.duration
        FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
       WHERE f.project_id = ?
         AND (f.status IN ('waiting', 'importing')
@@ -418,7 +434,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
   }
   await Promise.all(
     claimed.map(async (r) => {
-      const started = await startImport(cfg, r, opts.download);
+      const started = await startImport(cfg, r, opts.drive);
       if (started === true) return;
       if (started.driveLimit) {
         // Drive lifts its limit within a day: the clip waits and is tried
@@ -570,15 +586,26 @@ const DRIVE_RETRY_MS = [30, 60, 120, 240, 240, 240, 240, 240].map((m) => m * 60_
 async function startImport(
   cfg: MediaConfig,
   r: WorkRow,
-  download?: DriveDownload,
+  drive?: DriveSource,
 ): Promise<true | { orgWide: boolean; detail: string; driveLimit?: true }> {
   // Through the org's connection first. A file it can't hand over (too big for
-  // the connector's temporary storage, or refused) comes by the shared link,
-  // now and from then on.
-  if (download && !r.link_only) {
-    const got = await download(r.drive_file_id).catch((e: unknown) => ({ error: String(e) }));
-    if ("url" in got) return importFrom(cfg, r, got.url, got.mimeType.startsWith("video/") ? got.mimeType : "video/mp4", 0);
-    await setRow(r.id, { link_only: 1 });
+  // the connector's temporary storage) comes from a copy the connection makes
+  // in its own account, shared with the link, and deleted once imported; and
+  // when even that fails, by the original's shared link.
+  if (drive && r.link_only < 2) {
+    if (!r.link_only) {
+      const got = await drive.download(r.drive_file_id).catch((e: unknown) => ({ error: String(e) }));
+      if ("url" in got) return importFrom(cfg, r, got.url, got.mimeType.startsWith("video/") ? got.mimeType : "video/mp4", 0);
+      await setRow(r.id, { link_only: 1 });
+    }
+    if (r.copy_id) await drive.remove(r.copy_id).catch(() => {});
+    const copy = await drive.copy(r.drive_file_id, r.name).catch((e: unknown) => ({ error: String(e) }));
+    if ("fileId" in copy) {
+      await setRow(r.id, { copy_id: copy.fileId });
+      return importFrom(cfg, r, directDownloadUrl(copy.fileId), "video/mp4", 0);
+    }
+    // Neither way through the connection worked: the shared link, with its waits.
+    await setRow(r.id, { link_only: 2 });
   }
   const url = directDownloadUrl(r.drive_file_id);
   const probe = await fetch(url, { redirect: "follow" }).catch(() => null);

@@ -199,6 +199,12 @@ CREATE INDEX IF NOT EXISTS idx_footage_highlights_clip ON footage_highlights(foo
 ALTER TABLE project_footage ADD COLUMN retry_at TEXT;
 ALTER TABLE project_footage ADD COLUMN drive_tries INTEGER NOT NULL DEFAULT 0;
 
--- 1 once the org's Drive connection could not hand this clip over (too big
--- for the connector, or refused): it comes in by the shared link instead.
+-- How a clip comes in when the org has a Drive connection: 0 downloaded
+-- through it; 1 too big for that, so from a copy the connection makes (see
+-- copy_id); 2 neither worked, so by the shared link.
 ALTER TABLE project_footage ADD COLUMN link_only INTEGER NOT NULL DEFAULT 0;
+
+-- A file too big to download through the Drive connection comes in from a
+-- copy the connection makes in its own account, shared with the link: this
+-- is that copy, deleted once the import is over.
+ALTER TABLE project_footage ADD COLUMN copy_id TEXT;
