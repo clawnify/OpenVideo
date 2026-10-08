@@ -145,10 +145,18 @@ each file's Drive link.
 `POST /api/projects/{id}/instruct` sees the highlights too: "make a 60 second
 cut from the kept soundbites" places them with its `add_highlight` operation.
 
+Google Drive limits how often a file shared with the link can be downloaded,
+and on a heavy day it refuses the files of a whole folder for a while. A clip it
+refuses is not failed: it waits (`status: "waiting"` with `retry_at`, counted in
+`counts.drive_waiting`) and is tried again by itself, further apart each time,
+for about a day, after which it fails with the reason. `imports_paused` says so
+when every waiting clip is waiting on Drive. A copy of the folder in another
+Drive account has its own limit.
+
 `POST /api/projects/{id}/footage/sync` looks in the folders again and takes in
 files added since; a clip deleted from the project stays out.
 `POST /api/projects/{id}/footage/retry` puts every failed import and log back
-in line. `DELETE /api/projects/{id}` deletes the footage a batch at a time: a
+in line, and asks Drive again now for the clips waiting on it. `DELETE /api/projects/{id}` deletes the footage a batch at a time: a
 `202 { remaining }` means call it again.
 
 ## API

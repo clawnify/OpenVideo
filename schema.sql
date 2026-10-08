@@ -191,3 +191,10 @@ CREATE TABLE IF NOT EXISTS footage_highlights (
 
 CREATE INDEX IF NOT EXISTS idx_footage_highlights_project ON footage_highlights(project_id, score);
 CREATE INDEX IF NOT EXISTS idx_footage_highlights_clip ON footage_highlights(footage_id);
+
+-- A clip Google Drive refuses to hand over (its download limit for the file,
+-- or for the owner's shared files, is used up) waits until `retry_at` (ISO
+-- time) and is tried again, further apart each time; `drive_tries` counts the
+-- refusals. NULL retry_at: it can be tried now.
+ALTER TABLE project_footage ADD COLUMN retry_at TEXT;
+ALTER TABLE project_footage ADD COLUMN drive_tries INTEGER NOT NULL DEFAULT 0;

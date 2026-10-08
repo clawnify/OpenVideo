@@ -298,6 +298,8 @@ interface WorkRow {
   updated_at: string;
   media_uid: string | null;
   duration: number | null;
+  retry_at: string | null;
+  drive_tries: number;
 }
 
 export interface StepOutcome {
@@ -309,6 +311,8 @@ export interface StepOutcome {
   importsBlocked: string | null;
   /** Why no more clips are being logged, when the org has hit a limit. */
   logsBlocked: string | null;
+  /** When nothing can move before then (clips waiting on Google Drive): when to look again. */
+  nextAt: string | null;
 }
 
 // Errors that are about the org, not the clip: every clip would fail the same
@@ -334,7 +338,7 @@ async function setRow(id: string, fields: Record<string, unknown>, where = ""): 
 export async function stepFootage(cfg: MediaConfig, projectId: string): Promise<StepOutcome> {
   const rows = await query<WorkRow>(
     `SELECT f.id, f.status, f.drive_file_id, f.name, f.folder, f.language, f.asset_id, f.log_status, f.log_job,
-            f.updated_at, a.media_uid, a.duration
+            f.updated_at, f.retry_at, f.drive_tries, a.media_uid, a.duration
        FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
       WHERE f.project_id = ?
         AND (f.status IN ('waiting', 'importing')
@@ -342,7 +346,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string): Promise<
       ORDER BY f.folder, f.name`,
     [projectId],
   );
-  const out: StepOutcome = { pending: rows.length, moving: false, importsBlocked: null, logsBlocked: null };
+  const out: StepOutcome = { pending: rows.length, moving: false, importsBlocked: null, logsBlocked: null, nextAt: null };
   if (rows.length === 0 || !cfg.token) {
     if (rows.length && !cfg.token) {
       out.importsBlocked = "importing needs the managed media service, which deployed apps have and local dev does not";
@@ -382,15 +386,28 @@ export async function stepFootage(cfg: MediaConfig, projectId: string): Promise<
   //    the org (storage full) puts its clip back in line and starts no more.
   const room = STEP_LIMITS.importing - importing.filter((r) => r.status === "importing").length;
   const claimed: WorkRow[] = [];
+  const now = new Date().toISOString();
   for (const r of rows) {
     if (claimed.length >= room) break;
-    if (r.status !== "waiting") continue;
-    if (await setRow(r.id, { status: "importing", error: null }, " AND status = 'waiting'")) claimed.push(r);
+    if (r.status !== "waiting" || (r.retry_at && r.retry_at > now)) continue;
+    if (await setRow(r.id, { status: "importing", error: null, retry_at: null }, " AND status = 'waiting'")) claimed.push(r);
   }
   await Promise.all(
     claimed.map(async (r) => {
       const started = await startImport(cfg, r);
       if (started === true) return;
+      if (started.driveLimit) {
+        // Drive lifts its limit within a day: the clip waits and is tried
+        // again by itself, further apart each time, then gives up.
+        const tries = r.drive_tries + 1;
+        if (tries > DRIVE_RETRY_MS.length) {
+          await setRow(r.id, { status: "failed", error: DRIVE_QUOTA, drive_tries: tries });
+        } else {
+          const at = new Date(Date.now() + DRIVE_RETRY_MS[tries - 1]).toISOString();
+          await setRow(r.id, { status: "waiting", error: DRIVE_WAIT, drive_tries: tries, retry_at: at });
+        }
+        return;
+      }
       if (started.orgWide) {
         await setRow(r.id, { status: "waiting" });
         out.importsBlocked = started.detail;
@@ -473,29 +490,49 @@ export async function stepFootage(cfg: MediaConfig, projectId: string): Promise<
     await prepareMedia(cfg, r.media_uid!, r.language);
   }
 
-  const left = await get<{ waiting: number; importing: number; unlogged: number; preparing: number; running: number }>(
+  const at = new Date().toISOString();
+  const left = await get<{
+    waiting: number;
+    waiting_now: number;
+    next_retry: string | null;
+    importing: number;
+    unlogged: number;
+    preparing: number;
+    running: number;
+  }>(
     `SELECT COALESCE(SUM(status = 'waiting'), 0) AS waiting,
+            COALESCE(SUM(status = 'waiting' AND (retry_at IS NULL OR retry_at <= ?)), 0) AS waiting_now,
+            MIN(CASE WHEN status = 'waiting' AND retry_at > ? THEN retry_at END) AS next_retry,
             COALESCE(SUM(status = 'importing'), 0) AS importing,
             COALESCE(SUM(status = 'ready' AND log_status IS NULL), 0) AS unlogged,
             COALESCE(SUM(status = 'ready' AND log_status = 'preparing'), 0) AS preparing,
             COALESCE(SUM(status = 'ready' AND log_status = 'running'), 0) AS running
        FROM project_footage WHERE project_id = ?`,
-    [projectId],
+    [at, at, projectId],
   );
-  const n = left ?? { waiting: 0, importing: 0, unlogged: 0, preparing: 0, running: 0 };
+  const n = left ?? { waiting: 0, waiting_now: 0, next_retry: null, importing: 0, unlogged: 0, preparing: 0, running: 0 };
   out.pending = n.waiting + n.importing + n.unlogged + n.preparing + n.running;
   // Clips a limit holds are not moving: a step would only be refused again.
   // The next read tries once more, and starts the chain again if it can.
   out.moving =
     n.importing > 0 ||
     n.running > 0 ||
-    (n.waiting > 0 && !out.importsBlocked) ||
+    (n.waiting_now > 0 && !out.importsBlocked) ||
     (n.unlogged + n.preparing > 0 && !out.logsBlocked);
+  // Clips waiting on Google Drive: nothing to do until the first is due, so
+  // the next step is booked for then rather than every minute.
+  if (!out.moving && n.next_retry) out.nextAt = n.next_retry;
+  if (!out.importsBlocked && n.waiting_now === 0 && n.next_retry) out.importsBlocked = DRIVE_WAIT_ALL;
   return out;
 }
 
 const DRIVE_QUOTA =
   "Google Drive's download limit for this file is used up for today: it resets within a day, so retry it then. A copy of the file in Drive has its own limit";
+const DRIVE_WAIT = "Waiting for Google Drive, which is limiting downloads of this file for now";
+const DRIVE_WAIT_ALL =
+  "Google Drive is limiting downloads of these files for now. Importing carries on by itself as it lifts, usually within a day. A copy of the folder in another Drive account has its own limit";
+/** How long a clip Drive refused waits before each new try: about a day in all. */
+const DRIVE_RETRY_MS = [30, 60, 120, 240, 240, 240, 240, 240].map((m) => m * 60_000);
 
 /**
  * Check the Drive file serves video, then have the media service pull it.
@@ -506,7 +543,7 @@ const DRIVE_QUOTA =
  * its "Quota exceeded" page, so a ranged check passes a file the import then
  * fails on, and that failed import still counts against the plan.
  */
-async function startImport(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWide: boolean; detail: string }> {
+async function startImport(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWide: boolean; detail: string; driveLimit?: true }> {
   const url = directDownloadUrl(r.drive_file_id);
   const probe = await fetch(url, { redirect: "follow" }).catch(() => null);
   if (!probe) return { orgWide: true, detail: "Google Drive could not be reached" };
@@ -516,7 +553,8 @@ async function startImport(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWi
   if (!page) await probe.body?.cancel();
   const verdict = judgeLinkResponse(probe.status, served, probe.headers.get("content-range"), probe.headers.get("content-length"));
   if (!verdict.ok) {
-    return { orgWide: false, detail: /<title>[^<]*quota exceeded/i.test(page) ? DRIVE_QUOTA : (verdict.reason ?? "that file isn't a video") };
+    if (/<title>[^<]*quota exceeded/i.test(page)) return { orgWide: false, detail: DRIVE_QUOTA, driveLimit: true };
+    return { orgWide: false, detail: verdict.reason ?? "that file isn't a video" };
   }
 
   // A copy from an attempt that failed is of no use and still counts against
@@ -557,12 +595,14 @@ export async function bookStep(
   env: QueueEnv,
   origin: string,
   projectId: string,
-  opts: { after: "delivery" | "read"; bookedAt: string | null },
+  opts: { after: "delivery" | "read"; bookedAt: string | null; at?: string | null },
 ): Promise<string | null> {
   if (opts.after === "read" && opts.bookedAt && Date.parse(opts.bookedAt) > Date.now() - STEP_GRACE_MS) {
     return opts.bookedAt;
   }
-  const runAt = new Date(Math.ceil((Date.now() + 60_000) / 60_000) * 60_000);
+  // A minute from now, or later when nothing can move before then.
+  const earliest = Math.max(Date.now() + 60_000, opts.at ? Date.parse(opts.at) : 0);
+  const runAt = new Date(Math.ceil(earliest / 60_000) * 60_000);
   try {
     await enqueueJob(env, {
       targetUrl: `${origin}/api/footage/step`,
