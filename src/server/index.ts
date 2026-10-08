@@ -34,7 +34,7 @@ import { addFolderVideos, bookStep, readFolder, stepFootage, type StepOutcome } 
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
 import { instructEdit } from "./instruct";
-import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig } from "./export";
+import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
 
 type Bindings = {
@@ -1194,36 +1194,43 @@ app.post("/api/projects/:id/export", async (c) => {
     project.id,
   ]);
   const jobId = res.lastInsertRowid as number;
-  const fail = async (error: string, detail: string, path?: string) => {
-    const msg = `${error}: ${detail}${path ? ` (at ${path})` : ""}`.slice(0, 1000);
-    await run("UPDATE export_jobs SET status = 'failed', error = ?, updated_at = datetime('now') WHERE id = ?", [msg, jobId]);
-    const job = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [jobId]);
-    // Machine-readable failure alongside the job row, so an editing loop can
-    // jump straight to the offending EDL node.
-    return c.json({ ...job, failure: { error, detail, ...(path ? { path } : {}) } }, 201);
-  };
 
-  try {
-    const resolved = await resolveEdlSources(parsed.edl, cfg);
-    if ("failure" in resolved) return fail(resolved.failure.error, resolved.failure.detail, resolved.failure.path);
-
-    const started = await startEdit(
-      resolved.edl,
-      { quality, filename: `${makeKey(project.name)}.mp4` },
-      cfg,
-    );
-    if ("failure" in started) return fail(started.failure.error, started.failure.detail, started.failure.path);
-
-    // The render is on its way; reads of this job settle it (settleExport).
-    await run("UPDATE export_jobs SET service_job_id = ?, updated_at = datetime('now') WHERE id = ?", [
-      started.jobId,
-      jobId,
-    ]);
-  } catch (err) {
-    return fail("export_failed", String(err).slice(0, 500));
-  }
+  // Hand the render to the edit service. This runs to the end even if the
+  // caller goes away mid-request (a phone locking, a laptop closing): cut off
+  // between the insert and the render's start, an export used to be left
+  // with no render at all, failing only when a read noticed, 15 minutes on.
+  const handover: Promise<{ ok: true } | ExportFailure> = (async () => {
+    try {
+      const resolved = await resolveEdlSources(parsed.edl, cfg);
+      if ("failure" in resolved) return resolved.failure;
+      const started = await startEdit(resolved.edl, { quality, filename: `${makeKey(project.name)}.mp4` }, cfg);
+      if ("failure" in started) return started.failure;
+      // The render is on its way; reads of this job settle it (settleExport).
+      await run("UPDATE export_jobs SET service_job_id = ?, updated_at = datetime('now') WHERE id = ?", [
+        started.jobId,
+        jobId,
+      ]);
+      return { ok: true as const };
+    } catch (err) {
+      return { error: "export_failed", detail: String(err).slice(0, 500) };
+    }
+  })().then(async (outcome) => {
+    if ("error" in outcome) {
+      const msg = `${outcome.error}: ${outcome.detail}${outcome.path ? ` (at ${outcome.path})` : ""}`.slice(0, 1000);
+      await run("UPDATE export_jobs SET status = 'failed', error = ?, updated_at = datetime('now') WHERE id = ?", [msg, jobId]);
+    }
+    return outcome;
+  });
+  c.executionCtx.waitUntil(handover.then(() => {}));
+  const outcome = await handover;
 
   const job = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [jobId]);
+  if ("error" in outcome) {
+    // Machine-readable failure alongside the job row, so an editing loop can
+    // jump straight to the offending EDL node.
+    const { error, detail, path } = outcome;
+    return c.json({ ...job, failure: { error, detail, ...(path ? { path } : {}) } }, 201);
+  }
   return c.json(job, 201);
 });
 
