@@ -153,6 +153,12 @@ for about a day, after which it fails with the reason. `imports_paused` says so
 when every waiting clip is waiting on Drive. A copy of the folder in another
 Drive account has its own limit.
 
+When the org has a Google Drive connection whose account can open the
+folder, clips are downloaded through it instead, as that account, which
+Drive's limit on shared links doesn't touch. Those downloads run in the
+background steps only. A file too big for the connection's temporary storage
+(seen at 9 GB; 3.4 GB passed) comes by the shared link instead.
+
 `POST /api/projects/{id}/footage/sync` looks in the folders again and takes in
 files added since; a clip deleted from the project stays out.
 `POST /api/projects/{id}/footage/retry` puts every failed import and log back

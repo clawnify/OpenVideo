@@ -300,6 +300,21 @@ interface WorkRow {
   duration: number | null;
   retry_at: string | null;
   drive_tries: number;
+  link_only: number;
+}
+
+/**
+ * The org's Google Drive connection, when it has one: a short-lived link to a
+ * file's bytes, fetched as the connected account. Drive's limit on how often
+ * a file shared with the link is downloaded doesn't apply to it.
+ */
+export type DriveDownload = (fileId: string) => Promise<{ url: string; mimeType: string } | { error: string }>;
+
+export interface StepOptions {
+  /** Import through the org's Drive connection; the shared link stays the fallback. */
+  download?: DriveDownload;
+  /** False: start no imports this step (a read, while imports go through the connection, which is slow). */
+  startImports?: boolean;
 }
 
 export interface StepOutcome {
@@ -335,10 +350,19 @@ async function setRow(id: string, fields: Record<string, unknown>, where = ""): 
  * start what has room. Safe to run from several places at once: every start
  * claims its row first, and a row only one step can claim.
  */
-export async function stepFootage(cfg: MediaConfig, projectId: string): Promise<StepOutcome> {
+export async function stepFootage(cfg: MediaConfig, projectId: string, opts: StepOptions = {}): Promise<StepOutcome> {
+  // With a connection, clips waiting on the shared link's limit can come in
+  // now: only those the connection already couldn't take keep waiting.
+  if (opts.download) {
+    await run(
+      `UPDATE project_footage SET retry_at = NULL, error = NULL
+        WHERE project_id = ? AND status = 'waiting' AND retry_at IS NOT NULL AND link_only = 0`,
+      [projectId],
+    );
+  }
   const rows = await query<WorkRow>(
     `SELECT f.id, f.status, f.drive_file_id, f.name, f.folder, f.language, f.asset_id, f.log_status, f.log_job,
-            f.updated_at, f.retry_at, f.drive_tries, a.media_uid, a.duration
+            f.updated_at, f.retry_at, f.drive_tries, f.link_only, a.media_uid, a.duration
        FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
       WHERE f.project_id = ?
         AND (f.status IN ('waiting', 'importing')
@@ -384,7 +408,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string): Promise<
 
   // 2. Start imports while there is room, together. A refusal that is about
   //    the org (storage full) puts its clip back in line and starts no more.
-  const room = STEP_LIMITS.importing - importing.filter((r) => r.status === "importing").length;
+  const room = opts.startImports === false ? 0 : STEP_LIMITS.importing - importing.filter((r) => r.status === "importing").length;
   const claimed: WorkRow[] = [];
   const now = new Date().toISOString();
   for (const r of rows) {
@@ -394,7 +418,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string): Promise<
   }
   await Promise.all(
     claimed.map(async (r) => {
-      const started = await startImport(cfg, r);
+      const started = await startImport(cfg, r, opts.download);
       if (started === true) return;
       if (started.driveLimit) {
         // Drive lifts its limit within a day: the clip waits and is tried
@@ -543,7 +567,19 @@ const DRIVE_RETRY_MS = [30, 60, 120, 240, 240, 240, 240, 240].map((m) => m * 60_
  * its "Quota exceeded" page, so a ranged check passes a file the import then
  * fails on, and that failed import still counts against the plan.
  */
-async function startImport(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWide: boolean; detail: string; driveLimit?: true }> {
+async function startImport(
+  cfg: MediaConfig,
+  r: WorkRow,
+  download?: DriveDownload,
+): Promise<true | { orgWide: boolean; detail: string; driveLimit?: true }> {
+  // Through the org's connection first. A file it can't hand over (too big for
+  // the connector's temporary storage, or refused) comes by the shared link,
+  // now and from then on.
+  if (download && !r.link_only) {
+    const got = await download(r.drive_file_id).catch((e: unknown) => ({ error: String(e) }));
+    if ("url" in got) return importFrom(cfg, r, got.url, got.mimeType.startsWith("video/") ? got.mimeType : "video/mp4", 0);
+    await setRow(r.id, { link_only: 1 });
+  }
   const url = directDownloadUrl(r.drive_file_id);
   const probe = await fetch(url, { redirect: "follow" }).catch(() => null);
   if (!probe) return { orgWide: true, detail: "Google Drive could not be reached" };
@@ -557,6 +593,17 @@ async function startImport(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWi
     return { orgWide: false, detail: verdict.reason ?? "that file isn't a video" };
   }
 
+  return importFrom(cfg, r, url, verdict.contentType?.startsWith("video/") ? verdict.contentType : "video/mp4", verdict.size ?? 0);
+}
+
+/** Have the media service pull the clip from `url`, and record it as an asset. */
+async function importFrom(
+  cfg: MediaConfig,
+  r: WorkRow,
+  url: string,
+  type: string,
+  size: number,
+): Promise<true | { orgWide: boolean; detail: string }> {
   // A copy from an attempt that failed is of no use and still counts against
   // the org's storage: it goes before the clip is imported again.
   if (r.asset_id) {
@@ -569,10 +616,9 @@ async function startImport(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWi
     return { orgWide: ORG_LIMITS.has(imported.failure.error), detail: imported.failure.detail };
   }
   const uid = imported.media.id;
-  const type = verdict.contentType?.startsWith("video/") ? verdict.contentType : "video/mp4";
   const res = await run(
     "INSERT INTO assets (key, name, content_type, size, media_uid) VALUES (?, ?, ?, ?, ?)",
-    [`media/${uid}`, r.name, type, verdict.size ?? 0, uid],
+    [`media/${uid}`, r.name, type, size, uid],
   );
   const asset = await get<{ id: string }>("SELECT id FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
   await setRow(r.id, { asset_id: asset!.id });

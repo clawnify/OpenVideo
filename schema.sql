@@ -198,3 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_footage_highlights_clip ON footage_highlights(foo
 -- refusals. NULL retry_at: it can be tried now.
 ALTER TABLE project_footage ADD COLUMN retry_at TEXT;
 ALTER TABLE project_footage ADD COLUMN drive_tries INTEGER NOT NULL DEFAULT 0;
+
+-- 1 once the org's Drive connection could not hand this clip over (too big
+-- for the connector, or refused): it comes in by the shared link instead.
+ALTER TABLE project_footage ADD COLUMN link_only INTEGER NOT NULL DEFAULT 0;

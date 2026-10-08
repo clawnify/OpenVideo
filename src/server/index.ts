@@ -30,7 +30,7 @@ import {
   withinFolder,
 } from "./drive";
 import { parseDriveLink, type FolderVideo } from "./drive-link";
-import { addFolderVideos, bookStep, readFolder, stepFootage, type StepOutcome } from "./footage";
+import { addFolderVideos, bookStep, readFolder, stepFootage, type DriveDownload, type StepOutcome } from "./footage";
 import { HIGHLIGHTS_NO_KEY, highlightsPending, stepHighlights, type HighlightKind } from "./highlights";
 import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
@@ -893,6 +893,21 @@ async function addFolder(
   return { folder: { id: folder.id, name: folder.name }, found: folder.videos.length, added, truncated: folder.truncated };
 }
 
+/** The org's Google Drive connection as a footage source, when it has one. */
+async function driveDownloader(env: Bindings): Promise<DriveDownload | undefined> {
+  if (!env.CREDENTIALS) return undefined;
+  const status = await driveStatus(env).catch(() => ({ connected: false }));
+  if (!status.connected) return undefined;
+  return async (fileId) => {
+    try {
+      const file = await driveDownloadLink(env, fileId);
+      return { url: file.url, mimeType: file.mimeType };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+  };
+}
+
 /** Book the next background step while there is work a step can do. */
 async function keepFootageMoving(
   c: Context<{ Bindings: Bindings }>,
@@ -909,7 +924,13 @@ async function advanceFootage(
   projectId: string,
   after: "delivery" | "read",
 ): Promise<{ outcome: StepOutcome; nextStepAt: string | null }> {
-  const outcome = await stepFootage(mediaCfg(c.env), projectId);
+  // With the org's Drive connection, clips come in through it, on deliveries
+  // only: a download through it takes from seconds to minutes.
+  const download = await driveDownloader(c.env);
+  const outcome = await stepFootage(mediaCfg(c.env), projectId, {
+    download: after === "delivery" ? download : undefined,
+    startImports: !(download && after === "read"),
+  });
   // Highlights are read only on a delivery: a model call takes up to half a
   // minute, and a read answers at once. A read still keeps the chain booked.
   const highlightsMoving =
