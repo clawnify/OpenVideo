@@ -2038,7 +2038,7 @@ function FootageRow({
               <Film className="w-3.5 h-3.5" />
             )}
           </div>
-          <div className={`min-w-0 flex-1 text-fine text-foreground break-all line-clamp-2 ${asset ? "pr-5" : ""}`}>{label}</div>
+          <div className="min-w-0 flex-1 text-fine text-foreground break-words line-clamp-2">{label}</div>
         </div>
         <div className={`mt-0.5 text-fine line-clamp-2 ${failed ? "text-danger" : "text-muted"}`}>
           {item.log && (
@@ -2051,10 +2051,11 @@ function FootageRow({
         </div>
       </button>
       {asset && (
+        // On the thumbnail, so it takes no width from the name beside it.
         <button
           onClick={() => onDelete(asset)}
           data-hover-only
-          className="absolute right-1 top-1 grid place-items-center w-6 h-6 rounded-xs text-faint hover:text-danger hover:bg-danger-tint opacity-0 transition-opacity group-hover/tile:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+          className="absolute left-1 top-1 grid place-items-center w-6 h-6 rounded-xs bg-surface/90 text-muted hover:text-danger hover:bg-danger-tint opacity-0 transition-opacity group-hover/tile:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
           aria-label={`Delete ${item.name} from this project`}
           title="Delete from this project"
         >
