@@ -1,4 +1,4 @@
-import { Hono, type MiddlewareHandler } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { initDB, query, get, run } from "./db";
 import {
   initUploads,
@@ -9,6 +9,7 @@ import {
   makeKey,
 } from "./uploads";
 import type { ConnectionsEnv } from "@clawnify/connections";
+import { verifyDelivery } from "@clawnify/queue";
 import {
   deleteMedia,
   frameUrl,
@@ -28,6 +29,8 @@ import {
   listDriveFiles,
   withinFolder,
 } from "./drive";
+import { parseDriveLink, type FolderVideo } from "./drive-link";
+import { addFolderVideos, bookStep, readFolder, stepFootage, type StepOutcome } from "./footage";
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
 import { instructEdit } from "./instruct";
@@ -81,7 +84,14 @@ interface Asset {
 }
 
 app.get("/api/assets", async (c) => {
-  const rows = await query<Asset>("SELECT * FROM assets ORDER BY created_at DESC");
+  // Footage a project took from a Drive folder is that project's own: it is
+  // listed only with ?project=<its id>, never in the library at large.
+  const rows = await query<Asset>(
+    `SELECT * FROM assets a
+      WHERE NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = a.id AND f.project_id IS NOT ?)
+      ORDER BY created_at DESC`,
+    [c.req.query("project") ?? null],
+  );
   c.executionCtx.waitUntil(sweepUploads(c.env).catch((err) => console.error("upload sweep:", String(err))));
   return c.json(rows);
 });
@@ -470,6 +480,12 @@ app.delete("/api/assets/:id", async (c) => {
     }
     if (row.proxy_key) await deleteUpload(row.proxy_key);
     await run("DELETE FROM assets WHERE id = ?", [row.id]);
+    // A clip from a project's Drive folder stays listed as removed, so
+    // checking the folder for new files does not bring it back.
+    await run(
+      "UPDATE project_footage SET status = 'removed', asset_id = NULL, updated_at = datetime('now') WHERE asset_id = ?",
+      [row.id],
+    );
   }
   return c.json({ ok: true });
 });
@@ -556,6 +572,7 @@ app.get("/api/projects", async (c) => {
     Omit<EditProject, "edl" | "brief"> & { cover_key: string | null; cover_type: string | null; cover_at: number | null }
   >(
     `SELECT p.id, p.name, p.created_at, p.updated_at,
+            (SELECT COUNT(*) FROM project_footage f WHERE f.project_id = p.id AND f.status != 'removed') AS footage,
             a.key AS cover_key, a.content_type AS cover_type,
             a.id AS cover_asset, a.media_uid AS cover_media,
             json_extract(p.edl, '$.main.elements[0].trimStart') AS cover_at
@@ -573,8 +590,19 @@ app.get("/api/projects/:id", async (c) => {
 });
 
 app.post("/api/projects", async (c) => {
-  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string }>();
-  if (!b.name?.trim()) return c.json({ error: "name is required" }, 400);
+  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string; folder?: string; language?: string }>();
+  // A project can start from a Drive folder shared with the link: every video
+  // in it, and in the folders inside it, becomes this project's footage.
+  let folder: { id: string; name: string; videos: FolderVideo[]; truncated: boolean } | null = null;
+  if (b.folder !== undefined) {
+    const link = parseDriveLink(String(b.folder));
+    if (link?.kind !== "folder") return c.json({ error: "invalid_request", detail: "that isn't a Google Drive folder link" }, 400);
+    const walk = await readFolder(link.id);
+    if ("failure" in walk) return c.json({ error: "folder_unreadable", detail: walk.failure }, 422);
+    folder = { id: link.id, ...walk };
+  }
+  const name = b.name?.trim() || folder?.name;
+  if (!name) return c.json({ error: "name is required" }, 400);
 
   let edl: Edl;
   if (b.edl !== undefined) {
@@ -588,12 +616,14 @@ app.post("/api/projects", async (c) => {
   const id = crypto.randomUUID();
   await run("INSERT INTO edit_projects (id, name, edl, brief) VALUES (?, ?, ?, ?)", [
     id,
-    b.name.trim(),
+    name.slice(0, 200),
     JSON.stringify(edl),
     b.brief?.trim() ?? "",
   ]);
+  let footage: FolderAdded | undefined;
+  if (folder) footage = await addFolder(c, id, folder, b.language);
   const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
-  return c.json(projectOut(row!), 201);
+  return c.json({ ...projectOut(row!), ...(footage ? { footage } : {}) }, 201);
 });
 
 app.put("/api/projects/:id", async (c) => {
@@ -758,6 +788,39 @@ app.post("/api/projects/:id/autocut", async (c) => {
 
 app.delete("/api/projects/:id", async (c) => {
   const id = c.req.param("id");
+  // Its footage from Drive goes first. Each clip is a copy on the media
+  // service, counted against the org's storage until it is deleted there, so
+  // a big shoot is deleted a batch per call: 202 says how many are left, and
+  // calling again carries on. A clip another project uses stays, in the library.
+  const footage = await query<{ id: string; asset_id: string | null; media_uid: string | null }>(
+    `SELECT f.id, f.asset_id, a.media_uid FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE f.project_id = ? LIMIT ?`,
+    [id, FOOTAGE_DELETE_BATCH],
+  );
+  if (footage.length > 0) {
+    await Promise.all(
+      footage.map(async (f) => {
+        if (f.asset_id) {
+          const usedElsewhere = await get(
+            "SELECT 1 AS used FROM edit_projects WHERE id != ? AND edl LIKE ? LIMIT 1",
+            [id, `%"asset:${f.asset_id}"%`],
+          );
+          if (!usedElsewhere) {
+            try {
+              if (f.media_uid) await deleteMedia(mediaCfg(c.env), f.media_uid);
+            } catch {
+              return; // unreachable: kept for the next call
+            }
+            await run("DELETE FROM assets WHERE id = ?", [f.asset_id]);
+          }
+        }
+        await run("DELETE FROM project_footage WHERE id = ?", [f.id]);
+      }),
+    );
+    const left = await get<{ n: number }>("SELECT COUNT(*) AS n FROM project_footage WHERE project_id = ?", [id]);
+    if (left && left.n > 0) return c.json({ ok: false, remaining: left.n }, 202);
+  }
+  await run("DELETE FROM footage_sources WHERE project_id = ?", [id]);
   // Drop each completed export's rendered file from storage before the rows go,
   // otherwise the renders/*.mp4 objects outlive the only rows that point to them
   // and are orphaned forever. Best-effort: a storage hiccup must not strand the
@@ -772,6 +835,267 @@ app.delete("/api/projects/:id", async (c) => {
   await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM edit_projects WHERE id = ?", [id]);
   return c.json({ ok: true });
+});
+
+// ── Footage from Drive folders ──────────────────────────────────────
+// A project's own clips, from folders shared with the link: imported and
+// logged in the background, a few at a time. See src/server/footage.ts.
+
+const FOOTAGE_DELETE_BATCH = 100;
+const LANGUAGE = /^[a-z]{2}$/;
+
+interface FolderAdded {
+  folder: { id: string; name: string };
+  /** Videos in the folder and the folders inside it. */
+  found: number;
+  /** Of those, the ones new to the project. */
+  added: number;
+  /** A walk limit was reached, and some videos were left out. */
+  truncated: boolean;
+}
+
+async function addFolder(
+  c: Context<{ Bindings: Bindings }>,
+  projectId: string,
+  folder: { id: string; name: string; videos: FolderVideo[]; truncated: boolean },
+  language?: string,
+): Promise<FolderAdded> {
+  const lang = language && LANGUAGE.test(language) ? language : "en";
+  const added = await addFolderVideos(projectId, folder, folder.videos, lang);
+  if (added > 0) await keepFootageMoving(c, projectId, "read");
+  return { folder: { id: folder.id, name: folder.name }, found: folder.videos.length, added, truncated: folder.truncated };
+}
+
+/** Book the next background step while there is work a step can do. */
+async function keepFootageMoving(
+  c: Context<{ Bindings: Bindings }>,
+  projectId: string,
+  after: "delivery" | "read",
+): Promise<string | null> {
+  const row = await get<{ footage_step_at: string | null }>("SELECT footage_step_at FROM edit_projects WHERE id = ?", [projectId]);
+  return bookStep(c.env, new URL(c.req.url).origin, projectId, { after, bookedAt: row?.footage_step_at ?? null });
+}
+
+async function advanceFootage(
+  c: Context<{ Bindings: Bindings }>,
+  projectId: string,
+  after: "delivery" | "read",
+): Promise<{ outcome: StepOutcome; nextStepAt: string | null }> {
+  const outcome = await stepFootage(mediaCfg(c.env), projectId);
+  const nextStepAt = outcome.moving ? await keepFootageMoving(c, projectId, after) : null;
+  return { outcome, nextStepAt };
+}
+
+interface FootageItemRow {
+  id: string;
+  name: string;
+  folder: string;
+  status: string;
+  error: string | null;
+  log_status: string | null;
+  log_error: string | null;
+  log: string | null;
+  asset_id: string | null;
+  key: string | null;
+  content_type: string | null;
+  size: number | null;
+  duration: number | null;
+  media_uid: string | null;
+}
+
+function footageOut(r: FootageItemRow) {
+  return {
+    id: r.id,
+    name: r.name,
+    folder: r.folder,
+    status: r.status,
+    error: r.error,
+    asset: r.asset_id
+      ? {
+          id: r.asset_id,
+          key: r.key,
+          name: r.name,
+          content_type: r.content_type,
+          size: r.size,
+          duration: r.duration,
+          media_uid: r.media_uid,
+        }
+      : null,
+    log_status: r.log_status,
+    log_error: r.log_error,
+    log: r.log ? JSON.parse(r.log) : null,
+  };
+}
+
+const FOOTAGE_COLUMNS = `f.id, f.name, f.folder, f.status, f.error, f.log_status, f.log_error, f.asset_id,
+       a.key, a.content_type, a.size, a.duration, a.media_uid`;
+
+function intParam(v: string | undefined, fallback: number, min: number, max: number): number {
+  const n = Number.parseInt(v ?? "", 10);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+
+// The project's footage and each clip's log, moving the work on by a step
+// first (step=0 skips that, for a quick first look). Pages: with logs (the
+// default) 50 a page, at most 200; with logs=0 only each log's summary, kind
+// and quality, and up to 3000 a page. Narrow with folder= (a folder and
+// everything inside it), kind=, status=.
+app.get("/api/projects/:id/footage", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const { outcome, nextStepAt } =
+    c.req.query("step") === "0" ? { outcome: null, nextStepAt: null } : await advanceFootage(c, id, "read");
+
+  const full = c.req.query("logs") !== "0";
+  const limit = intParam(c.req.query("limit"), full ? 50 : 3000, 1, full ? 200 : 3000);
+  const offset = intParam(c.req.query("offset"), 0, 0, 1_000_000);
+  const where = ["f.project_id = ?", "f.status != 'removed'"];
+  const params: unknown[] = [id];
+  const folder = c.req.query("folder")?.replace(/\/+$/, "");
+  if (folder) {
+    where.push("(f.folder = ? OR substr(f.folder, 1, ?) = ?)");
+    params.push(folder, folder.length + 1, `${folder}/`);
+  }
+  const kind = c.req.query("kind");
+  if (kind) {
+    where.push("json_extract(f.log, '$.kind') = ?");
+    params.push(kind);
+  }
+  const status = c.req.query("status");
+  if (status) {
+    where.push("f.status = ?");
+    params.push(status);
+  }
+  const rows = await query<FootageItemRow>(
+    `SELECT ${FOOTAGE_COLUMNS},
+            CASE WHEN f.log IS NULL THEN NULL
+                 WHEN ? THEN f.log
+                 ELSE json_object('summary', json_extract(f.log, '$.summary'),
+                                  'kind', json_extract(f.log, '$.kind'),
+                                  'quality', json_extract(f.log, '$.quality')) END AS log
+       FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE ${where.join(" AND ")}
+      ORDER BY f.folder, f.name, f.id
+      LIMIT ? OFFSET ?`,
+    [full ? 1 : 0, ...params, limit, offset],
+  );
+  const tally = await query<{ status: string; log_status: string | null; n: number }>(
+    `SELECT status, log_status, COUNT(*) AS n FROM project_footage
+      WHERE project_id = ? AND status != 'removed' GROUP BY status, log_status`,
+    [id],
+  );
+  const count = (pick: (t: { status: string; log_status: string | null }) => boolean) =>
+    tally.filter(pick).reduce((sum, t) => sum + t.n, 0);
+  const sources = await query<{ folder_id: string; name: string; language: string }>(
+    "SELECT folder_id, name, language FROM footage_sources WHERE project_id = ? ORDER BY created_at",
+    [id],
+  );
+  return c.json({
+    sources: sources.map((s) => ({
+      id: s.folder_id,
+      name: s.name,
+      language: s.language,
+      url: `https://drive.google.com/drive/folders/${s.folder_id}`,
+    })),
+    counts: {
+      total: count(() => true),
+      waiting: count((t) => t.status === "waiting"),
+      importing: count((t) => t.status === "importing"),
+      ready: count((t) => t.status === "ready"),
+      failed: count((t) => t.status === "failed"),
+      logged: count((t) => t.log_status === "done"),
+      logging: count((t) => t.log_status === "preparing" || t.log_status === "running"),
+      log_failed: count((t) => t.log_status === "failed"),
+    },
+    // Why nothing more is starting, when the org has hit a limit.
+    imports_paused: outcome?.importsBlocked ?? null,
+    logging_paused: outcome?.logsBlocked ?? null,
+    next_step_at: nextStepAt,
+    items: rows.map(footageOut),
+    next_offset: rows.length === limit ? offset + limit : null,
+  });
+});
+
+app.get("/api/projects/:id/footage/:clip", async (c) => {
+  const row = await get<FootageItemRow>(
+    `SELECT ${FOOTAGE_COLUMNS}, f.log FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE f.project_id = ? AND f.id = ?`,
+    [c.req.param("id"), c.req.param("clip")],
+  );
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json(footageOut(row));
+});
+
+// Add a folder shared with the link: its videos and those in every folder
+// inside it. Adding one again adds only what is new.
+app.post("/api/projects/:id/footage/folders", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const b = await c.req.json<{ url?: string; language?: string }>().catch(() => ({}) as { url?: string; language?: string });
+  const link = parseDriveLink(b.url ?? "");
+  if (link?.kind !== "folder") return c.json({ error: "invalid_request", detail: "that isn't a Google Drive folder link" }, 400);
+  const walk = await readFolder(link.id);
+  if ("failure" in walk) return c.json({ error: "folder_unreadable", detail: walk.failure }, 422);
+  return c.json(await addFolder(c, id, { id: link.id, ...walk }, b.language), 201);
+});
+
+// Look in the project's folders again and take in what has been added since.
+app.post("/api/projects/:id/footage/sync", async (c) => {
+  const id = c.req.param("id");
+  const sources = await query<{ folder_id: string; language: string }>(
+    "SELECT folder_id, language FROM footage_sources WHERE project_id = ?",
+    [id],
+  );
+  if (sources.length === 0) return c.json({ error: "not_found", detail: "this project has no Drive folder" }, 404);
+  const folders: (FolderAdded | { folder: { id: string }; error: string })[] = [];
+  for (const s of sources) {
+    const walk = await readFolder(s.folder_id);
+    folders.push(
+      "failure" in walk
+        ? { folder: { id: s.folder_id }, error: walk.failure }
+        : await addFolder(c, id, { id: s.folder_id, ...walk }, s.language),
+    );
+  }
+  return c.json({ added: folders.reduce((n, f) => n + ("added" in f ? f.added : 0), 0), folders });
+});
+
+// Put every clip that failed to import or to be logged back in line.
+app.post("/api/projects/:id/footage/retry", async (c) => {
+  const id = c.req.param("id");
+  const imports = await run(
+    "UPDATE project_footage SET status = 'waiting', error = NULL, updated_at = datetime('now') WHERE project_id = ? AND status = 'failed'",
+    [id],
+  );
+  const logs = await run(
+    `UPDATE project_footage SET log_status = NULL, log_error = NULL, log_job = NULL, updated_at = datetime('now')
+      WHERE project_id = ? AND log_status = 'failed'`,
+    [id],
+  );
+  if (imports.changes + logs.changes > 0) await keepFootageMoving(c, id, "read");
+  return c.json({ imports: imports.changes, logs: logs.changes });
+});
+
+// The platform queue's call for the next background step. Public, because the
+// queue calls from outside the app's sign-in; the signature is the check.
+app.post("/api/footage/step", async (c) => {
+  const body = await c.req.text();
+  const signed = await verifyDelivery(body, {
+    signature: c.req.header("X-Queue-Signature") ?? null,
+    timestamp: c.req.header("X-Queue-Timestamp") ?? null,
+    keyId: c.req.header("X-Queue-Key-Id") ?? null,
+  }).catch(() => false);
+  if (!signed) return c.json({ error: "unauthorized" }, 401);
+  let projectId = "";
+  try {
+    projectId = String((JSON.parse(body) as { project_id?: unknown }).project_id ?? "");
+  } catch {
+    /* no project: answered below */
+  }
+  // A project deleted since the step was booked: nothing to do, and a 2xx so
+  // the queue does not try again.
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [projectId]))) return c.json({ ok: true });
+  const { outcome, nextStepAt } = await advanceFootage(c, projectId, "delivery");
+  return c.json({ ok: true, pending: outcome.pending, next_step_at: nextStepAt });
 });
 
 // ── Exports ──────────────────────────────────────────────────────────

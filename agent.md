@@ -40,11 +40,81 @@ Drive folder and its subfolders, and a file outside it is refused. Pass
 `folder=<id>` to `GET /api/drive/files` to list one folder (its subfolders come
 back as `folders`); a search looks inside that folder only, never the subtree.
 
+## Footage from a Drive folder
+
+A shoot usually arrives as a Google Drive folder shared with "anyone with the
+link": a folder per camera, hundreds of clips. Start a project from it, or add
+one to a project:
+
+```
+POST /api/projects                     { "folder": "<folder link>", "name"?, "brief"?, "language"?: "en" }
+POST /api/projects/{id}/footage/folders { "url": "<folder link>", "language"?: "en" }
+```
+
+Every video in the folder, and in every folder inside it, becomes the
+project's own footage (photos and other files are left out). It is listed with
+that project only (`GET /api/assets?project={id}`), and deleting the project
+deletes it. No Drive connection is needed: the folder only has to be shared
+with the link, and one that isn't answers 422 `folder_unreadable`. The answer's
+`footage` says how many videos were found and how many were new.
+
+Each clip is then copied to the media service and **logged** by the
+platform's video analysis, a few at a time, in the background. The platform
+queue moves the work on every minute, so nothing has to stay open; every read
+below also moves it on. Read progress and the logs with:
+
+```
+GET /api/projects/{id}/footage             50 clips a page with full logs (limit up to 200, offset)
+GET /api/projects/{id}/footage?logs=0      every clip, with only each log's summary, kind and quality
+    &folder=Day 1/Cam B                    one folder and everything inside it
+    &kind=interview|stage|b-roll|other     what the log says the clip is
+    &status=waiting|importing|ready|failed
+GET /api/projects/{id}/footage/{clipId}    one clip with its full log
+```
+
+The answer carries `counts` (`total`, `waiting`, `importing`, `ready`,
+`failed`, `logged`, `logging`, `log_failed`), `imports_paused` and
+`logging_paused` (why nothing more is starting when the workspace has hit a
+limit: storage full, the plan's monthly video allowance, credits; null
+otherwise), `next_offset`, and `items`:
+
+```jsonc
+{
+  "id": "…", "name": "B_0012.MP4", "folder": "Day 1/Cam B",
+  "status": "ready",                       // waiting | importing | ready | failed
+  "asset": { "id": "…", "duration": 41.2 }, // the EDL uses "asset:<id>"
+  "log_status": "done",                    // preparing | running | done | failed
+  "log": {
+    "summary": "…", "kind": "interview", "quality": "good", "issues": "",
+    "quotes": [{ "start": 12.0, "end": 18.4, "text": "…", "speaker": "woman in a green blazer" }],
+    "moments": [{ "start": 3.0, "end": 8.5, "description": "…" }],
+    "visible_text": ["…"]
+  }
+}
+```
+
+Times in a log are seconds into the clip, so a quote is a main-track clip as
+it stands: `{ "type": "video", "src": "asset:<asset.id>", "trimStart": start,
+"duration": end - start }`. A log quotes only the strongest lines; the clip's
+transcript (`GET /api/assets/{id}/transcript`) has every word.
+
+To cut a video from a shoot: read every log (page through, or `logs=0` first
+and then the folders you need in full), choose the soundbites and the moments
+to cut away to for the brief, and write the main track. One scene filmed by
+several cameras shows up once per camera folder: use one angle, or cut between
+them. Then add titles, music and transitions as usual.
+
+`POST /api/projects/{id}/footage/sync` looks in the folders again and takes in
+files added since; a clip deleted from the project stays out.
+`POST /api/projects/{id}/footage/retry` puts every failed import and log back
+in line. `DELETE /api/projects/{id}` deletes the footage a batch at a time: a
+`202 { remaining }` means call it again.
+
 ## API
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET  | `/api/assets` | List uploaded media |
+| GET  | `/api/assets` | List uploaded media; `?project={id}` adds that project's footage from Drive |
 | POST | `/api/assets` | Upload one file into app storage (multipart, field `file`) → the asset |
 | POST | `/api/assets/uploads` | `{ name, size, type?, duration? }` opens a resumable upload of a video on the media service → `{ uid, upload_url }` (503 `media_unavailable` in local dev) |
 | POST | `/api/assets/media` | `{ uid }` adds a finished upload to the library → the asset |
@@ -61,11 +131,16 @@ back as `folders`); a search looks inside that folder only, never the subtree.
 | PUT  | `/api/drive/folder` | `{ folderId }` limits browsing to one folder, `null` clears it |
 | GET  | `/api/projects` | List projects |
 | GET  | `/api/projects/{id}` | Get one (includes the `edl` document and `brief`) |
-| POST | `/api/projects` | Create `{ name, brief?, edl? }` (empty 720p timeline if omitted) |
+| POST | `/api/projects` | Create `{ name, brief?, edl? }` (empty 720p timeline if omitted), or `{ folder, name?, brief?, language? }` from a Drive folder |
+| GET  | `/api/projects/{id}/footage` | The project's footage from Drive and each clip's log; moves the import and logging on → `{ counts, items, next_offset, imports_paused, logging_paused }` |
+| GET  | `/api/projects/{id}/footage/{clipId}` | One clip with its full log |
+| POST | `/api/projects/{id}/footage/folders` | `{ url, language? }` adds a Drive folder shared with the link |
+| POST | `/api/projects/{id}/footage/sync` | Takes in files added to the folders since → `{ added }` |
+| POST | `/api/projects/{id}/footage/retry` | Puts failed imports and logs back in line → `{ imports, logs }` |
 | PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
 | POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied }` |
-| DELETE | `/api/projects/{id}` | Delete a project and its export history |
+| DELETE | `/api/projects/{id}` | Delete a project, its export history and its footage from Drive; `202 { remaining }` means call again |
 | POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job, `status: "exporting"` |
 | GET  | `/api/exports/{id}` | One export; read it until it is no longer `exporting` |
 | GET  | `/api/exports?project_id={id}` | Export history |
@@ -343,6 +418,8 @@ link gets a new address.
 
 1. Get the purpose and set it as the project's `brief` (ask if you don't know).
 2. `GET /api/assets` to see the user's footage, or upload what they sent you.
+   A shoot in a shared Drive folder: create the project from the folder, wait
+   for the logs, and choose from them (see "Footage from a Drive folder").
 3. Several raw clips: `POST /api/projects/{id}/autocut`. One clip: analyze it,
    then write the main track from the keep segments.
 4. Adjust with read → transform → `PUT`, fixing anything validation points at.
