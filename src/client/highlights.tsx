@@ -195,6 +195,22 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
     [id],
   );
 
+  // A person's correction: who says it, as they know it ("Name, Title").
+  const setSpeaker = useCallback(
+    async (h: Highlight, speaker: string) => {
+      if (speaker.trim() === h.speaker) return;
+      setItems((prev) => prev.map((x) => (x.id === h.id ? { ...x, speaker: speaker.trim() } : x)));
+      try {
+        const updated = await api.send<Highlight>("PATCH", `/api/projects/${id}/highlights/${h.id}`, { speaker });
+        setItems((prev) => prev.map((x) => (x.id === h.id ? updated : x)));
+      } catch (e) {
+        setItems((prev) => prev.map((x) => (x.id === h.id ? h : x)));
+        setErr(String((e as Error).message || e));
+      }
+    },
+    [id],
+  );
+
   // Review at speed: a call moves on to the next pick.
   const decide = useCallback(
     (pick: Pick) => {
@@ -290,7 +306,9 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
                     </button>
                   )}
                 </div>
-                <div className="order-1 lg:order-2 lg:sticky lg:top-4">{current && <Viewer h={current} onPick={decide} />}</div>
+                <div className="order-1 lg:order-2 lg:sticky lg:top-4">
+                  {current && <Viewer h={current} onPick={decide} onSpeaker={(name) => setSpeaker(current, name)} />}
+                </div>
               </div>
             )}
             <SkippedClips
@@ -602,7 +620,7 @@ function PickRow({ h, selected, onSelect, onPick }: { h: Highlight; selected: bo
 }
 
 /** The selected pick, played from its in to its out. Space plays it again. */
-function Viewer({ h, onPick }: { h: Highlight; onPick: (p: Pick) => void }) {
+function Viewer({ h, onPick, onSpeaker }: { h: Highlight; onPick: (p: Pick) => void; onSpeaker: (name: string) => void }) {
   const video = useRef<HTMLMediaElement | null>(null);
   const asset = useMemo(() => asAsset({ ...h.clip }), [h.clip]);
   const range = useRef({ start: h.start, end: h.end });
@@ -657,7 +675,7 @@ function Viewer({ h, onPick }: { h: Highlight; onPick: (p: Pick) => void }) {
           ))}
       </div>
       <p className="text-body-sm text-foreground mb-1">{h.kind === "soundbite" ? `“${h.text}”` : h.text}</p>
-      {h.speaker && <p className="text-fine text-muted">{h.speaker}</p>}
+      {h.kind === "soundbite" && <SpeakerField key={h.id} value={h.speaker} onSave={onSpeaker} />}
       {h.reason && <p className="text-fine text-muted mt-1">Why: {h.reason}</p>}
       <p className="text-fine text-faint tabular-nums mt-1 mb-3">
         {h.clip.folder}/{h.clip.name} · {clock(h.start)} to {clock(h.end)}
@@ -668,6 +686,34 @@ function Viewer({ h, onPick }: { h: Highlight; onPick: (p: Pick) => void }) {
         <Kbd>↓</Kbd> move · <Kbd>Space</Kbd> play · <Kbd>U</Kbd> undo
       </p>
     </div>
+  );
+}
+
+/**
+ * Who says a soundbite. Found picks describe people as they appear; whoever
+ * knows them types the name and title here, and it goes to the exports.
+ */
+function SpeakerField({ value, onSave }: { value: string; onSave: (name: string) => void }) {
+  const [text, setText] = useState(value);
+  return (
+    <label className="block">
+      <span className="sr-only">Who says it</span>
+      <input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={() => onSave(text)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          if (e.key === "Escape") {
+            setText(value);
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        placeholder="Who says it: name, title"
+        title="Who says it. Type their name and title if you know them."
+        className="w-full -mx-1 px-1 py-0.5 rounded-xs bg-transparent text-fine text-muted hover:bg-surface-sunken focus:bg-surface-sunken focus:text-foreground outline-none"
+      />
+    </label>
   );
 }
 

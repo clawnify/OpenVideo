@@ -7,6 +7,7 @@ import {
   readHighlights,
   snapToCues,
   stamp,
+  vetSpeaker,
   type HighlightClip,
 } from "../src/server/highlights";
 import type { ClipLog } from "../src/server/footage";
@@ -174,5 +175,34 @@ describe("findHighlights", () => {
     expect(r).toEqual({ verdicts: [{ id: "c2", skip: null, highlights: [{ kind: "broll", start: 0, end: 5, text: "Two men chatting", speaker: "", score: 3, reason: "warm" }] }] });
     const body = JSON.parse((fetch.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
     expect(body.response_format.json_schema.strict).toBe(true);
+  });
+});
+
+describe("vetSpeaker", () => {
+  // A talk where nobody is named: the logger describes the speaker as seen.
+  const talk: HighlightClip = {
+    ...interview,
+    log: log({
+      summary: "A man in a red patterned shirt addresses colleagues, then draws on a whiteboard.",
+      quotes: [{ start: 21.9, end: 25.4, text: "We're actually starting to wake up.", speaker: "man in a red patterned shirt" }],
+      visible_text: ["JUST SUCCEED"],
+    }),
+    transcript: "WEBVTT\n\n1\n00:00:21.900 --> 00:00:25.400\nWe're actually starting to wake up.\n",
+  };
+
+  it("takes the logger's description of whoever says those words", () => {
+    expect(vetSpeaker("Some Famous Founder", 20.6, 25.9, talk)).toBe("man in a red patterned shirt");
+  });
+
+  it("never keeps a name the clip doesn't bear out, and keeps one it does", () => {
+    // Outside the logged quote: the model's guess has nothing in the clip behind it.
+    expect(vetSpeaker("Some Famous Founder", 40, 45, talk)).toBe("man in a red patterned shirt");
+    expect(vetSpeaker("presenter at the whiteboard", 40, 45, talk)).toBe("presenter at the whiteboard");
+    const named = { ...talk, log: { ...talk.log, visible_text: ["Ada Lovelace, CTO"] } };
+    expect(vetSpeaker("Ada Lovelace", 40, 45, named)).toBe("Ada Lovelace");
+  });
+
+  it("falls back to nothing rather than a guess when the log names no speaker", () => {
+    expect(vetSpeaker("Famous Founder", 1, 2, { ...talk, log: log({ quotes: [] }), transcript: null })).toBe("");
   });
 });
