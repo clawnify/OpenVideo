@@ -350,35 +350,67 @@ const rid = () => Math.random().toString(36).slice(2, 10);
 const assetUrl = (a: Asset) => `/api/assets/${encodeURIComponent(a.id)}/source`;
 
 /**
- * Adaptive playback for one media-service clip. The library is fetched only
- * when such a clip actually plays, and Safari needs none of it.
+ * Adaptive playback for one media-service source, picture or sound alone. It
+ * buffers from `startAt`, where the clip comes in, at a preview's size (from
+ * about 480p, never above 720p) rather than the source's 4K: the clips loading
+ * behind it share the connection, and a stage needs no more. Sound alone takes
+ * the smallest stream. The library is fetched only when such a source actually
+ * plays, and Safari needs none of it.
  */
 function MediaVideo({
   asset,
   elementRef,
+  startAt = 0,
+  as = "video",
   ...rest
 }: {
   asset: Asset;
-  elementRef: (v: HTMLVideoElement | null) => void;
+  elementRef: (v: HTMLMediaElement | null) => void;
+  /** Source seconds to buffer from first. Moving it later is the sync loop's job. */
+  startAt?: number;
+  as?: "video" | "audio";
 } & React.VideoHTMLAttributes<HTMLVideoElement>) {
-  const ref = useRef<HTMLVideoElement | null>(null);
+  const ref = useRef<HTMLMediaElement | null>(null);
+  const firstStart = useRef(startAt);
 
   useEffect(() => {
     const v = ref.current;
     if (!v) return;
     let dead = false;
     let hls: { destroy: () => void } | null = null;
+    const from = firstStart.current;
 
     (async () => {
       const play = await api.get<{ ready: boolean; hls?: string }>(`/api/assets/${asset.id}/playback`);
       if (dead || !play.ready || !play.hls) return;
       if (v.canPlayType("application/vnd.apple.mpegurl")) {
         v.src = play.hls;
+        if (from > 0) {
+          v.addEventListener("loadedmetadata", () => v.currentTime < 0.05 && (v.currentTime = from), { once: true });
+        }
         return;
       }
       const { default: Hls } = await import("hls.js");
       if (dead || !Hls.isSupported()) return;
-      const instance = new Hls({ maxBufferLength: 30 });
+      const instance = new Hls({ startPosition: from, maxBufferLength: 12, maxMaxBufferLength: 24, backBufferLength: 10 });
+      instance.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
+        const heights = data.levels.map((l) => l.height || 0);
+        // The tallest rendition at or under `h`, or the smallest there is.
+        const upTo = (h: number) => {
+          let best = -1;
+          heights.forEach((ht, i) => {
+            if (ht <= h && (best < 0 || ht > heights[best])) best = i;
+          });
+          return best >= 0 ? best : heights.indexOf(Math.min(...heights));
+        };
+        if (as === "audio") {
+          instance.autoLevelCapping = upTo(0);
+          instance.startLevel = upTo(0);
+        } else {
+          instance.autoLevelCapping = upTo(720);
+          instance.startLevel = upTo(480);
+        }
+      });
       instance.loadSource(play.hls);
       instance.attachMedia(v);
       hls = instance;
@@ -390,18 +422,56 @@ function MediaVideo({
       dead = true;
       hls?.destroy();
     };
-  }, [asset.id]);
+  }, [asset.id, as]);
 
-  return (
-    <video
-      ref={(v) => {
-        ref.current = v;
-        elementRef(v);
-      }}
-      {...rest}
-    />
+  const attach = (m: HTMLMediaElement | null) => {
+    ref.current = m;
+    elementRef(m);
+  };
+  return as === "audio" ? (
+    <audio ref={attach} {...(rest as React.AudioHTMLAttributes<HTMLAudioElement>)} />
+  ) : (
+    <video ref={attach} {...rest} />
   );
 }
+
+/** Whether `at` lies inside what the element has loaded, with a little to spare. */
+function isBuffered(m: HTMLMediaElement, at: number): boolean {
+  for (let i = 0; i < m.buffered.length; i++) {
+    if (at >= m.buffered.start(i) && at <= m.buffered.end(i) - 0.25) return true;
+  }
+  return false;
+}
+
+/**
+ * Keep a medium that follows the clock (sound, a cutaway, the other side of a
+ * transition) in step with it. A small drift is closed by playing a touch
+ * faster or slower, which keeps the buffer; only a real gap is worth a seek,
+ * because each seek empties it.
+ */
+function follow(m: HTMLMediaElement, wanted: number, playing: boolean) {
+  const drift = m.currentTime - wanted;
+  if (!playing) {
+    if (Math.abs(drift) > 0.04 && !m.seeking) m.currentTime = wanted;
+    if (m.playbackRate !== 1) m.playbackRate = 1;
+    return;
+  }
+  // Starting up takes a beat, so a voice comes in a little behind its
+  // picture. Where the data is already here, jumping costs nothing: do that
+  // rather than take seconds to catch up.
+  if (Math.abs(drift) > 0.4 || (Math.abs(drift) > 0.08 && isBuffered(m, wanted))) {
+    if (!m.seeking) m.currentTime = wanted;
+    if (m.playbackRate !== 1) m.playbackRate = 1;
+  } else {
+    // At most 5% either way: enough to close a cut's few hundredths in a
+    // second or two, too little to hear on music.
+    const rate = Math.abs(drift) > 0.05 ? Math.min(1.05, Math.max(0.95, 1 - drift)) : 1;
+    if (Math.abs(m.playbackRate - rate) > 0.005) m.playbackRate = rate;
+  }
+}
+
+/** How long the preview waits for a source to load before playing on without it. */
+const MAX_HOLD_S = 6;
 
 /** A frame of media-service footage, which beats decoding the video for one. */
 const frameUrl = (a: Pick<Asset, "id">, at = 0) => `/api/assets/${encodeURIComponent(a.id)}/frame?t=${Math.max(0, at).toFixed(1)}`;
@@ -999,6 +1069,10 @@ export function EditEditor({
   // seeking the video to match made every rebuffer force a seek, which
   // rebuffered again — the stutter people saw on long footage.
   const mediaClock = useRef<(() => number | null) | null>(null);
+  // Whether everything due at the playhead can play now (filled by the Player),
+  // and whether the clock is holding for it.
+  const mediaReady = useRef<(() => boolean) | null>(null);
+  const [waiting, setWaiting] = useState(false);
   const { srcDur, resolveAsset } = useSourceDurations(edl, assets);
 
   // ── persistence (debounced) ───────────────────────────────────────────────
@@ -1136,12 +1210,36 @@ export function EditEditor({
 
   // Master clock — drives the playhead state (media elements sync in Player).
   useEffect(() => {
-    if (!playing) return;
+    if (!playing) {
+      setWaiting(false);
+      return;
+    }
     let raf = 0;
     let last = performance.now();
+    let held = 0;
+    let holding = false;
+    const hold = (on: boolean) => {
+      if (on !== holding) {
+        holding = on;
+        setWaiting(on);
+      }
+    };
     const tick = (now: number) => {
       const dt = (now - last) / 1000;
       last = now;
+      // Hold while something due now is still loading: picture, sound and
+      // titles wait together, where running on let the picture fall behind
+      // the music and jump to catch up. A source that never loads (an error)
+      // is given up on after a few seconds rather than stopping playback.
+      const ready = mediaReady.current?.() ?? true;
+      if (!ready && held < MAX_HOLD_S) {
+        held += dt;
+        hold(true);
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      if (ready) held = 0;
+      hold(false);
       const fromMedia = mediaClock.current?.();
       let t = fromMedia !== null && fromMedia !== undefined && Number.isFinite(fromMedia)
         ? fromMedia
@@ -1411,6 +1509,8 @@ export function EditEditor({
           playhead={playhead}
           playheadRef={playheadRef}
           mediaClock={mediaClock}
+          mediaReady={mediaReady}
+          waiting={waiting}
           captions={captionLayer}
           playing={playing}
           resolveAsset={resolveAsset}
@@ -2880,6 +2980,8 @@ function Player({
   playhead,
   playheadRef,
   mediaClock,
+  mediaReady,
+  waiting,
   captions,
   playing,
   resolveAsset,
@@ -2895,6 +2997,10 @@ function Player({
   playheadRef: React.MutableRefObject<number>;
   /** Filled here so the master clock can follow the playing video. */
   mediaClock: React.MutableRefObject<(() => number | null) | null>;
+  /** Filled here: whether everything due at the playhead can play now. The clock waits until it can. */
+  mediaReady: React.MutableRefObject<(() => boolean) | null>;
+  /** The clock is holding for media to load: everything stays paused where it is. */
+  waiting: boolean;
   /** The project's captions, already laid onto the timeline, or null when off. */
   captions: { lines: CaptionLine[]; style: CaptionStyle } | null;
   playing: boolean;
@@ -2912,8 +3018,22 @@ function Player({
   // the frame was clipped.
   const [fit, setFit] = useState({ w: 0, h: 0, scale: 1 });
   const scale = fit.scale;
-  const videoRefs = useRef(new Map<string, HTMLVideoElement>());
-  const audioRefs = useRef(new Map<string, HTMLAudioElement>());
+  const videoRefs = useRef(new Map<string, HTMLMediaElement>());
+  const overlayRefs = useRef(new Map<string, HTMLMediaElement>());
+  const audioRefs = useRef(new Map<string, HTMLMediaElement>());
+  /** A ref callback that keeps `map` to the elements actually mounted. */
+  const keep = (map: Map<string, HTMLMediaElement>, id: string) => (m: HTMLMediaElement | null) => {
+    if (m) map.set(id, m);
+    else map.delete(id);
+  };
+  // Media is mounted from just behind the playhead to a few seconds ahead of
+  // it, not all at once: a clip has its first seconds buffered before its cut
+  // comes up, and only a handful of sources share the connection at a time.
+  // Everything mounted all at once had the clip about to play queue behind
+  // twenty others, so it started late and the cut fell out of step.
+  const AHEAD = 8;
+  const BEHIND = 1;
+  const near = (from: number, to: number) => to > playhead - BEHIND && from < playhead + AHEAD;
 
   useEffect(() => {
     const box = boxRef.current;
@@ -3004,9 +3124,52 @@ function Player({
     };
   }, [mediaClock]);
 
-  // Sync media elements to the master clock (drift-corrected seeks).
+  // What must be able to play at the playhead for the preview to carry on in
+  // step: the clip on screen (both, in a transition), the cutaways showing,
+  // and the sound heard there. The clock waits for these rather than running
+  // on while one of them is still loading.
+  // Shown only when a wait lasts: most are a frame or two.
+  const [showWait, setShowWait] = useState(false);
+  useEffect(() => {
+    if (!waiting) {
+      setShowWait(false);
+      return;
+    }
+    const timer = setTimeout(() => setShowWait(true), 300);
+    return () => clearTimeout(timer);
+  }, [waiting]);
+  const dueRef = useRef<() => HTMLMediaElement[]>(() => []);
+  dueRef.current = () => {
+    const out: (HTMLMediaElement | undefined)[] = [];
+    for (const seg of segments) if (seg.el.type === "video" && live(seg)) out.push(videoRefs.current.get(seg.el.id));
+    for (const track of edl.overlays ?? []) {
+      if (track.hidden) continue;
+      for (const el of track.elements) {
+        if (el.type === "video" && playhead >= el.startTime && playhead < el.startTime + el.duration) out.push(overlayRefs.current.get(el.id));
+      }
+    }
+    for (const track of edl.audio ?? []) {
+      if (track.muted) continue;
+      for (const el of track.elements) {
+        const dur = el.duration ?? Math.max(0, (durCache.get(el.src) ?? 0) - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
+        if (playhead >= el.startTime && playhead < el.startTime + dur) out.push(audioRefs.current.get(el.id));
+      }
+    }
+    // Not mounted yet counts as not ready: a stand-in that never loads.
+    return out.map((m) => m ?? ({ readyState: 0, seeking: false } as HTMLMediaElement));
+  };
+  useEffect(() => {
+    mediaReady.current = () => dueRef.current().every((m) => m.readyState >= 3 && !m.seeking);
+    return () => {
+      mediaReady.current = null;
+    };
+  }, [mediaReady]);
+
+  // Sync media elements to the master clock.
   useEffect(() => {
     const t = playhead;
+    // Waiting for media to load, everything holds where it is, together.
+    const going = playing && !waiting;
     for (const seg of segments) {
       const v = videoRefs.current.get(seg.el.id);
       if (!v || seg.el.type !== "video") continue;
@@ -3021,20 +3184,46 @@ function Player({
         // Playing, the video leads and needs no correction; only a real jump
         // (a scrub, or a cut to another clip) is worth a seek, because each
         // one empties the buffer. Paused, follow the playhead closely.
-        const jumped = Math.abs(v.currentTime - wanted) > (playing && !hold ? 0.75 : 0.05);
-        if (jumped && !v.seeking) v.currentTime = wanted;
+        if (seg === active) {
+          // The clip the clock follows needs no correction while it plays.
+          const jumped = Math.abs(v.currentTime - wanted) > (going && !hold ? 0.75 : 0.05);
+          if (jumped && !v.seeking) v.currentTime = wanted;
+        } else {
+          follow(v, wanted, going && !hold);
+        }
         v.volume = Math.min(1, Math.min(1, seg.el.volume ?? 1) * fadeGain(seg.el, seg.dur, t - seg.start) * crossGain(seg));
         v.muted = seg.el.sourceAudio === false;
-        if (playing && !hold && v.paused) v.play().catch(() => {});
-        if ((!playing || hold) && !v.paused) v.pause();
+        if (going && !hold && v.paused) v.play().catch(() => {});
+        if ((!going || hold) && !v.paused) v.pause();
       } else {
         if (!v.paused) v.pause();
         // The clip after the active one waits where it will start playing: its
         // first frame, or as far before it as its transition in reaches. A clip
         // that starts where it was last left, within the seek tolerance above,
         // runs ahead of the clock, and the playhead jumps when it takes over.
+        // Every clip mounted ahead waits there, not only the next one: a
+        // montage of one-second shots has several cuts inside the look-ahead.
         const first = Math.max(0, (seg.el.trimStart ?? 0) - seg.before);
-        if (active && seg.i === active.i + 1 && !v.seeking && Math.abs(v.currentTime - first) > 0.05) v.currentTime = first;
+        if (seg.start > t && !v.seeking && Math.abs(v.currentTime - first) > 0.05) v.currentTime = first;
+      }
+    }
+    // Cutaways and other video laid over the cut: they play, in step, as in
+    // the export. Their own sound is not part of the cut.
+    for (const track of edl.overlays ?? []) {
+      for (const el of track.elements) {
+        if (el.type !== "video") continue;
+        const v = overlayRefs.current.get(el.id);
+        if (!v) continue;
+        v.muted = true;
+        const showing = !track.hidden && t >= el.startTime && t < el.startTime + el.duration;
+        if (showing) {
+          follow(v, (el.trimStart ?? 0) + (t - el.startTime), going);
+          if (going && v.paused) v.play().catch(() => {});
+          if (!going && !v.paused) v.pause();
+        } else {
+          if (!v.paused) v.pause();
+          if (el.startTime > t && !v.seeking && Math.abs(v.currentTime - (el.trimStart ?? 0)) > 0.05) v.currentTime = el.trimStart ?? 0;
+        }
       }
     }
     for (const [ti, track] of (edl.audio ?? []).entries()) {
@@ -3044,17 +3233,22 @@ function Player({
         const dur = el.duration ?? Math.max(0, (durCache.get(el.src) ?? 0) - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
         const inWindow = t >= el.startTime && t < el.startTime + dur;
         const wanted = (el.trimStart ?? 0) + (t - el.startTime);
-        if (inWindow && playing && !track.muted) {
-          if (Math.abs(a.currentTime - wanted) > 0.25) a.currentTime = wanted;
+        if (inWindow && !track.muted) {
+          follow(a, wanted, going);
           // The export's afade envelope, so fades sound in the preview as they will in the file.
           const gain = fadeGain(el, heardFor(el.startTime, dur, cutLength), t - el.startTime);
           a.volume = Math.min(1, el.volume ?? 1) * gain;
-          if (a.paused) a.play().catch(() => {});
-        } else if (!a.paused) a.pause();
+          if (going && a.paused) a.play().catch(() => {});
+          if (!going && !a.paused) a.pause();
+        } else {
+          if (!a.paused) a.pause();
+          // Waiting at its in-point, ready for when it comes in.
+          if (el.startTime > t && !a.seeking && Math.abs(a.currentTime - (el.trimStart ?? 0)) > 0.05) a.currentTime = el.trimStart ?? 0;
+        }
       }
       void ti;
     }
-  }, [playhead, playing, segments, active, blend?.to, edl.audio]);
+  }, [playhead, playing, waiting, segments, active, blend?.to, edl.audio, edl.overlays]);
 
   // Drag overlays on the stage (position as canvas fractions).
   const dragOverlay = (ti: number, i: number) => (e: React.PointerEvent) => {
@@ -3159,6 +3353,7 @@ function Player({
           {segments.map((seg) => {
             const a = resolveAsset(seg.el.src);
             if (!a) return null;
+            if (!near(seg.start - seg.before, seg.start + seg.dur + 1)) return null;
             const visible = live(seg);
             const look = layerLook(seg);
             const effect = look && ((blend?.look.blurBox ?? 0) > 1 || (blend?.look.block ?? 0) * scale >= 1) ? `url(#${filterId})` : undefined;
@@ -3202,9 +3397,10 @@ function Player({
                     <MediaVideo
                       key={seg.el.id}
                       asset={a}
-                      elementRef={(v) => {
-                        if (v) videoRefs.current.set(seg.el.id, v);
-                      }}
+                      elementRef={keep(videoRefs.current, seg.el.id)}
+                      startAt={Math.max(0, (seg.el.trimStart ?? 0) - seg.before)}
+                      // Its first frame, on screen before the stream has one.
+                      poster={frameUrl(a, seg.el.trimStart ?? 0)}
                       preload="auto"
                       playsInline
                       {...common}
@@ -3212,9 +3408,7 @@ function Player({
                   ) : (
                     <video
                       key={seg.el.id}
-                      ref={(v) => {
-                        if (v) videoRefs.current.set(seg.el.id, v);
-                      }}
+                      ref={keep(videoRefs.current, seg.el.id)}
                       src={assetUrl(a)}
                       preload="auto"
                       playsInline
@@ -3253,7 +3447,9 @@ function Player({
               ? null
               : track.elements.map((el, i) => {
                   const show = playhead >= el.startTime && playhead < el.startTime + el.duration;
-                  if (!show) return null;
+                  // A video is mounted a few seconds early, hidden, so it is
+                  // loaded and waiting at its in-point when its moment comes.
+                  if (!show && !(el.type === "video" && near(el.startTime, el.startTime + el.duration))) return null;
                   const selected = sel?.area === "ovl" && sel.ti === ti && sel.i === i;
                   if (el.type === "text") {
                     return (
@@ -3270,6 +3466,13 @@ function Player({
                   const m = el as OverlayMedia;
                   const a = resolveAsset(m.src);
                   if (!a) return null;
+                  // Streamed when it lives on the media service, like a clip on the main track.
+                  const overlayVideo = (props: React.VideoHTMLAttributes<HTMLVideoElement>) =>
+                    a.media_uid ? (
+                      <MediaVideo asset={a} elementRef={keep(overlayRefs.current, m.id)} startAt={m.trimStart ?? 0} preload="auto" playsInline muted {...props} />
+                    ) : (
+                      <video ref={keep(overlayRefs.current, m.id)} src={assetUrl(a)} preload="auto" playsInline muted {...props} />
+                    );
                   const shape = m.crop ? shapeFor(a) : undefined;
                   if (shape && m.crop) {
                     const kept = croppedShape(shape, m.crop);
@@ -3285,12 +3488,13 @@ function Player({
                           width: `${m.width * 100}%`,
                           aspectRatio: `${kept.width} / ${kept.height}`,
                           opacity: overlayOpacity(m),
+                          display: show ? undefined : "none",
                         }}
                       >
                         {m.type === "image" ? (
                           <img src={assetUrl(a)} className="absolute max-w-none pointer-events-none" style={pct(source)} />
                         ) : (
-                          <video src={assetUrl(a)} muted className="absolute max-w-none pointer-events-none" style={{ ...pct(source), objectFit: "fill" }} />
+                          overlayVideo({ className: "absolute max-w-none pointer-events-none", style: { ...pct(source), objectFit: "fill" } })
                         )}
                       </div>
                     );
@@ -3300,38 +3504,46 @@ function Player({
                       key={el.id}
                       onPointerDown={dragOverlay(ti, i)}
                       className={`absolute cursor-move ${selected ? "outline outline-2 outline-ring" : ""}`}
-                      style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: overlayOpacity(m) }}
+                      style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: overlayOpacity(m), display: show ? undefined : "none" }}
                     >
                       {m.type === "image" ? (
                         <img src={assetUrl(a)} onLoad={noteSize(a.id)} className="w-full h-auto pointer-events-none" />
                       ) : (
-                        <video src={assetUrl(a)} onLoadedMetadata={noteSize(a.id)} muted className="w-full h-auto pointer-events-none" />
+                        overlayVideo({ onLoadedMetadata: noteSize(a.id), className: "w-full h-auto pointer-events-none" })
                       )}
                     </div>
                   );
                 }),
           )}
 
-          {/* audio elements live off-stage */}
+          {/* audio elements live off-stage, mounted as they come near */}
           {(edl.audio ?? []).flatMap((track) =>
             track.elements.map((el) => {
               const a = resolveAsset(el.src);
-              return a ? (
-                <audio
-                  key={el.id}
-                  ref={(n) => {
-                    if (n) audioRefs.current.set(el.id, n);
-                  }}
-                  src={assetUrl(a)}
-                  preload="auto"
-                />
-              ) : null;
+              if (!a) return null;
+              const dur = el.duration ?? Math.max(0, (durCache.get(el.src) ?? 0) - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
+              if (!near(el.startTime, el.startTime + (dur || 1))) return null;
+              // Sound taken from footage on the media service: its stream, not
+              // the camera file (a 45-minute interview is 20 GB).
+              return a.media_uid ? (
+                <MediaVideo key={el.id} as="audio" asset={a} elementRef={keep(audioRefs.current, el.id)} startAt={el.trimStart ?? 0} preload="auto" />
+              ) : (
+                <audio key={el.id} ref={keep(audioRefs.current, el.id)} src={assetUrl(a)} preload="auto" />
+              );
             }),
           )}
 
           {total === 0 && (
             <div className="absolute inset-0 grid place-items-center px-6 text-center text-body-sm text-faint">
               Add clips from the Media panel to start the cut
+            </div>
+          )}
+          {showWait && (
+            <div
+              role="status"
+              className="absolute top-2 right-2 flex items-center gap-1.5 rounded-xs bg-foreground/70 px-2 py-1 text-fine text-on-primary pointer-events-none"
+            >
+              <Loader2 className="w-3.5 h-3.5 animate-spin" /> Buffering
             </div>
           )}
         </div>
@@ -3929,7 +4141,7 @@ function CropDialog({
                 asset.media_uid ? (
                   <MediaVideo
                     asset={asset}
-                    elementRef={(v) => (videoRef.current = v)}
+                    elementRef={(v) => (videoRef.current = v as HTMLVideoElement | null)}
                     onLoadedMetadata={(e) => {
                       e.currentTarget.currentTime = t;
                       noteSize(e);
