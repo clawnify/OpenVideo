@@ -72,6 +72,7 @@ import {
   ChevronRight,
   Crop as CropIcon,
   Cloud,
+  Download,
   Film,
   Folder,
   Image as ImageIcon,
@@ -2038,7 +2039,7 @@ function FootageRow({
               <Film className="w-3.5 h-3.5" />
             )}
           </div>
-          <div className={`min-w-0 flex-1 text-fine text-foreground break-all line-clamp-2 ${asset ? "pr-5" : ""}`}>{label}</div>
+          <div className="min-w-0 flex-1 text-fine text-foreground break-words line-clamp-2">{label}</div>
         </div>
         <div className={`mt-0.5 text-fine line-clamp-2 ${failed ? "text-danger" : "text-muted"}`}>
           {item.log && (
@@ -2051,10 +2052,11 @@ function FootageRow({
         </div>
       </button>
       {asset && (
+        // On the thumbnail, so it takes no width from the name beside it.
         <button
           onClick={() => onDelete(asset)}
           data-hover-only
-          className="absolute right-1 top-1 grid place-items-center w-6 h-6 rounded-xs text-faint hover:text-danger hover:bg-danger-tint opacity-0 transition-opacity group-hover/tile:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+          className="absolute left-1 top-1 grid place-items-center w-6 h-6 rounded-xs bg-surface/90 text-muted hover:text-danger hover:bg-danger-tint opacity-0 transition-opacity group-hover/tile:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
           aria-label={`Delete ${item.name} from this project`}
           title="Delete from this project"
         >
@@ -4898,9 +4900,23 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
   const [quality, setQuality] = useState("standard");
   const [busy, setBusy] = useState(false);
   const [last, setLast] = useState<ExportJob | null>(null);
+  // The newest finished export. Its file stays one tap away while a newer
+  // export runs, and after one fails: showing only the newest export hid every
+  // finished file behind a single failed attempt.
+  const [done, setDone] = useState<ExportJob | null>(null);
+  const settle = useCallback((job: ExportJob) => {
+    setLast(job);
+    if (job.status === "completed" && job.output_url) setDone(job);
+  }, []);
 
   useEffect(() => {
-    api.get<ExportJob[]>(`/api/exports?project_id=${projectId}`).then((j) => setLast(j[0] ?? null)).catch(() => {});
+    api
+      .get<ExportJob[]>(`/api/exports?project_id=${projectId}`)
+      .then((j) => {
+        setLast(j[0] ?? null);
+        setDone(j.find((x) => x.status === "completed" && x.output_url) ?? null);
+      })
+      .catch(() => {});
   }, [projectId]);
 
   // The render runs in the background on the edit service, and each read of
@@ -4916,7 +4932,7 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
       timer = setTimeout(async () => {
         const job = await api.get<ExportJob>(`/api/exports/${exporting}`).catch(() => null);
         if (stop) return;
-        if (job && job.status !== "exporting") setLast(job);
+        if (job && job.status !== "exporting") settle(job);
         else tick();
       }, 3000);
     };
@@ -4925,7 +4941,7 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
       stop = true;
       clearTimeout(timer);
     };
-  }, [exporting]);
+  }, [exporting, settle]);
 
   const run = async () => {
     setBusy(true);
@@ -4935,7 +4951,7 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
         `/api/projects/${projectId}/export`,
         { quality },
       );
-      setLast(job);
+      settle(job);
     } catch (e) {
       setLast({ id: 0, project_id: projectId, status: "failed", output_url: null, error: String((e as Error).message), duration: null, created_at: "" });
     } finally {
@@ -4945,14 +4961,20 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
 
   return (
     <div className="flex items-center gap-2">
-      {last?.status === "completed" && last.output_url && (
-        <a
-          href={last.output_url}
-          target="_blank"
-          className="hidden sm:inline text-body-sm text-link underline decoration-border underline-offset-2"
-        >
-          Last export ↗
-        </a>
+      {done?.output_url && (
+        <>
+          <a
+            href={done.output_url}
+            target="_blank"
+            className="hidden sm:inline text-body-sm text-link underline decoration-border underline-offset-2"
+          >
+            Last export ↗
+          </a>
+          {/* Phones too: the toolbar has room for an icon, not the words. */}
+          <a href={done.output_url} target="_blank" className={`${btnIcon} sm:hidden`} aria-label="Download the last export" title="Last export">
+            <Download className="w-4 h-4" />
+          </a>
+        </>
       )}
       {/* A failure is data that happens to be alarming: danger TEXT, not a pill. */}
       {last?.status === "failed" && (

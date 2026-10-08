@@ -494,19 +494,30 @@ export async function stepFootage(cfg: MediaConfig, projectId: string): Promise<
   return out;
 }
 
-/** Check the Drive file serves video, then have the media service pull it. */
+const DRIVE_QUOTA =
+  "Google Drive's download limit for this file is used up for today: it resets within a day, so retry it then. A copy of the file in Drive has its own limit";
+
+/**
+ * Check the Drive file serves video, then have the media service pull it.
+ *
+ * The check asks exactly as the media service will: the whole file, no Range
+ * header, closed once the headers are in. A file over Drive's daily download
+ * limit still answers a ranged request with video, but the whole file with
+ * its "Quota exceeded" page, so a ranged check passes a file the import then
+ * fails on, and that failed import still counts against the plan.
+ */
 async function startImport(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWide: boolean; detail: string }> {
   const url = directDownloadUrl(r.drive_file_id);
-  const probe = await fetch(url, { headers: { Range: "bytes=0-1" }, redirect: "follow" }).catch(() => null);
+  const probe = await fetch(url, { redirect: "follow" }).catch(() => null);
   if (!probe) return { orgWide: true, detail: "Google Drive could not be reached" };
-  const verdict = judgeLinkResponse(
-    probe.status,
-    probe.headers.get("content-type"),
-    probe.headers.get("content-range"),
-    probe.headers.get("content-length"),
-  );
-  await probe.body?.cancel();
-  if (!verdict.ok) return { orgWide: false, detail: verdict.reason ?? "that file isn't a video" };
+  const served = probe.headers.get("content-type");
+  // A page is a few KB, and its title says which page it is.
+  const page = served?.startsWith("text/") ? (await probe.text().catch(() => "")).slice(0, 8000) : "";
+  if (!page) await probe.body?.cancel();
+  const verdict = judgeLinkResponse(probe.status, served, probe.headers.get("content-range"), probe.headers.get("content-length"));
+  if (!verdict.ok) {
+    return { orgWide: false, detail: /<title>[^<]*quota exceeded/i.test(page) ? DRIVE_QUOTA : (verdict.reason ?? "that file isn't a video") };
+  }
 
   const imported = await importMedia(cfg, url, r.name);
   if ("failure" in imported) {
