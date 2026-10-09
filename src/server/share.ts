@@ -67,19 +67,31 @@ ${body}
 </html>`;
 }
 
-/** The player: the project's name, its latest export, and a download button. */
-export function sharePage(name: string, videoUrl: string): string {
+/**
+ * The player: the project's name, its pinned export, and a download button.
+ * `posterUrl` (absolute, or null when the export has no poster frame) is the
+ * link preview: og:image for most chat apps, and the large card on X. X's
+ * twitter:image and twitter:title are set too rather than trusting its
+ * Open Graph fallback, which its docs (unreachable when this was written)
+ * could not confirm.
+ */
+export function sharePage(name: string, videoUrl: string, posterUrl: string | null = null): string {
   const n = esc(name);
+  const image = posterUrl
+    ? `<meta property="og:image" content="${esc(posterUrl)}">\n<meta property="og:image:type" content="image/jpeg">\n` +
+      `<meta property="og:image:alt" content="A frame from ${n}">\n<meta name="twitter:card" content="summary_large_image">\n` +
+      `<meta name="twitter:title" content="${n}">\n<meta name="twitter:image" content="${esc(posterUrl)}">\n`
+    : "";
   return page(
     name,
     `<main>
-  <video src="${esc(videoUrl)}" controls playsinline preload="metadata"></video>
+  <video src="${esc(videoUrl)}"${posterUrl ? ` poster="${esc(posterUrl)}"` : ""} controls playsinline preload="metadata"></video>
   <div class="bar">
     <h1>${n}</h1>
     <a class="btn" href="${esc(videoUrl)}&amp;download" download>Download</a>
   </div>
 </main>`,
-    `<meta property="og:title" content="${n}">\n<meta property="og:type" content="video.other">\n`,
+    `<meta property="og:title" content="${n}">\n<meta property="og:type" content="video.other">\n${image}`,
   );
 }
 
