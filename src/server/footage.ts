@@ -320,6 +320,18 @@ export interface DriveSource {
   remove(fileId: string): Promise<void>;
 }
 
+/**
+ * Delete a copy made in the connected account. True once it is gone (one
+ * already deleted counts); false keeps it on the row, so the next try deletes
+ * it instead of forgetting a file that is still shared with the link.
+ */
+export async function removeCopy(drive: DriveSource, fileId: string): Promise<boolean> {
+  return drive.remove(fileId).then(
+    () => true,
+    (e: unknown) => /not.?found|404/i.test(String(e)),
+  );
+}
+
 export interface StepOptions {
   /** Import through the org's Drive connection; the shared link stays the fallback. */
   drive?: DriveSource;
@@ -375,8 +387,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
       [projectId],
     );
     for (const d of done) {
-      await opts.drive.remove(d.copy_id).catch(() => {});
-      await setRow(d.id, { copy_id: null });
+      if (await removeCopy(opts.drive, d.copy_id)) await setRow(d.id, { copy_id: null });
     }
   }
   const rows = await query<WorkRow>(
@@ -632,7 +643,12 @@ async function startImport(
       if ("url" in got) return importFrom(cfg, r, got.url, got.mimeType.startsWith("video/") ? got.mimeType : "video/mp4", 0);
       await setRow(r.id, { link_only: 1 });
     }
-    if (r.copy_id) await drive.remove(r.copy_id).catch(() => {});
+    if (r.copy_id) {
+      // The copy from an earlier try makes way for a fresh one. One that
+      // can't be deleted is imported from again rather than left behind.
+      if (!(await removeCopy(drive, r.copy_id))) return importFrom(cfg, r, directDownloadUrl(r.copy_id), "video/mp4", 0);
+      await setRow(r.id, { copy_id: null });
+    }
     const copy = await drive.copy(r.drive_file_id, r.name).catch((e: unknown) => ({ error: String(e) }));
     if ("fileId" in copy) {
       await setRow(r.id, { copy_id: copy.fileId });

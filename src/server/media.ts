@@ -213,6 +213,12 @@ export async function mediaFacts(
   return { fps: rates.length ? Math.max(...rates) : null, width: state.media.width, height: state.media.height };
 }
 
+/**
+ * Delete a video on the media service. One already gone counts as deleted.
+ * Any other refusal throws: the caller keeps its row and tries again, rather
+ * than forgetting a copy that still counts against the org's storage.
+ */
 export async function deleteMedia(cfg: MediaConfig, uid: string): Promise<void> {
-  await call(cfg, `/${uid}`, { method: "DELETE" });
+  const res = await call(cfg, `/${uid}`, { method: "DELETE" });
+  if ("failure" in res && res.failure.error !== "not_found") throw new Error(res.failure.detail);
 }

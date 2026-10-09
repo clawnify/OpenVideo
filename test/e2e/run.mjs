@@ -110,7 +110,14 @@ globalThis.fetch = async (input, init = {}) => {
     }
     let m = /^\/media\/([0-9a-f]{32})$/.exec(u.pathname);
     if (m && method === "DELETE") {
-      world.media.get(m[1]).deleted = true;
+      if (world.refuseMediaDeletes > 0) {
+        world.refuseMediaDeletes--;
+        (world.refusedDeletes ??= []).push(m[1]);
+        return json(503, { error: "media_failed", detail: "storage is busy" });
+      }
+      const v = world.media.get(m[1]);
+      if (!v || v.deleted) return json(404, { error: "not_found" });
+      v.deleted = true;
       return new Response(null, { status: 204 });
     }
     if (m) {
@@ -280,13 +287,18 @@ setDrive([fileEntry(fid("b3"), "B_0003.MP4")]);
 r = await call("POST", `/api/projects/${pid}/footage/sync`);
 assert.equal(r.data.added, 1, JSON.stringify(r.data));
 const firstAsset = f.items[0].asset.id;
+world.refuseMediaDeletes = 1;
+r = await call("DELETE", `/api/assets/${firstAsset}`);
+assert.equal(r.status, 502, "a copy the service would not delete is not reported deleted");
+assert.match(r.data.detail, /could not be deleted/);
+assert.ok(db.prepare("SELECT 1 FROM assets WHERE id = ?").get(firstAsset), "the asset stays, to be deleted again");
 r = await call("DELETE", `/api/assets/${firstAsset}`);
 assert.equal(r.status, 200);
 r = await call("POST", `/api/projects/${pid}/footage/sync`);
 assert.equal(r.data.added, 0, "a removed clip is not brought back");
 f = await statuses();
 assert.equal(f.counts.total, 4, "the removed clip is not listed");
-console.log("5 ok: sync adds new files, removed clips stay out");
+console.log("5 ok: sync adds new files, removed clips stay out; a refused copy delete keeps the asset");
 
 // 6. An org-wide refusal pauses imports and leaves the clip in line.
 for (let i = 0; i < 8 && f.counts.logged < 4; i++) f = await statuses();
@@ -563,17 +575,22 @@ console.log("11f ok: a clip logged later is read by itself");
 // 10. Deleting the project deletes its footage, a batch at a time.
 const stmt = db.prepare("INSERT INTO project_footage (project_id, drive_file_id, name, folder) VALUES (?, ?, ?, 'Bulk')");
 for (let i = 0; i < 150; i++) stmt.run(pid, `bulk${i}`, `bulk${i}.mp4`);
+world.refuseMediaDeletes = 1;
 r = await call("DELETE", `/api/projects/${pid}`);
 assert.equal(r.status, 202, JSON.stringify(r.data));
 assert.ok(r.data.remaining > 0);
+const refusedUid = world.refusedDeletes.at(-1);
+const kept = db.prepare("SELECT f.id FROM project_footage f JOIN assets a ON a.id = f.asset_id WHERE a.media_uid = ?").get(refusedUid);
+assert.ok(kept, "the clip whose copy the service would not delete is kept for the next call");
 r = await call("DELETE", `/api/projects/${pid}`);
 assert.equal(r.status, 200, JSON.stringify(r.data));
 assert.equal(db.prepare("SELECT COUNT(*) AS n FROM project_footage").get().n, 0);
 assert.equal(db.prepare("SELECT COUNT(*) AS n FROM assets").get().n, 0);
 assert.equal(db.prepare("SELECT COUNT(*) AS n FROM edit_projects").get().n, 0);
 assert.equal(db.prepare("SELECT COUNT(*) AS n FROM footage_highlights").get().n, 0, "its highlights went with it");
+assert.equal(world.media.get(refusedUid).deleted, true, "the refused copy was deleted on the next call");
 const deleted = [...world.media.values()].filter((v) => v.deleted).length;
-console.log(`10 ok: project deleted in two calls, ${deleted} media copies deleted`);
+console.log(`10 ok: project deleted in two calls, ${deleted} media copies deleted, a refused one on the second`);
 
 // 12. With the org's Google Drive connection, clips come in through it, not
 // the shared link: on deliveries only (a download through it is slow). A file
@@ -594,6 +611,11 @@ env.CREDENTIALS = {
       return { successful: true, data: {} };
     }
     if (action === "GOOGLEDRIVE_GOOGLE_DRIVE_DELETE_FOLDER_OR_FILE_ACTION") {
+      world.removeTries = (world.removeTries ?? 0) + 1;
+      if (world.refuseRemoves > 0) {
+        world.refuseRemoves--;
+        return { successful: false, error: "User rate limit exceeded" };
+      }
       (world.removed ??= []).push(args.fileId);
       return { successful: true, data: {} };
     }
@@ -628,13 +650,16 @@ const copyId = "copy_big___________________";
 assert.ok(world.importUrls.includes(`https://drive.usercontent.google.com/download?id=${copyId}&export=download&confirm=t`), "imported from the copy's link");
 assert.equal(db.prepare("SELECT copy_id FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().copy_id, copyId);
 const callsBefore = world.connCalls;
-// The imports finish; the next delivery deletes the copy, and the connection's
-// download isn't tried again for the file it couldn't take.
-for (let i = 0; i < 4; i++) await deliver2();
+// The imports finish; the next delivery deletes the copy (Drive refuses the
+// first try: the copy stays on the clip and goes on the next one), and the
+// connection's download isn't tried again for the file it couldn't take.
+world.refuseRemoves = 1;
+for (let i = 0; i < 6; i++) await deliver2();
 assert.equal(world.connCalls, callsBefore);
 assert.deepEqual(world.removed, [copyId], "the copy is deleted once imported");
+assert.equal(world.removeTries, 2, "a refused delete keeps the copy on the clip and is tried again");
 assert.equal(db.prepare("SELECT copy_id FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().copy_id, null);
-console.log("12 ok: imports through the Drive connection on deliveries; a file too big for it comes from a copy, deleted once imported");
+console.log("12 ok: imports through the Drive connection on deliveries; a file too big for it comes from a copy, deleted once imported, after a refused delete too");
 
 // 13. A source over the video host's bitrate cap goes back in line marked for
 // re-encoding; the re-encode becomes a media id, and the clip is ready.

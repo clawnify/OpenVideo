@@ -33,7 +33,7 @@ import {
   withinFolder,
 } from "./drive";
 import { parseDriveLink, type FolderVideo } from "./drive-link";
-import { addFolderVideos, bookStep, readFolder, stepFootage, type DriveSource, type StepOutcome } from "./footage";
+import { addFolderVideos, bookStep, readFolder, removeCopy, stepFootage, type DriveSource, type StepOutcome } from "./footage";
 import { HIGHLIGHTS_NO_KEY, highlightsPending, stepHighlights, type HighlightKind } from "./highlights";
 import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
@@ -189,7 +189,8 @@ async function sweepUploads(env: Bindings): Promise<void> {
     if (state.media.state !== "pendingupload") {
       await promoteUpload(up.uid);
     } else if (Date.parse(up.created_at + "Z") < Date.now() - UPLOAD_EXPIRED_HOURS * 3600_000) {
-      await deleteMedia(mediaCfg(env), up.uid);
+      // Not deleted on the service: kept, and tried again on the next sweep.
+      if (!(await deleteMedia(mediaCfg(env), up.uid).then(() => true, () => false))) continue;
       await run("DELETE FROM media_uploads WHERE uid = ?", [up.uid]);
     }
   }
@@ -239,7 +240,11 @@ app.delete("/api/assets/uploads/:uid", async (c) => {
   if (!MEDIA_UID.test(uid) || !(await get<MediaUpload>("SELECT uid FROM media_uploads WHERE uid = ?", [uid]))) {
     return c.json({ error: "not_found", detail: "no open upload with that id" }, 404);
   }
-  await deleteMedia(mediaCfg(c.env), uid);
+  try {
+    await deleteMedia(mediaCfg(c.env), uid);
+  } catch (e) {
+    return c.json({ error: "delete_failed", detail: `the upload could not be deleted from storage, try again: ${(e as Error).message}` }, 502);
+  }
   await run("DELETE FROM media_uploads WHERE uid = ?", [uid]);
   return c.json({ ok: true });
 });
@@ -479,7 +484,13 @@ app.delete("/api/assets/:id", async (c) => {
     // Footage on the media service counts against the org's storage minutes
     // until it is deleted there; dropping only our row left it counting.
     if (row.media_uid) {
-      await deleteMedia({ servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN }, row.media_uid);
+      // Not deleted on the service: the asset stays, so deleting it again
+      // finishes the job, instead of an ok that leaves the copy counting.
+      try {
+        await deleteMedia({ servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN }, row.media_uid);
+      } catch (e) {
+        return c.json({ error: "delete_failed", detail: `the video could not be deleted from storage, try again: ${(e as Error).message}` }, 502);
+      }
     } else {
       await deleteUpload(row.key);
     }
@@ -828,14 +839,24 @@ app.delete("/api/projects/:id", async (c) => {
   );
   // A copy made in the connected account's Drive for an import still under
   // way goes too: it is the size of the original.
+  // One that can't be deleted keeps its clip for the next call. Without the
+  // connection there is no way to reach it, and the project goes regardless.
   const copies = footage.filter((f) => f.copy_id);
+  const copyLeft = new Set<string>();
   if (copies.length) {
     const drive = await driveSource(c.env);
-    if (drive) await Promise.all(copies.map((f) => drive.remove(f.copy_id!).catch(() => {})));
+    if (drive) {
+      await Promise.all(
+        copies.map(async (f) => {
+          if (!(await removeCopy(drive, f.copy_id!))) copyLeft.add(f.id);
+        }),
+      );
+    }
   }
   if (footage.length > 0) {
     await Promise.all(
       footage.map(async (f) => {
+        if (copyLeft.has(f.id)) return;
         if (f.asset_id) {
           const usedElsewhere = await get(
             "SELECT 1 AS used FROM edit_projects WHERE id != ? AND edl LIKE ? LIMIT 1",
