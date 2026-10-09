@@ -163,6 +163,10 @@ with the link, imported from the copy, and the copy is deleted once the
 import is over (or with the project). Only if that fails too does it come by
 the original's shared link.
 
+A source over the video host's 200 Mbps cap (all-intra camera files) is
+re-encoded on the way in, by itself: it imports a little later, as high-quality
+H.264.
+
 `POST /api/projects/{id}/footage/sync` looks in the folders again and takes in
 files added since; a clip deleted from the project stays out.
 `POST /api/projects/{id}/footage/retry` puts every failed import and log back

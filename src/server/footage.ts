@@ -16,7 +16,7 @@
 
 import { enqueueJob, type QueueEnv } from "@clawnify/queue";
 import { query, get, run } from "./db";
-import { deleteMedia, importMedia, mediaState, prepareMedia, type MediaConfig } from "./media";
+import { deleteMedia, importMedia, mediaState, prepareMedia, startTranscode, transcodeState, type MediaConfig } from "./media";
 import { refusalDetail } from "./refusal";
 import { directDownloadUrl, folderListingUrl, judgeLinkResponse, listFolderVideos, type FolderVideo } from "./drive-link";
 
@@ -303,6 +303,8 @@ interface WorkRow {
   drive_tries: number;
   link_only: number;
   copy_id: string | null;
+  transcode: number;
+  transcode_job: string | null;
 }
 
 /**
@@ -379,7 +381,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
   }
   const rows = await query<WorkRow>(
     `SELECT f.id, f.status, f.drive_file_id, f.name, f.folder, f.language, f.asset_id, f.log_status, f.log_job,
-            f.updated_at, f.retry_at, f.drive_tries, f.link_only, f.copy_id, a.media_uid, a.duration
+            f.updated_at, f.retry_at, f.drive_tries, f.link_only, f.copy_id, f.transcode, f.transcode_job, a.media_uid, a.duration
        FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
       WHERE f.project_id = ?
         AND (f.status IN ('waiting', 'importing')
@@ -399,6 +401,28 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
   const importing = rows.filter((r) => r.status === "importing");
   await Promise.all(
     importing.map(async (r) => {
+      // Being re-encoded: once it has a media id it imports like any other.
+      if (r.transcode_job) {
+        const t = await transcodeState(cfg, r.transcode_job);
+        if (t.status === "done") {
+          const res = await run("INSERT INTO assets (key, name, content_type, size, media_uid) VALUES (?, ?, ?, ?, ?)", [
+            `media/${t.id}`,
+            r.name,
+            "video/mp4",
+            0,
+            t.id,
+          ]);
+          const asset = await get<{ id: string }>("SELECT id FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
+          await setRow(r.id, { asset_id: asset!.id, transcode_job: null });
+        } else if (t.status === "failed") {
+          await setRow(r.id, { status: "failed", error: t.detail, transcode_job: null });
+          r.status = "failed";
+        } else if (age(r.updated_at) > IMPORT_TIMEOUT_MS) {
+          await setRow(r.id, { status: "failed", error: "the re-encode did not finish", transcode_job: null });
+          r.status = "failed";
+        }
+        return;
+      }
       if (!r.media_uid) {
         if (age(r.updated_at) > STALE_CLAIM_MS) await setRow(r.id, { status: "waiting" }, " AND status = 'importing'");
         return;
@@ -413,6 +437,14 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
         await setRow(r.id, { status: "ready" });
         r.status = "ready";
         r.duration = r.duration ?? s.media.duration;
+      } else if (s.media.state === "error" && !r.transcode && BITRATE_REFUSED.test(s.media.error ?? "")) {
+        // Over the video host's bitrate cap: back in line, to be re-encoded
+        // on the way in. The refused copy is of no use.
+        await deleteMedia(cfg, r.media_uid).catch(() => {});
+        if (r.asset_id) await run("DELETE FROM assets WHERE id = ?", [r.asset_id]);
+        await setRow(r.id, { status: "waiting", asset_id: null, transcode: 1, error: null });
+        // This same step may claim it again: it must see what the row now says.
+        Object.assign(r, { status: "waiting", asset_id: null, media_uid: null, transcode: 1 });
       } else if (s.media.state === "error") {
         await setRow(r.id, { status: "failed", error: s.media.error || "the video could not be processed" });
         r.status = "failed";
@@ -624,6 +656,9 @@ async function startImport(
   return importFrom(cfg, r, url, verdict.contentType?.startsWith("video/") ? verdict.contentType : "video/mp4", verdict.size ?? 0);
 }
 
+/** The video host's refusal of a source over its bitrate cap. */
+const BITRATE_REFUSED = /bitrate exceeded/i;
+
 /** Have the media service pull the clip from `url`, and record it as an asset. */
 async function importFrom(
   cfg: MediaConfig,
@@ -638,6 +673,13 @@ async function importFrom(
     if (r.media_uid) await deleteMedia(cfg, r.media_uid).catch(() => {});
     await run("DELETE FROM assets WHERE id = ?", [r.asset_id]);
     await setRow(r.id, { asset_id: null });
+  }
+  // Marked for re-encoding: the media id comes later, from the re-encode.
+  if (r.transcode) {
+    const started = await startTranscode(cfg, url, r.name);
+    if ("failure" in started) return { orgWide: ORG_LIMITS.has(started.failure.error), detail: started.failure.detail };
+    await setRow(r.id, { transcode_job: started.jobId });
+    return true;
   }
   const imported = await importMedia(cfg, url, r.name);
   if ("failure" in imported) {

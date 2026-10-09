@@ -1166,7 +1166,8 @@ app.post("/api/projects/:id/footage/sync", async (c) => {
 app.post("/api/projects/:id/footage/retry", async (c) => {
   const id = c.req.param("id");
   const imports = await run(
-    `UPDATE project_footage SET status = 'waiting', error = NULL, retry_at = NULL, drive_tries = 0, updated_at = datetime('now')
+    `UPDATE project_footage SET status = 'waiting', error = NULL, retry_at = NULL, drive_tries = 0,
+            transcode = CASE WHEN error LIKE '%bitrate exceeded%' THEN 1 ELSE transcode END, updated_at = datetime('now')
       WHERE project_id = ? AND (status = 'failed' OR (status = 'waiting' AND retry_at IS NOT NULL))`,
     [id],
   );
