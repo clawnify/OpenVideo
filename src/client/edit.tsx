@@ -3667,21 +3667,22 @@ function TransitionFilter({ id, blurBox, block, scale }: { id: string; blurBox?:
 }
 
 /**
- * A clip's colour adjustment as an SVG filter: the saturation matrix, then a
- * straight line per channel, each clamped, in the encoded RGB the export
+ * A clip's colour adjustment as an SVG filter: step 1 one colour matrix,
+ * step 2 the red and blue gains, each clamped, in the encoded RGB the export
  * works in (sRGB interpolation, not SVG's default linear light).
  */
 function AdjustFilter({ id, adjust }: { id: string; adjust: Adjust }) {
-  const { matrix, slopes, intercept, lines } = adjustSteps(adjust);
+  const { matrix, offset, warmth } = adjustSteps(adjust);
   return (
     <svg className="absolute w-0 h-0" aria-hidden>
       <filter id={id} x="0" y="0" width="100%" height="100%" colorInterpolationFilters="sRGB">
-        {matrix && <feColorMatrix type="matrix" values={matrix.map((row) => `${row.join(" ")} 0 0`).join(" ") + " 0 0 0 1 0"} />}
-        {lines && (
+        {matrix && (
+          <feColorMatrix type="matrix" values={matrix.map((row) => `${row.join(" ")} 0 ${offset}`).join(" ") + " 0 0 0 1 0"} />
+        )}
+        {warmth && (
           <feComponentTransfer>
-            <feFuncR type="linear" slope={slopes[0]} intercept={intercept} />
-            <feFuncG type="linear" slope={slopes[1]} intercept={intercept} />
-            <feFuncB type="linear" slope={slopes[2]} intercept={intercept} />
+            <feFuncR type="linear" slope={warmth[0]} />
+            <feFuncB type="linear" slope={warmth[1]} />
           </feComponentTransfer>
         )}
       </filter>

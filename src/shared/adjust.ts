@@ -1,13 +1,15 @@
 // A clip's colour adjustment, in the edit service's own maths (its schema.ts
 // `adjust`), so the preview's SVG filter draws what the export renders.
 //
-// On gamma-encoded RGB in 0..1, each step clamped to 0..1:
-//   1. saturation: s = 1 + saturation (0 is greyscale), the CSS saturate()
-//      matrix with weights 0.213 / 0.715 / 0.072;
-//   2. per channel, x -> k * (gain_c * x - 0.5) + 0.5, where
-//      gain_c = 2^brightness * white_c, k = 2^contrast, and white is
-//      (1 + 0.2 t, 1, 1 - 0.2 t) for t = temperature (warm above 0).
-// Each field runs -1..1 and 0 leaves the picture alone; people see -100..100.
+// On gamma-encoded RGB in 0..1, two steps, each clamped to 0..1:
+//   1. y = k * g * S * x + (1 - k) / 2, where S is the saturation matrix with
+//      BT.709 weights (0.2126 / 0.7152 / 0.0722) and s = 1 + saturation (0 is
+//      greyscale), g = 2^brightness, k = 2^contrast (pivot: mid grey);
+//   2. temperature t scales red by 1 + 0.2 t and blue by 1 - 0.2 t (warm
+//      above 0).
+// The service renders step 1 in YUV, where it is a line per plane, and goes
+// to RGB only for step 2. Each field runs -1..1 and 0 leaves the picture
+// alone; people see -100..100.
 
 export interface Adjust {
   brightness?: number;
@@ -35,32 +37,33 @@ export function cleanAdjust(a: Adjust | undefined): Adjust | undefined {
   return Object.keys(out).length ? out : undefined;
 }
 
-/** The two filter steps: a 3x3 saturation matrix (null when s is 1) and a
- *  slope per channel with one intercept (null when every line is x -> x). */
+/** The two steps as filter values: step 1 as a 3x3 matrix and one offset
+ *  (null when it changes nothing), step 2 as red and blue gains (null
+ *  without temperature). */
 export function adjustSteps(a: Adjust): {
   matrix: number[][] | null;
-  slopes: [number, number, number];
-  intercept: number;
-  lines: boolean;
+  offset: number;
+  warmth: [number, number] | null;
 } {
   const s = 1 + (a.saturation ?? 0);
   const k = 2 ** (a.contrast ?? 0);
-  const gain = 2 ** (a.brightness ?? 0);
+  const g = 2 ** (a.brightness ?? 0);
   const t = a.temperature ?? 0;
-  const w = [0.213, 0.715, 0.072];
-  const matrix = s === 1 ? null : [0, 1, 2].map((c) => w.map((wi, j) => (j === c ? wi + (1 - wi) * s : wi - wi * s)));
-  const slopes = [gain * (1 + 0.2 * t), gain, gain * (1 - 0.2 * t)].map((g) => k * g) as [number, number, number];
-  const intercept = 0.5 * (1 - k);
-  return { matrix, slopes, intercept, lines: slopes.some((m) => m !== 1) || intercept !== 0 };
+  const w = [0.2126, 0.7152, 0.0722];
+  const matrix =
+    s === 1 && k === 1 && g === 1
+      ? null
+      : [0, 1, 2].map((c) => w.map((wi, j) => k * g * (j === c ? wi + (1 - wi) * s : wi - wi * s)));
+  return { matrix, offset: (1 - k) / 2, warmth: t === 0 ? null : [1 + 0.2 * t, 1 - 0.2 * t] };
 }
 
 /** One pixel (RGB 0..1) through the adjustment: the reference both the
  *  preview and the export are held to. */
 export function adjustPixel(a: Adjust, rgb: [number, number, number]): [number, number, number] {
-  const { matrix, slopes, intercept } = adjustSteps(a);
+  const { matrix, offset, warmth } = adjustSteps(a);
   const c01 = (x: number) => Math.max(0, Math.min(1, x));
-  const sat = matrix ? matrix.map((row) => c01(row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2])) : rgb;
-  return [0, 1, 2].map((c) => c01(slopes[c] * sat[c] + intercept)) as [number, number, number];
+  const one = matrix ? matrix.map((row) => c01(row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2] + offset)) : rgb;
+  return warmth ? [c01(one[0] * warmth[0]), one[1], c01(one[2] * warmth[1])] : ([...one] as [number, number, number]);
 }
 
 /** "contrast +30, saturation -20", or "" when nothing is adjusted. */
