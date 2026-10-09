@@ -107,6 +107,31 @@ export async function importMedia(
 }
 
 /**
+ * Re-encode a source the video host refuses (over 200 Mbps) and import the
+ * result. Two calls: this starts it; `transcodeState` says when it has become
+ * a media id like any other.
+ */
+export async function startTranscode(
+  cfg: MediaConfig,
+  url: string,
+  name: string,
+): Promise<{ jobId: string } | { failure: MediaFailure }> {
+  const res = await call<{ job_id: string }>(cfg, "/transcode", { method: "POST", body: JSON.stringify({ url, name }) });
+  return "failure" in res ? res : { jobId: res.data.job_id };
+}
+
+export async function transcodeState(
+  cfg: MediaConfig,
+  jobId: string,
+): Promise<{ status: "running" } | { status: "done"; id: string } | { status: "failed"; detail: string }> {
+  const res = await call<{ status: string; id?: string; detail?: string }>(cfg, `/transcode/${encodeURIComponent(jobId)}`);
+  if ("failure" in res) return res.failure.error === "not_found" ? { status: "failed", detail: "the re-encode was lost" } : { status: "running" };
+  if (res.data.status === "done" && res.data.id) return { status: "done", id: res.data.id };
+  if (res.data.status === "failed") return { status: "failed", detail: res.data.detail || "the re-encode failed" };
+  return { status: "running" };
+}
+
+/**
  * Open an upload the browser sends the file to itself, resumably (tus). The
  * bytes go straight to the service and never pass through this app, so a
  * phone clip of several gigabytes uploads as easily as a short one.
