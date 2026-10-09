@@ -319,7 +319,14 @@ defaults to the source's length minus trims; `fadeIn` and `fadeOut` are
 seconds (0..30) of ramp from and to silence. The fade-out ends where the clip
 is last heard, which is the end of the video when the clip runs past it, so
 music laid under a shorter cut needs no trimming to end cleanly: set
-`fadeOut: 2` and leave its length alone. Output duration (sum of the main
+`fadeOut: 2` and leave its length alone. `duck` (dB, 1..40; the editor offers
+6, 12 and 18) lowers the clip while someone on the main track speaks and
+brings it back up in the pauses: set `"duck": 12` on a music bed under a
+talking-head cut. The dips are worked out at export from the transcripts of
+the main track's clips (in the captions' language, English when there are no
+captions), so they follow every trim; clips with `sourceAudio: false` or
+volume 0 do not count, and footage kept in the app's own storage has no
+transcript, so nothing dips under it. Output duration (sum of the main
 track) maxes at 5 minutes.
 
 **Format** (the video's shape) is `output.width` x `output.height`: even

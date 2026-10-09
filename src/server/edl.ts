@@ -15,6 +15,7 @@
 
 import { z } from "zod";
 import { MAX_FADE_SECONDS } from "../shared/fade";
+import { MAX_DUCK_DB } from "../shared/duck";
 import { MAX_TRANSITION_SECONDS, TRANSITION_TYPES } from "../shared/transition";
 
 export const MAX_ELEMENTS = 100;
@@ -193,6 +194,10 @@ const audioElement = z
      *  last heard (its end, or the cut's end if it runs past). shared/fade.ts */
     fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
     fadeOut: seconds.max(MAX_FADE_SECONDS).optional(),
+    /** Dip this many dB while someone on the main track speaks (ducking).
+     *  This app's own field: the export turns it into the edit service's
+     *  volume `envelope` from the transcripts' timing. shared/duck.ts */
+    duck: z.number().finite().min(1).max(MAX_DUCK_DB).optional(),
   })
   .strict();
 
