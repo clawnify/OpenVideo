@@ -25,6 +25,7 @@ import {
 import { parseVtt, type Cue } from "../shared/transcript";
 import { fadeGain, heardFor } from "../shared/fade";
 import { sharedPrefix } from "../shared/names";
+import { repeatPasses } from "../shared/passes";
 import {
   DEFAULT_TRANSITION_SECONDS,
   MAX_TRANSITION_SECONDS,
@@ -2480,14 +2481,17 @@ function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<st
   const pending = assets.filter((a) => a.media_uid && !ready.has(a.id) && !failed.has(a.id)).map((a) => a.id);
   const key = pending.join(",");
 
+  // One pass at a time, 5 s apart, and none left running once the set changes:
+  // a pass over hundreds of clips takes minutes, and a fixed interval stacked
+  // them up, every one asking about every clip.
   useEffect(() => {
     if (!key) return;
-    let dead = false;
-    const check = async () => {
+    return repeatPasses(async (stopped) => {
       const done: string[] = [];
       const waiting: string[] = [];
       const broken: string[] = [];
       for (const id of key.split(",")) {
+        if (stopped()) return;
         try {
           const r = await api.get<{ ready: boolean; state?: string }>(`/api/assets/${id}/playback`);
           (r.ready ? done : r.state === "error" ? broken : waiting).push(id);
@@ -2495,17 +2499,11 @@ function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<st
           /* a hiccup: ask again on the next pass */
         }
       }
-      if (dead) return;
+      if (stopped()) return;
       if (done.length) setReady((cur) => new Set([...cur, ...done]));
       if (broken.length) setFailed((cur) => new Set([...cur, ...broken]));
       setIngesting(new Set(waiting));
-    };
-    check();
-    const t = setInterval(check, 5000);
-    return () => {
-      dead = true;
-      clearInterval(t);
-    };
+    }, 5000);
   }, [key]);
 
   return { ready, ingesting, failed };
