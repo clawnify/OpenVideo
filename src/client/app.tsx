@@ -2,9 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import { ArrowLeft, Film } from "lucide-react";
 import { AppNav, embedded, reportLocation } from "@clawnify/app/client";
 import { EditRoute, ProjectsHome, type EditProject } from "./edit";
+import { HighlightsRoute } from "./highlights";
 import { btnGhost } from "./ui";
 
-// Minimal history-based router: `/` = your projects, `/edits/<id>` = the editor.
+// Minimal history-based router: `/` = your projects, `/edits/<id>` = the
+// editor, `/edits/<id>/highlights` = its footage's highlights.
 function useRouter() {
   const [path, setPath] = useState(() => window.location.pathname);
   useEffect(() => {
@@ -54,11 +56,13 @@ function HostNav({ active, path, navigate }: { active: string; path: string; nav
 export function App() {
   const { path, navigate } = useRouter();
   const id = decodeURIComponent(path.replace(/^\/+|\/+$/g, ""));
-  const editId = id.startsWith("edits/") ? id.slice(6) : null;
+  const m = /^edits\/([^/]+)(\/highlights)?$/.exec(id);
+  const editId = m ? m[1] : null;
+  const highlights = !!m?.[2];
 
   return (
     <div className="h-dvh flex flex-col text-foreground">
-      {embedded && <HostNav active={id} path={path} navigate={navigate} />}
+      {embedded && <HostNav active={editId ? `edits/${editId}` : id} path={path} navigate={navigate} />}
       {/* Brand row: the app icon is the identity object, and the accent hue
           lives here (plus count badges and the focus ring) and nowhere else.
           The dashboard draws its own, so it is standalone-only. */}
@@ -77,7 +81,13 @@ export function App() {
       </header>
       )}
 
-      {editId ? <EditRoute id={editId} navigate={navigate} /> : <ProjectsHome navigate={navigate} />}
+      {editId && highlights ? (
+        <HighlightsRoute id={editId} navigate={navigate} />
+      ) : editId ? (
+        <EditRoute id={editId} navigate={navigate} />
+      ) : (
+        <ProjectsHome navigate={navigate} />
+      )}
     </div>
   );
 }

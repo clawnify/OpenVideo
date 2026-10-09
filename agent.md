@@ -104,10 +104,69 @@ to cut away to for the brief, and write the main track. One scene filmed by
 several cameras shows up once per camera folder: use one angle, or cut between
 them. Then add titles, music and transitions as usual.
 
+### Highlights: the selects, chosen for you
+
+Rather than read every log yourself, ask for the project's **highlights**: for
+every logged clip, whether it is worth an editor's time (and why not, when it
+isn't) and the parts to cut from, each with a 1 to 5 score against the brief
+and the reason. They are read from the logs and transcripts in the background,
+a folder at a time, and clips logged later join by themselves.
+
+```
+POST  /api/projects/{id}/highlights          { "brief"?: "…", "again"?: true }
+GET   /api/projects/{id}/highlights          best first, 100 a page (limit up to 1000, offset)
+      &kind=soundbite|broll  &min_score=2..5  &folder=Day 1/Cam B
+      &pick=open|keep|drop|not_dropped|all   &sort=score|clip  &skipped=1
+PATCH /api/projects/{id}/highlights/{hid}    { "pick"?: "keep"|"drop"|null, "start"?, "end"?, "speaker"?, "text"? }
+POST  /api/projects/{id}/highlights/items    { "clip": "<clipId>", "start"?, "end"?, "kind"?, "text"? }
+GET   /api/projects/{id}/highlights/export?format=csv|xml&pick=keep|not_dropped&root=&fps=
+```
+
+`again` reads every clip again; what a person kept or dropped stays as it is.
+A soundbite's `speaker` is who says it as the clip's log describes them; it
+names a person only when the clip itself does (said, shown or logged), so
+correct it with the person's name and title when you know them.
+A highlight is `{ id, clip: { id, name, folder, asset_id }, kind, start, end,
+text, speaker, score, reason, pick }`, times in seconds into the clip: as a
+main-track clip, `{ "type": "video", "src": "asset:<clip.asset_id>",
+"trimStart": start, "duration": end - start }` (b-roll usually with
+`"sourceAudio": false`). `skipped=1` adds the clips set aside, with `reason`.
+
+`format=xml` is a timeline for Premiere Pro or DaVinci Resolve (FCP7 XML: a
+Soundbites and a B-roll sequence, the picks end to end on the camera files,
+the words, score and reason on a marker per clip). The editor downloads the
+footage folder without renaming anything, imports the .xml and points their
+editor at that folder; `root=` is where they downloaded it, so the files are
+found without relinking. The file carries no camera timecode yet: in Resolve,
+set Project Settings > Conform Options > Use Timecode to "From the source clip
+frame count" before importing. `format=csv` is the same list as a sheet, with
+each file's Drive link.
+
+`POST /api/projects/{id}/instruct` sees the highlights too: "make a 60 second
+cut from the kept soundbites" places them with its `add_highlight` operation.
+
+Google Drive limits how often a file shared with the link can be downloaded,
+and on a heavy day it refuses the files of a whole folder for a while. A clip it
+refuses is not failed: it waits (`status: "waiting"` with `retry_at`, counted in
+`counts.drive_waiting`) and is tried again by itself, further apart each time,
+for about a day, after which it fails with the reason. `imports_paused` says so
+when every waiting clip is waiting on Drive. A copy of the folder in another
+Drive account has its own limit.
+
+When the org has a Google Drive connection whose account can open the
+folder, clips are downloaded through it instead, as that account, which
+Drive's limit on shared links doesn't touch. Those downloads run in the
+background steps only. A file too big for the connection's temporary storage
+(seen at 9 GB; 3.4 GB passed) is copied inside Google into a temporary
+folder of the connected account ("OpenVideo imports (temporary)"), shared
+with the link, imported from the copy, and the copy is deleted once the
+import is over (or with the project). Only if that fails too does it come by
+the original's shared link.
+
 `POST /api/projects/{id}/footage/sync` looks in the folders again and takes in
 files added since; a clip deleted from the project stays out.
 `POST /api/projects/{id}/footage/retry` puts every failed import and log back
-in line. `DELETE /api/projects/{id}` deletes the footage a batch at a time: a
+in line, and asks Drive again now for the clips waiting on it. `DELETE /api/projects/{id}` deletes the footage a batch at a time: a
 `202 { remaining }` means call it again.
 
 ## API
@@ -137,6 +196,11 @@ in line. `DELETE /api/projects/{id}` deletes the footage a batch at a time: a
 | POST | `/api/projects/{id}/footage/folders` | `{ url, language? }` adds a Drive folder shared with the link |
 | POST | `/api/projects/{id}/footage/sync` | Takes in files added to the folders since → `{ added }` |
 | POST | `/api/projects/{id}/footage/retry` | Puts failed imports and logs back in line → `{ imports, logs }` |
+| POST | `/api/projects/{id}/highlights` | Find the footage's highlights `{ brief?, again? }` (in the background) |
+| GET  | `/api/projects/{id}/highlights` | The highlights, best first, filtered and paged → `{ clips, counts, highlights, next_offset, paused }` |
+| PATCH | `/api/projects/{id}/highlights/{hid}` | A person's call `{ pick?: keep\|drop\|null, start?, end?, speaker?, text? }` |
+| POST | `/api/projects/{id}/highlights/items` | A person's own pick `{ clip, start?, end?, kind?, text? }`, kept |
+| GET  | `/api/projects/{id}/highlights/export` | `format=csv\|xml`: a sheet, or a Premiere Pro / Resolve timeline of the picks |
 | PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
 | POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied }` |
