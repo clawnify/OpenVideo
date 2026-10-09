@@ -372,10 +372,14 @@ function AskPanel({ projectId, brief, logged, onAsked }: { projectId: string; br
 function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId: string; onAgain: () => void }) {
   const { clips, counts } = list;
   const [busy, setBusy] = useState(false);
+  // Finding again is the moment to change what the picks are judged against.
+  const [editing, setEditing] = useState(false);
+  const [brief, setBrief] = useState(list.brief);
   const again = async (all: boolean) => {
     setBusy(true);
     try {
-      await api.send("POST", `/api/projects/${projectId}/highlights`, all ? { again: true } : {});
+      await api.send("POST", `/api/projects/${projectId}/highlights`, all ? { again: true, brief } : {});
+      setEditing(false);
       onAgain();
     } finally {
       setBusy(false);
@@ -399,7 +403,30 @@ function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId
         {counts.kept + counts.dropped > 0 && ` · ${counts.kept} kept, ${counts.dropped} dropped`}
       </p>
       {list.paused && <p className="mt-1 rounded-sm bg-warning-tint px-2 py-1.5 text-foreground">Paused: {list.paused}</p>}
-      {list.brief && <p className="mt-1 text-faint line-clamp-2" title={list.brief}>For: {list.brief}</p>}
+      {list.brief && !editing && <p className="mt-1 text-faint line-clamp-2" title={list.brief}>For: {list.brief}</p>}
+      {editing && (
+        <div className={`${card} mt-2 p-3 max-w-2xl`}>
+          <label className="block text-fine text-muted mb-1" htmlFor="hl-again-brief">
+            What is the video for? Every clip is read again against this; what you kept or dropped stays as it is.
+          </label>
+          <textarea id="hl-again-brief" value={brief} onChange={(e) => setBrief(e.target.value)} rows={3} className="field w-full mb-2" autoFocus />
+          <div className="flex gap-2">
+            <button onClick={() => again(true)} disabled={busy || !brief.trim()} className={btnPrimary}>
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />} Find again
+            </button>
+            <button
+              onClick={() => {
+                setBrief(list.brief);
+                setEditing(false);
+              }}
+              disabled={busy}
+              className={btnGhost}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
       <div className="mt-1 -ml-2 flex flex-wrap gap-1">
         {clips.failed > 0 && (
           <button onClick={() => again(false)} disabled={busy} className={btnGhost}>
@@ -411,12 +438,15 @@ function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId
             <Sparkles className="w-3.5 h-3.5" /> Read {clips.not_asked} new {clips.not_asked === 1 ? "clip" : "clips"}
           </button>
         )}
-        {clips.pending === 0 && (
+        {clips.pending === 0 && !editing && (
           <button
-            onClick={() => again(true)}
+            onClick={() => {
+              setBrief(list.brief);
+              setEditing(true);
+            }}
             disabled={busy}
             className={btnGhost}
-            title="Read every clip again. What you kept or dropped stays as it is."
+            title="Change the brief if you like, then read every clip again. What you kept or dropped stays as it is."
           >
             <RotateCcw className="w-3.5 h-3.5" /> Find again
           </button>
