@@ -417,11 +417,11 @@ export async function saveVerdict(projectId: string, v: ClipVerdict): Promise<vo
  * that died goes back in line.
  */
 export async function stepHighlights(cfg: MediaConfig, key: string | undefined, projectId: string): Promise<HighlightsOutcome> {
-  const project = await get<{ brief: string; highlights_at: string | null }>(
-    "SELECT brief, highlights_at FROM edit_projects WHERE id = ?",
+  const project = await get<{ brief: string; highlights_at: string | null; highlights_stopped_at: string | null }>(
+    "SELECT brief, highlights_at, highlights_stopped_at FROM edit_projects WHERE id = ?",
     [projectId],
   );
-  if (!project?.highlights_at) return { pending: 0, moving: false, blocked: null };
+  if (!project?.highlights_at || project.highlights_stopped_at) return { pending: 0, moving: false, blocked: null };
   await run(
     `UPDATE project_footage SET highlights_status = 'waiting'
       WHERE project_id = ? AND status = 'ready' AND log_status = 'done' AND highlights_status IS NULL`,

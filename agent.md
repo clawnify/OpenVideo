@@ -114,6 +114,7 @@ a folder at a time, and clips logged later join by themselves.
 
 ```
 POST  /api/projects/{id}/highlights          { "brief"?: "…", "again"?: true }
+POST  /api/projects/{id}/highlights/stop     stop reading; picks so far stay, asking again resumes
 GET   /api/projects/{id}/highlights          best first, 100 a page (limit up to 1000, offset)
       &kind=soundbite|broll  &min_score=2..5  &folder=Day 1/Cam B
       &pick=open|keep|drop|not_dropped|all   &sort=score|clip  &skipped=1
@@ -201,6 +202,7 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | POST | `/api/projects/{id}/footage/sync` | Takes in files added to the folders since → `{ added }` |
 | POST | `/api/projects/{id}/footage/retry` | Puts failed imports and logs back in line → `{ imports, logs }` |
 | POST | `/api/projects/{id}/highlights` | Find the footage's highlights `{ brief?, again? }` (in the background) |
+| POST | `/api/projects/{id}/highlights/stop` | Stop reading: clips in line go back, later clips wait until asked again |
 | GET  | `/api/projects/{id}/highlights` | The highlights, best first, filtered and paged → `{ clips, counts, highlights, next_offset, paused }` |
 | PATCH | `/api/projects/{id}/highlights/{hid}` | A person's call `{ pick?: keep\|drop\|null, start?, end?, speaker?, text? }` |
 | POST | `/api/projects/{id}/highlights/items` | A person's own pick `{ clip, start?, end?, kind?, text? }`, kept |
