@@ -152,6 +152,71 @@ CREATE INDEX IF NOT EXISTS idx_project_footage_asset ON project_footage(asset_id
 -- (ISO time). NULL: none booked.
 ALTER TABLE edit_projects ADD COLUMN footage_step_at TEXT;
 
+-- Highlights (src/server/highlights.ts): the selects an editor looks at
+-- first, judged from each clip's log and transcript against the brief.
+-- `highlights_at`: when the project asked for them; NULL, it hasn't. Clips
+-- logged after that join in by themselves.
+ALTER TABLE edit_projects ADD COLUMN highlights_at TEXT;
+-- Per clip: NULL (not asked) | waiting | running | done | failed. A clip done
+-- with a skip_reason was judged not worth an editor's time, and why.
+ALTER TABLE project_footage ADD COLUMN highlights_status TEXT;
+ALTER TABLE project_footage ADD COLUMN highlights_error TEXT;
+ALTER TABLE project_footage ADD COLUMN skip_reason TEXT;
+-- The original's frame rate and size, as the media service measured them:
+-- what a timeline for the editor's own software is laid out with.
+ALTER TABLE project_footage ADD COLUMN fps REAL;
+ALTER TABLE project_footage ADD COLUMN width INTEGER;
+ALTER TABLE project_footage ADD COLUMN height INTEGER;
+
+-- One row per pick: a soundbite (speech that stands on its own) or a stretch
+-- of b-roll, `src_in`..`src_out` seconds into its clip. `pick` is a person's
+-- call: NULL until reviewed, then keep | drop. Finding again replaces only
+-- unreviewed picks; `origin` is ai, or person for one a person added.
+CREATE TABLE IF NOT EXISTS footage_highlights (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  project_id TEXT NOT NULL,
+  footage_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  src_in REAL NOT NULL,
+  src_out REAL NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  speaker TEXT NOT NULL DEFAULT '',
+  score INTEGER NOT NULL DEFAULT 3,
+  reason TEXT NOT NULL DEFAULT '',
+  pick TEXT,
+  origin TEXT NOT NULL DEFAULT 'ai',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_footage_highlights_project ON footage_highlights(project_id, score);
+CREATE INDEX IF NOT EXISTS idx_footage_highlights_clip ON footage_highlights(footage_id);
+
+-- A clip Google Drive refuses to hand over (its download limit for the file,
+-- or for the owner's shared files, is used up) waits until `retry_at` (ISO
+-- time) and is tried again, further apart each time; `drive_tries` counts the
+-- refusals. NULL retry_at: it can be tried now.
+ALTER TABLE project_footage ADD COLUMN retry_at TEXT;
+ALTER TABLE project_footage ADD COLUMN drive_tries INTEGER NOT NULL DEFAULT 0;
+
+-- How a clip comes in when the org has a Drive connection: 0 downloaded
+-- through it; 1 too big for that, so from a copy the connection makes (see
+-- copy_id); 2 neither worked, so by the shared link.
+ALTER TABLE project_footage ADD COLUMN link_only INTEGER NOT NULL DEFAULT 0;
+
+-- A file too big to download through the Drive connection comes in from a
+-- copy the connection makes in its own account, shared with the link: this
+-- is that copy, deleted once the import is over.
+ALTER TABLE project_footage ADD COLUMN copy_id TEXT;
+
+-- A source the media service's video host refuses for its bitrate (over
+-- 200 Mbps: all-intra camera files) is re-encoded on the way in: `transcode`
+-- 1 marks the clip for it, 2 once the host has the re-encode; `transcode_job`
+-- is the re-encode under way. Only a refused re-encode fails the clip: any
+-- other refusal sends it back to be re-encoded.
+ALTER TABLE project_footage ADD COLUMN transcode INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE project_footage ADD COLUMN transcode_job TEXT;
+
 -- A project's version: every write adds one. A writer that read revision N
 -- saves only while the project is still at N, so an editor, an agent and a
 -- teammate cannot overwrite each other's work without seeing it first.

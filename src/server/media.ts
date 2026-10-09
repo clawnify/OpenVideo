@@ -10,6 +10,8 @@
 // passes through this app), serves adaptive playback and a frame at any
 // second, and the edit service reads only the seconds a cut needs.
 
+import { refusalDetail } from "./refusal";
+
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 
 export interface MediaConfig {
@@ -83,7 +85,7 @@ async function call<T>(
     return {
       failure: {
         error: err.error ?? "media_failed",
-        detail: err.detail ?? raw.trim().slice(0, 300) ?? `media service returned ${res.status}`,
+        detail: refusalDetail(body, raw.trim().slice(0, 300) || `media service returned ${res.status}`),
       },
     };
   }
@@ -102,6 +104,31 @@ export async function importMedia(
 ): Promise<{ media: MediaState } | { failure: MediaFailure }> {
   const res = await call<MediaState>(cfg, "/import", { method: "POST", body: JSON.stringify({ url, name }) });
   return "failure" in res ? res : { media: res.data };
+}
+
+/**
+ * Re-encode a source the video host refuses (over 200 Mbps) and import the
+ * result. Two calls: this starts it; `transcodeState` says when it has become
+ * a media id like any other.
+ */
+export async function startTranscode(
+  cfg: MediaConfig,
+  url: string,
+  name: string,
+): Promise<{ jobId: string } | { failure: MediaFailure }> {
+  const res = await call<{ job_id: string }>(cfg, "/transcode", { method: "POST", body: JSON.stringify({ url, name }) });
+  return "failure" in res ? res : { jobId: res.data.job_id };
+}
+
+export async function transcodeState(
+  cfg: MediaConfig,
+  jobId: string,
+): Promise<{ status: "running" } | { status: "done"; id: string } | { status: "failed"; detail: string }> {
+  const res = await call<{ status: string; id?: string; detail?: string }>(cfg, `/transcode/${encodeURIComponent(jobId)}`);
+  if ("failure" in res) return res.failure.error === "not_found" ? { status: "failed", detail: "the re-encode was lost" } : { status: "running" };
+  if (res.data.status === "done" && res.data.id) return { status: "done", id: res.data.id };
+  if (res.data.status === "failed") return { status: "failed", detail: res.data.detail || "the re-encode failed" };
+  return { status: "running" };
 }
 
 /**
@@ -166,6 +193,24 @@ export async function mediaPlayback(
 /** A frame at `seconds`, as a URL the browser can load directly. */
 export function frameUrl(playback: MediaPlayback, seconds: number): string {
   return playback.thumbnail.replace("{time}", String(Math.max(0, Math.round(seconds * 10) / 10)));
+}
+
+/**
+ * The original's frame rate and size. The size is the service's; the rate is
+ * read off the adaptive playlist, whose renditions keep the source's rate.
+ */
+export async function mediaFacts(
+  cfg: MediaConfig,
+  uid: string,
+): Promise<{ fps: number | null; width: number | null; height: number | null } | null> {
+  const state = await mediaState(cfg, uid);
+  const play = await mediaPlayback(cfg, uid);
+  if ("failure" in state || "failure" in play) return null;
+  const list = await fetch(play.playback.hls)
+    .then((r) => (r.ok ? r.text() : ""))
+    .catch(() => "");
+  const rates = [...list.matchAll(/FRAME-RATE=([\d.]+)/g)].map((m) => Number(m[1])).filter((n) => n > 0 && n < 1000);
+  return { fps: rates.length ? Math.max(...rates) : null, width: state.media.width, height: state.media.height };
 }
 
 export async function deleteMedia(cfg: MediaConfig, uid: string): Promise<void> {
