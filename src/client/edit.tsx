@@ -994,6 +994,14 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
   const [err, setErr] = useState("");
 
   useEffect(() => {
+    // Another project: the open editor goes at once, so nothing of this one
+    // can be saved under the next one's id, and a slow answer for a project
+    // left behind is dropped.
+    let current = true;
+    setProject(null);
+    setAssets(null);
+    setFootage(null);
+    setErr("");
     Promise.all([
       api.get<EditProject>(`/api/projects/${id}`),
       api.get<Asset[]>("/api/assets"),
@@ -1001,13 +1009,17 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
       api.get<FootageList>(`/api/projects/${id}/footage?logs=0&step=0`),
     ])
       .then(([p, a, f]) => {
+        if (!current) return;
         setProject(p);
         // The project's own clips from Drive sit beside the library's, so
         // the timeline can play them.
         setAssets([...a, ...readyFootage(f)]);
         setFootage(f);
       })
-      .catch((e) => setErr(String(e.message || e)));
+      .catch((e) => current && setErr(String(e.message || e)));
+    return () => {
+      current = false;
+    };
   }, [id]);
 
   if (err)
@@ -1033,6 +1045,8 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
     );
   return (
     <EditEditor
+      // One editor per project: its state, undo and autosave belong to it alone.
+      key={project.id}
       initial={project}
       initialAssets={assets}
       initialFootage={footage}
@@ -1115,6 +1129,23 @@ export function EditEditor({
     }, 700);
     return () => clearTimeout(t);
   }, [edl, name, brief, initial.id, initial.edl, initial.name, initial.brief]);
+
+  // Leaving with a change not yet saved (the save waits for a pause in the
+  // typing): save it, to this project, on the way out.
+  const latest = useRef({ edl, name, brief });
+  latest.current = { edl, name, brief };
+  useEffect(() => {
+    const id = initial.id;
+    return () => {
+      if (!dirty.current) return;
+      fetch(`/api/projects/${id}`, {
+        method: "PUT",
+        keepalive: true,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(latest.current),
+      }).catch(() => {});
+    };
+  }, [initial.id]);
 
   /**
    * Replace the document, remembering the version before it. `coalesce` folds
