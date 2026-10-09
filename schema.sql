@@ -211,6 +211,8 @@ ALTER TABLE project_footage ADD COLUMN copy_id TEXT;
 
 -- A source the media service's video host refuses for its bitrate (over
 -- 200 Mbps: all-intra camera files) is re-encoded on the way in: `transcode`
--- 1 marks the clip for it, `transcode_job` is the re-encode under way.
+-- 1 marks the clip for it, 2 once the host has the re-encode; `transcode_job`
+-- is the re-encode under way. Only a refused re-encode fails the clip: any
+-- other refusal sends it back to be re-encoded.
 ALTER TABLE project_footage ADD COLUMN transcode INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE project_footage ADD COLUMN transcode_job TEXT;

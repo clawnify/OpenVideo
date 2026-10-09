@@ -413,7 +413,8 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
             t.id,
           ]);
           const asset = await get<{ id: string }>("SELECT id FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
-          await setRow(r.id, { asset_id: asset!.id, transcode_job: null });
+          // 2: what the host now has is the re-encode.
+          await setRow(r.id, { asset_id: asset!.id, transcode_job: null, transcode: 2 });
         } else if (t.status === "failed") {
           await setRow(r.id, { status: "failed", error: t.detail, transcode_job: null });
           r.status = "failed";
@@ -437,7 +438,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
         await setRow(r.id, { status: "ready" });
         r.status = "ready";
         r.duration = r.duration ?? s.media.duration;
-      } else if (s.media.state === "error" && !r.transcode && BITRATE_REFUSED.test(s.media.error ?? "")) {
+      } else if (s.media.state === "error" && r.transcode < 2 && BITRATE_REFUSED.test(s.media.error ?? "")) {
         // Over the video host's bitrate cap: back in line, to be re-encoded
         // on the way in. The refused copy is of no use.
         await deleteMedia(cfg, r.media_uid).catch(() => {});
