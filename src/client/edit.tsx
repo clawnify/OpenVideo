@@ -1707,7 +1707,7 @@ function LeftPanel({
   const hasFootage = footage.list.sources.length > 0;
   const [view, setView] = useState<"project" | "library">(hasFootage ? "project" : "library");
   const library = useMemo(() => assets.filter((a) => !footageIds.has(a.id)), [assets, footageIds]);
-  const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(library);
+  const { ready: mediaReady, ingesting: mediaIngesting, failed: mediaFailed } = useMediaReady(library);
   const [deleting, setDeleting] = useState<Asset | null>(null);
   const [deleteErr, setDeleteErr] = useState("");
 
@@ -1888,7 +1888,7 @@ function LeftPanel({
                 <button
                   onClick={() => !preparing && onAdd(a)}
                   disabled={preparing}
-                  title={preparing ? "Still being prepared" : "Add to timeline"}
+                  title={mediaFailed.has(a.id) ? "This clip could not be prepared. Delete it and upload it again." : preparing ? "Still being prepared" : "Add to timeline"}
                   aria-label={`Add ${a.name} to the timeline`}
                   className="block w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group disabled:hover:bg-surface"
                 >
@@ -1901,6 +1901,7 @@ function LeftPanel({
                             Preparing
                           </>
                         )}
+                        {mediaFailed.has(a.id) && <span className="text-danger">Could not be prepared</span>}
                       </div>
                     ) : a.media_uid ? (
                       <img src={frameUrl(a, 1)} alt="" className="w-full h-20 object-cover bg-black" />
@@ -2436,13 +2437,16 @@ function fmtBytes(n: number | null): string {
  * the library says so and the clip stays out of the timeline until it is.
  * Polls only while something is still pending.
  */
-function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<string> } {
+function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<string>; failed: Set<string> } {
   const [ready, setReady] = useState<Set<string>>(new Set());
   // Only what the service has actually reported as not ready yet. Until the
   // first answer a clip is merely unknown, and calling it "Preparing" flashed
   // that label on every page load for footage that had long been ready.
   const [ingesting, setIngesting] = useState<Set<string>>(new Set());
-  const pending = assets.filter((a) => a.media_uid && !ready.has(a.id)).map((a) => a.id);
+  // Footage the service gave up on never becomes ready, so it is not asked
+  // about again; otherwise an open editor asks every 5 s for as long as it is open.
+  const [failed, setFailed] = useState<Set<string>>(new Set());
+  const pending = assets.filter((a) => a.media_uid && !ready.has(a.id) && !failed.has(a.id)).map((a) => a.id);
   const key = pending.join(",");
 
   useEffect(() => {
@@ -2451,16 +2455,18 @@ function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<st
     const check = async () => {
       const done: string[] = [];
       const waiting: string[] = [];
+      const broken: string[] = [];
       for (const id of key.split(",")) {
         try {
-          const r = await api.get<{ ready: boolean }>(`/api/assets/${id}/playback`);
-          (r.ready ? done : waiting).push(id);
+          const r = await api.get<{ ready: boolean; state?: string }>(`/api/assets/${id}/playback`);
+          (r.ready ? done : r.state === "error" ? broken : waiting).push(id);
         } catch {
           /* a hiccup: ask again on the next pass */
         }
       }
       if (dead) return;
       if (done.length) setReady((cur) => new Set([...cur, ...done]));
+      if (broken.length) setFailed((cur) => new Set([...cur, ...broken]));
       setIngesting(new Set(waiting));
     };
     check();
@@ -2471,7 +2477,7 @@ function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<st
     };
   }, [key]);
 
-  return { ready, ingesting };
+  return { ready, ingesting, failed };
 }
 
 // ── captions ────────────────────────────────────────────────────────────────
