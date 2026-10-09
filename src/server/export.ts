@@ -125,6 +125,9 @@ export async function ensureStagedSrc(
   return { src: `file:${key}` };
 }
 
+/** Sources made ready at once for an export: a Worker keeps six connections open. */
+const STAGE_AT_ONCE = 6;
+
 /**
  * Resolve every "asset:<id>" in the EDL to a fresh staged source, re-staging
  * from this app's storage where needed. Returns the resolved document or a
@@ -136,11 +139,22 @@ export async function resolveEdlSources(
 ): Promise<{ edl: Edl } | { failure: ExportFailure }> {
   edl = await expandSpeech(edl);
   const staged = new Map<string, string>();
-  for (const assetId of collectAssetIds(edl)) {
-    const res = await ensureStagedSrc(assetId, cfg);
-    if ("failure" in res) return res;
-    staged.set(assetId, res.src);
-  }
+  // Several at a time: one after another, a cut of twenty clips spent most of
+  // an export's request here, long enough for a phone to lock and drop it.
+  const ids = [...collectAssetIds(edl)];
+  let failure: ExportFailure | null = null;
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(STAGE_AT_ONCE, ids.length) }, async () => {
+      while (!failure && next < ids.length) {
+        const assetId = ids[next++];
+        const res = await ensureStagedSrc(assetId, cfg);
+        if ("failure" in res) failure ??= res.failure;
+        else staged.set(assetId, res.src);
+      }
+    }),
+  );
+  if (failure) return { failure };
   return { edl: dropLeadTransition(layoutText(substituteAssetSrcs(edl, (id) => staged.get(id)!))) };
 }
 
