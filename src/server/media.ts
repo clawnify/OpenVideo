@@ -10,6 +10,8 @@
 // passes through this app), serves adaptive playback and a frame at any
 // second, and the edit service reads only the seconds a cut needs.
 
+import { refusalDetail } from "./refusal";
+
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 
 export interface MediaConfig {
@@ -83,7 +85,7 @@ async function call<T>(
     return {
       failure: {
         error: err.error ?? "media_failed",
-        detail: err.detail ?? raw.trim().slice(0, 300) ?? `media service returned ${res.status}`,
+        detail: refusalDetail(body, raw.trim().slice(0, 300) || `media service returned ${res.status}`),
       },
     };
   }
