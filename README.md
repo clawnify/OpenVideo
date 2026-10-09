@@ -56,6 +56,8 @@ Overlays can also carry images and video (a logo in the corner, picture-in-pictu
 ```bash
 pnpm install
 pnpm dev        # editor UI + API, with a local database & storage
+pnpm test       # unit tests
+pnpm test:e2e   # the server end to end, with Drive, the media services and the queue stubbed
 ```
 
 Open the editor, hit **New project**, upload a clip from the **Media** panel, click it to put it on the timeline, and trim it. Export and the AI tools run on Clawnify's managed services, so they work once the app is deployed.
