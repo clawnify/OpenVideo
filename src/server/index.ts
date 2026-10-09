@@ -1269,7 +1269,7 @@ app.post("/api/projects/:id/highlights", async (c) => {
   const b = await c.req.json<{ brief?: unknown; again?: unknown }>().catch(() => ({}) as { brief?: unknown; again?: unknown });
   const brief = typeof b.brief === "string" ? b.brief.trim().slice(0, 2000) : null;
   await run(
-    "UPDATE edit_projects SET highlights_at = COALESCE(highlights_at, datetime('now')), brief = COALESCE(?, brief) WHERE id = ?",
+    "UPDATE edit_projects SET highlights_at = COALESCE(highlights_at, datetime('now')), highlights_stopped_at = NULL, brief = COALESCE(?, brief) WHERE id = ?",
     [brief, id],
   );
   await run(
@@ -1283,13 +1283,33 @@ app.post("/api/projects/:id/highlights", async (c) => {
   return c.json({ ok: true, pending, next_step_at: nextStepAt, paused: c.env.OPENROUTER_API_KEY ? null : HIGHLIGHTS_NO_KEY }, 202);
 });
 
+// Stop reading. Clips in line go back to how they were (read before: their
+// picks stay; never read: not asked), and clips logged later don't join until
+// highlights are asked for again. A batch already with the model still lands.
+app.post("/api/projects/:id/highlights/stop", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  await run("UPDATE edit_projects SET highlights_stopped_at = datetime('now') WHERE id = ? AND highlights_at IS NOT NULL", [id]);
+  await run(
+    `UPDATE project_footage SET highlights_status = CASE
+        WHEN skip_reason IS NOT NULL OR EXISTS (SELECT 1 FROM footage_highlights h WHERE h.footage_id = project_footage.id) THEN 'done'
+        ELSE NULL END
+      WHERE project_id = ? AND highlights_status IN ('waiting', 'running')`,
+    [id],
+  );
+  return c.json({ ok: true, pending: await highlightsPending(id) });
+});
+
 // The highlights, best first by default. Filters: kind=soundbite|broll,
 // min_score=2..5, pick=open|keep|drop|not_dropped|all (default all),
 // folder= (a folder and everything inside it), sort=score|clip. Pages of 100,
 // at most 1000. skipped=1 adds the clips judged not worth using, and why.
 app.get("/api/projects/:id/highlights", async (c) => {
   const id = c.req.param("id");
-  const project = await get<{ brief: string; highlights_at: string | null }>("SELECT brief, highlights_at FROM edit_projects WHERE id = ?", [id]);
+  const project = await get<{ brief: string; highlights_at: string | null; highlights_stopped_at: string | null }>(
+    "SELECT brief, highlights_at, highlights_stopped_at FROM edit_projects WHERE id = ?",
+    [id],
+  );
   if (!project) return c.json({ error: "Not found" }, 404);
   const q = (k: string) => c.req.query(k);
   const { where, params } = highlightFilter(id, q, "all");
@@ -1332,6 +1352,7 @@ app.get("/api/projects/:id/highlights", async (c) => {
       : undefined;
   return c.json({
     asked: !!project.highlights_at,
+    stopped: !!project.highlights_stopped_at,
     brief: project.brief,
     clips: {
       logged: clipCount(() => true),
