@@ -17,6 +17,7 @@
 import { enqueueJob, type QueueEnv } from "@clawnify/queue";
 import { query, get, run } from "./db";
 import { deleteMedia, importMedia, mediaState, prepareMedia, type MediaConfig } from "./media";
+import { refusalDetail } from "./refusal";
 import { directDownloadUrl, folderListingUrl, judgeLinkResponse, listFolderVideos, type FolderVideo } from "./drive-link";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -208,7 +209,7 @@ export async function startLog(
   const body = (await res.json().catch(() => null)) as { job_id?: string; error?: string; detail?: string } | null;
   if (res.ok && body?.job_id) return { jobId: body.job_id };
   return {
-    failure: { status: res.status, error: body?.error ?? "analyze_failed", detail: body?.detail ?? `the analysis service answered ${res.status}` },
+    failure: { status: res.status, error: body?.error ?? "analyze_failed", detail: refusalDetail(body, `the analysis service answered ${res.status}`) },
   };
 }
 

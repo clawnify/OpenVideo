@@ -17,6 +17,8 @@ import { parseVtt, type Cue } from "../shared/transcript";
 import { layOut } from "../shared/transition";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
+import { refusalDetail } from "./refusal";
+
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 // Re-stage when the staged copy expires within this window — an export must
 // never race the expiry.
@@ -276,7 +278,7 @@ async function stageAsset(
     return {
       failure: {
         error: json?.error ?? "staging_failed",
-        detail: `could not stage "${asset.name}": ${json?.detail ?? (text || `service returned ${res.status}`)}`,
+        detail: `could not stage "${asset.name}": ${refusalDetail(json, text || `service returned ${res.status}`)}`,
       },
     };
   }
@@ -324,7 +326,7 @@ export async function runEdit(
     return {
       failure: {
         error: json?.error ?? "edit_failed",
-        detail: json?.detail ?? (text || `edit service returned ${res.status}`),
+        detail: refusalDetail(json, text || `edit service returned ${res.status}`),
         ...(json?.path ? { path: json.path } : {}),
       },
     };
@@ -352,7 +354,7 @@ export async function startEdit(
     return {
       failure: {
         error: json?.error ?? "edit_failed",
-        detail: json?.detail ?? (text || `edit service returned ${res.status}`),
+        detail: refusalDetail(json, text || `edit service returned ${res.status}`),
         ...(json?.path ? { path: json.path } : {}),
       },
     };
