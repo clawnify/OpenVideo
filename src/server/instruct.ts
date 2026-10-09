@@ -21,6 +21,7 @@ import {
   type TransitionType,
 } from "../shared/transition";
 import { FORMAT_PRESETS, reshape, sizeFor } from "../shared/format";
+import { MAX_SPEED, MIN_SPEED, cleanSpeed, speedLabel, speedOf } from "../shared/speed";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 const MODEL = "google/gemini-3.7-flash";
@@ -70,6 +71,7 @@ interface Clip {
   trimStart?: number;
   volume?: number;
   sourceAudio?: boolean;
+  speed?: number;
   src: string;
   id: string;
 }
@@ -99,6 +101,19 @@ const OPS = [
         at: { type: "number", description: "seconds from the start of the clip as it plays now" },
       },
       required: ["clip", "at"],
+    },
+  },
+  {
+    name: "set_speed",
+    description:
+      "Play a main-track video clip faster or slower: 2 is twice as fast (the clip lasts half as long), 0.5 is slow motion, 1 is normal. The clip keeps the same footage and its sound keeps its pitch.",
+    parameters: {
+      type: "object",
+      properties: {
+        clip: { type: "integer" },
+        speed: { type: "number", description: `${MIN_SPEED} to ${MAX_SPEED}` },
+      },
+      required: ["clip", "speed"],
     },
   },
   {
@@ -253,10 +268,21 @@ export function apply(
       const clip = clipAt(i);
       const at = Number(args.at);
       if (!clip) return { error: `there is no clip ${args.clip}` };
-      const halves = splitClip(clip, at, clip.duration, rid());
+      // `at` is time as the clip plays; the halves are cut in its source.
+      const halves = splitClip(clip, at * speedOf(clip), clip.duration, rid());
       if (!halves) return { error: "split at a point inside the clip, after its start and before its end" };
       main.splice(i, 1, ...halves);
       return { said: `Split clip ${i} at ${at.toFixed(1)}s` };
+    }
+    case "set_speed": {
+      const clip = clipAt(args.clip);
+      if (!clip) return { error: `there is no clip ${args.clip}` };
+      if (clip.type !== "video") return { error: "only a video clip has a speed" };
+      if (typeof args.speed !== "number" || !(args.speed > 0)) return { error: `give a speed from ${MIN_SPEED} to ${MAX_SPEED}` };
+      const speed = cleanSpeed(args.speed);
+      if (speed === undefined) delete clip.speed;
+      else clip.speed = speed;
+      return { said: speed === undefined ? `Set clip ${args.clip} back to normal speed` : `Set clip ${args.clip} to ${speedLabel(speed)}` };
     }
     case "delete_clip": {
       const i = Number(args.clip);
@@ -426,7 +452,8 @@ function describeEdl(edl: Edl, names: Map<string, string>): string {
     const from = el.trimStart ?? 0;
     const playing = "duration" in el && el.duration !== undefined ? `${el.duration.toFixed(1)}s` : "the rest";
     const audio = el.type === "video" && el.sourceAudio === false ? ", muted" : "";
-    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${audio}${fades(el)}${joined(el, i)}`;
+    const speed = speedOf(el) !== 1 ? ` at ${speedLabel(speedOf(el))}` : "";
+    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${speed}${audio}${fades(el)}${joined(el, i)}`;
   });
   const texts = (edl.overlays ?? []).flatMap((track, ti) =>
     track.elements.map((el, i) =>
@@ -457,7 +484,7 @@ function describeHighlights(list: InstructHighlight[]): string {
 const SYSTEM = [
   "You edit a video by calling the operations you are given. You never write the document yourself.",
   "You cannot see or hear the footage. For anything that depends on its content (pauses, dead air, filler, 'cut where needed'), call clean_up_clip on each clip concerned.",
-  "Clip times (start, seconds) are measured inside the source footage. Text times are measured on the finished video.",
+  "Clip times (start, seconds) are measured inside the source footage, at any speed: a clip that plays 10s of footage at 2x lasts 5s on the finished video. Text times are measured on the finished video.",
   "Positions on the main track are the order the clips play in.",
   "Make the smallest set of changes that does what was asked, then stop and say in one sentence what you changed.",
   "If the request cannot be done with these operations, say so plainly instead of guessing.",

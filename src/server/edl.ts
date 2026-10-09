@@ -16,10 +16,12 @@
 import { z } from "zod";
 import { MAX_FADE_SECONDS } from "../shared/fade";
 import { MAX_TRANSITION_SECONDS, TRANSITION_TYPES } from "../shared/transition";
+import { MAX_SPEED, MIN_SPEED } from "../shared/speed";
 
 export const MAX_ELEMENTS = 100;
 export const MAX_SOURCES = 20;
 export const MAX_OUTPUT_SECONDS = 300; // 5 minutes
+export const MAX_SOURCE_SECONDS = 600; // footage the main track reads; a sped-up clip still decodes all of it
 export const MAX_TEXT_CHARS = 500;
 export const MAX_TRACKS = 10;
 export const MAX_STROKE_PX = 80; // a fifth of the largest fontSize; drawn at most a fifth of its own (shared/outline.ts)
@@ -90,10 +92,13 @@ const mainVideo = z
   .object({
     ...clipBase,
     type: z.literal("video"),
-    /** Play this many seconds from trimStart (instead of trimming the tail) —
-     *  "10s starting at 0:32" without knowing the source's length. Wins over
-     *  trimEnd when both are set. */
-    duration: seconds.min(0.05).max(MAX_OUTPUT_SECONDS).optional(),
+    /** Play this many seconds of the source from trimStart (instead of
+     *  trimming the tail) — "10s starting at 0:32" without knowing the
+     *  source's length. Wins over trimEnd when both are set. */
+    duration: seconds.min(0.05).max(MAX_SOURCE_SECONDS).optional(),
+    /** Playback speed, 0.1 to 10: the same footage in 1/speed of the time.
+     *  Trims and duration still measure the source. shared/speed.ts */
+    speed: z.number().finite().min(MIN_SPEED).max(MAX_SPEED).optional(),
     /** Mix this clip's own audio into the output. Default true. */
     sourceAudio: z.boolean().optional(),
     volume: z.number().finite().min(0).max(2).optional(),
