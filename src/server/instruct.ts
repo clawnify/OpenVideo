@@ -21,6 +21,7 @@ import {
   type TransitionType,
 } from "../shared/transition";
 import { FORMAT_PRESETS, reshape, sizeFor } from "../shared/format";
+import { ADJUST_KEYS, cleanAdjust, describeAdjust, type Adjust } from "../shared/adjust";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 const MODEL = "google/gemini-3.7-flash";
@@ -63,6 +64,7 @@ export type AppliedOp = string;
 
 interface Clip {
   type: "video" | "image";
+  adjust?: Adjust;
   fadeIn?: number;
   fadeOut?: number;
   transition?: Transition;
@@ -126,6 +128,24 @@ const OPS = [
         volume: { type: "number", description: "0 to 2" },
       },
       required: ["clip"],
+    },
+  },
+  {
+    name: "adjust_color",
+    description:
+      "Change the colour of a main-track clip, of every main-track clip at once (`every`: footage from one camera usually needs one fix), or of a video or image overlay (`track` and `index`). Each value runs -100 to 100 and 0 is unchanged; temperature above 0 is warmer, below is cooler; saturation -100 is black and white. Values given replace the clip's own; values left out stay as they are. You cannot see the footage: change colour only when asked, and only as far as asked.",
+    parameters: {
+      type: "object",
+      properties: {
+        clip: { type: "integer", description: "0-based position on the main track" },
+        every: { type: "boolean", description: "every clip on the main track" },
+        track: { type: "integer", description: "overlay track of a video or image overlay" },
+        index: { type: "integer", description: "its position on that track" },
+        brightness: { type: "number" },
+        contrast: { type: "number" },
+        saturation: { type: "number" },
+        temperature: { type: "number" },
+      },
     },
   },
   {
@@ -290,6 +310,34 @@ export function apply(
       const what = args.clip !== undefined ? `clip ${args.clip}` : `${args.track}.${args.index}`;
       return { said: target.fadeIn || target.fadeOut ? `Set the fades on ${what}` : `Removed the fades on ${what}` };
     }
+    case "adjust_color": {
+      const given = ADJUST_KEYS.filter((k) => typeof args[k] === "number" && Number.isFinite(args[k]));
+      if (!given.length) return { error: `give at least one of ${ADJUST_KEYS.join(", ")}, from -100 to 100` };
+      let targets: { adjust?: Adjust }[];
+      let what: string;
+      if (args.every === true) {
+        targets = main;
+        what = "every clip";
+      } else if (args.clip !== undefined) {
+        const clip = clipAt(args.clip);
+        if (!clip) return { error: `there is no clip ${args.clip}` };
+        targets = [clip];
+        what = `clip ${args.clip}`;
+      } else {
+        const el = draft.overlays?.[Number(args.track)]?.elements[Number(args.index)];
+        if (!el || el.type === "text") return { error: "there is no video or image overlay there" };
+        targets = [el];
+        what = `overlay ${args.track}.${args.index}`;
+      }
+      for (const t of targets) {
+        const next: Adjust = { ...t.adjust };
+        for (const k of given) next[k] = (args[k] as number) / 100;
+        t.adjust = cleanAdjust(next);
+        if (!t.adjust) delete t.adjust;
+      }
+      const now = describeAdjust(targets[0].adjust);
+      return { said: now ? `Set the colour of ${what}: ${now}` : `Put the colour of ${what} back as shot` };
+    }
     case "transition": {
       const type = String(args.type ?? "");
       if (type !== "none" && !(TRANSITION_TYPES as readonly string[]).includes(type)) {
@@ -413,6 +461,12 @@ function fades(el: { fadeIn?: number; fadeOut?: number }): string {
   return parts.length ? `, ${parts.join(", ")}` : "";
 }
 
+/** A clip's colour, when it has been changed. */
+function colour(el: { adjust?: Adjust }): string {
+  const d = describeAdjust(el.adjust);
+  return d ? `, colour ${d}` : "";
+}
+
 /** How a clip comes in, when it does not simply cut in. */
 function joined(el: { transition?: Transition }, i: number): string {
   const t = i > 0 ? el.transition : undefined;
@@ -426,13 +480,13 @@ function describeEdl(edl: Edl, names: Map<string, string>): string {
     const from = el.trimStart ?? 0;
     const playing = "duration" in el && el.duration !== undefined ? `${el.duration.toFixed(1)}s` : "the rest";
     const audio = el.type === "video" && el.sourceAudio === false ? ", muted" : "";
-    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${audio}${fades(el)}${joined(el, i)}`;
+    return `  clip ${i}: "${name}" from ${from.toFixed(1)}s, plays ${playing}${audio}${colour(el)}${fades(el)}${joined(el, i)}`;
   });
   const texts = (edl.overlays ?? []).flatMap((track, ti) =>
     track.elements.map((el, i) =>
       el.type === "text"
         ? `  text ${ti}.${i}: "${el.text}" at ${el.startTime.toFixed(1)}s for ${el.duration.toFixed(1)}s${fades(el)}`
-        : `  overlay ${ti}.${i}: ${el.type}${fades(el)}`,
+        : `  overlay ${ti}.${i}: ${el.type}${colour(el)}${fades(el)}`,
     ),
   );
   return [

@@ -307,7 +307,15 @@ its in-point, into the footage beyond their trims (a clip that starts at 0:00
 holds its first frame for that part). So overlay and audio times stay where
 they are and the video keeps its length. One longer than the clips on either
 side allow is shortened to fit, and one on the first clip is left out of the
-export. Text overlays: `fontFamily`
+export. Every main-track clip and media overlay takes `adjust: { "brightness",
+"contrast", "saturation", "temperature" }`, each -1..1 with 0 leaving the
+picture alone (the editor shows -100..100): brightness is a gain (1 doubles,
+-1 halves), contrast pivots on mid grey, saturation -1 is black and white, and
+temperature above 0 is warmer. Leave out what you do not change. Flat log
+footage usually wants contrast and saturation up (0.2 to 0.4 each); footage
+from one camera usually wants the same values on every clip of it. You cannot
+see the picture: change colour when asked, or when a clip's log says it is
+flat, dark or off-colour, and say what you set. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
 `background` (`#RRGGBBAA` works), optional `stroke: { "color": "#000000",
 "width": 4 }` for an outline around the letters (opaque colour; `width` in px

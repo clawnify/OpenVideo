@@ -35,6 +35,7 @@ import {
   type Transition,
   type TransitionType,
 } from "../shared/transition";
+import { ADJUST_KEYS, adjustSteps, cleanAdjust, type Adjust, type AdjustKey } from "../shared/adjust";
 import {
   FULL,
   cropToRatio,
@@ -191,6 +192,8 @@ interface MainVideo {
   anchor?: Anchor;
   /** The part of the source kept, cut out before fitting (shared/crop.ts). */
   crop?: Crop;
+  /** Colour adjustment, the export's own maths (shared/adjust.ts). */
+  adjust?: Adjust;
   /** Seconds to fade from and to black (shared/fade.ts). */
   fadeIn?: number;
   fadeOut?: number;
@@ -205,6 +208,7 @@ interface MainImage {
   fit?: "contain" | "cover";
   anchor?: Anchor;
   crop?: Crop;
+  adjust?: Adjust;
   /** Seconds to fade from and to black (shared/fade.ts). */
   fadeIn?: number;
   fadeOut?: number;
@@ -225,6 +229,7 @@ interface OverlayMedia {
   trimStart?: number;
   trimEnd?: number;
   crop?: Crop;
+  adjust?: Adjust;
   /** Seconds to fade from and to transparent, the out ending where it is last seen. */
   fadeIn?: number;
   fadeOut?: number;
@@ -3149,6 +3154,8 @@ function Player({
   /** A clip's sound in a transition, on acrossfade's curve; 1 otherwise. */
   const crossGain = (seg: Seg) => (blend && seg === blend.from ? blend.look.gains[0] : blend && seg === blend.to ? blend.look.gains[1] : 1);
   const filterId = useId().replace(/:/g, "");
+  // An element id can be any string; a url(#…) reference cannot.
+  const adjustId = (elementId: string) => `${filterId}-adj-${elementId.replace(/[^\w-]/g, "_")}`;
   /** An overlay's opacity right now: its own times its fades. */
   const overlayOpacity = (el: { startTime: number; duration: number; opacity?: number; fadeIn?: number; fadeOut?: number }) =>
     (el.opacity ?? 1) * fadeGain(el, heardFor(el.startTime, el.duration, cutLength), playhead - el.startTime);
@@ -3459,8 +3466,13 @@ function Player({
                   filter: effect,
                 }}
               >
-              {/* The same wrapper either way, so cropping never reloads the video. */}
-              <div className={`absolute ${place ? "overflow-hidden" : "inset-0"}`} style={place ? pct(place.box) : undefined}>
+              {seg.el.adjust && <AdjustFilter id={adjustId(seg.el.id)} adjust={seg.el.adjust} />}
+              {/* The same wrapper either way, so cropping never reloads the
+                  video. Its colour is adjusted, never the bars around it. */}
+              <div
+                className={`absolute ${place ? "overflow-hidden" : "inset-0"}`}
+                style={{ ...(place ? pct(place.box) : {}), filter: adjustUrl(adjustId(seg.el.id), seg.el.adjust) }}
+              >
                 {seg.el.type === "video" ? (
                   a.media_uid ? (
                     <MediaVideo
@@ -3542,6 +3554,8 @@ function Player({
                     ) : (
                       <video ref={keep(overlayRefs.current, m.id)} src={assetUrl(a)} preload="auto" playsInline muted {...props} />
                     );
+                  const colour = adjustUrl(adjustId(m.id), m.adjust);
+                  const adjustDefs = m.adjust && <AdjustFilter id={adjustId(m.id)} adjust={m.adjust} />;
                   const shape = m.crop ? shapeFor(a) : undefined;
                   if (shape && m.crop) {
                     const kept = croppedShape(shape, m.crop);
@@ -3560,10 +3574,11 @@ function Player({
                           display: show ? undefined : "none",
                         }}
                       >
+                        {adjustDefs}
                         {m.type === "image" ? (
-                          <img src={assetUrl(a)} className="absolute max-w-none pointer-events-none" style={pct(source)} />
+                          <img src={assetUrl(a)} className="absolute max-w-none pointer-events-none" style={{ ...pct(source), filter: colour }} />
                         ) : (
-                          overlayVideo({ className: "absolute max-w-none pointer-events-none", style: { ...pct(source), objectFit: "fill" } })
+                          overlayVideo({ className: "absolute max-w-none pointer-events-none", style: { ...pct(source), objectFit: "fill", filter: colour } })
                         )}
                       </div>
                     );
@@ -3575,10 +3590,11 @@ function Player({
                       className={`absolute cursor-move ${selected ? "outline outline-2 outline-ring" : ""}`}
                       style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, width: `${m.width * 100}%`, opacity: overlayOpacity(m), display: show ? undefined : "none" }}
                     >
+                      {adjustDefs}
                       {m.type === "image" ? (
-                        <img src={assetUrl(a)} onLoad={noteSize(a.id)} className="w-full h-auto pointer-events-none" />
+                        <img src={assetUrl(a)} onLoad={noteSize(a.id)} className="w-full h-auto pointer-events-none" style={{ filter: colour }} />
                       ) : (
-                        overlayVideo({ onLoadedMetadata: noteSize(a.id), className: "w-full h-auto pointer-events-none" })
+                        overlayVideo({ onLoadedMetadata: noteSize(a.id), className: "w-full h-auto pointer-events-none", style: { filter: colour } })
                       )}
                     </div>
                   );
@@ -3649,6 +3665,32 @@ function TransitionFilter({ id, blurBox, block, scale }: { id: string; blurBox?:
     </svg>
   );
 }
+
+/**
+ * A clip's colour adjustment as an SVG filter: the saturation matrix, then a
+ * straight line per channel, each clamped, in the encoded RGB the export
+ * works in (sRGB interpolation, not SVG's default linear light).
+ */
+function AdjustFilter({ id, adjust }: { id: string; adjust: Adjust }) {
+  const { matrix, slopes, intercept, lines } = adjustSteps(adjust);
+  return (
+    <svg className="absolute w-0 h-0" aria-hidden>
+      <filter id={id} x="0" y="0" width="100%" height="100%" colorInterpolationFilters="sRGB">
+        {matrix && <feColorMatrix type="matrix" values={matrix.map((row) => `${row.join(" ")} 0 0`).join(" ") + " 0 0 0 1 0"} />}
+        {lines && (
+          <feComponentTransfer>
+            <feFuncR type="linear" slope={slopes[0]} intercept={intercept} />
+            <feFuncG type="linear" slope={slopes[1]} intercept={intercept} />
+            <feFuncB type="linear" slope={slopes[2]} intercept={intercept} />
+          </feComponentTransfer>
+        )}
+      </filter>
+    </svg>
+  );
+}
+
+/** The CSS `filter` that draws an element's adjustment, if it has one. */
+const adjustUrl = (id: string, adjust: Adjust | undefined) => (cleanAdjust(adjust) ? `url(#${id})` : undefined);
 
 /** A rectangle in shares of its container, as CSS. */
 const pct = (r: { left: number; top: number; width: number; height: number }): React.CSSProperties => ({
@@ -4374,6 +4416,71 @@ function Fades({
   );
 }
 
+const ADJUST_LABELS: Record<AdjustKey, string> = {
+  brightness: "Brightness",
+  contrast: "Contrast",
+  saturation: "Saturation",
+  temperature: "Temperature",
+};
+
+/**
+ * A clip's colour: -100..100 here, -1..1 in the EDL, drawn in the preview as
+ * the export renders it (shared/adjust.ts). Double-click a slider to zero it.
+ * `onApplyAll` gives every clip on the main track the same look: footage from
+ * one camera usually needs one fix throughout.
+ */
+function ColourAdjust({
+  adjust,
+  onChange,
+  onApplyAll,
+}: {
+  adjust?: Adjust;
+  onChange: (a: Adjust | undefined) => void;
+  onApplyAll?: () => void;
+}) {
+  const a = cleanAdjust(adjust);
+  const set = (k: AdjustKey, v: number) => onChange(cleanAdjust({ ...a, [k]: v / 100 }));
+  return (
+    <Field label="Colour">
+      {ADJUST_KEYS.map((k) => {
+        const v = Math.round((a?.[k] ?? 0) * 100);
+        return (
+          <label key={k} className="block mb-1.5">
+            <span className="flex justify-between text-fine text-muted">
+              <span>{ADJUST_LABELS[k]}</span>
+              <span className="tabular-nums">{v > 0 ? `+${v}` : v}</span>
+            </span>
+            <input
+              type="range"
+              className="w-full"
+              min={-100}
+              max={100}
+              step={1}
+              value={v}
+              onChange={(e) => set(k, Number(e.target.value))}
+              onDoubleClick={() => set(k, 0)}
+            />
+          </label>
+        );
+      })}
+      {(a || onApplyAll) && (
+        <div className="flex gap-1 -ml-2">
+          {a && (
+            <button className={btnGhost} onClick={() => onChange(undefined)}>
+              Reset
+            </button>
+          )}
+          {onApplyAll && (
+            <button className={btnGhost} onClick={onApplyAll}>
+              Apply to all clips
+            </button>
+          )}
+        </div>
+      )}
+    </Field>
+  );
+}
+
 /**
  * A style's icon: how the picture changes, drawn small. Wipes and slides are
  * drawn moving left and turned for the other directions.
@@ -4659,6 +4766,18 @@ function Inspector({
           )}
         </>
       );
+      const mainColour = (
+        <ColourAdjust
+          adjust={el.adjust}
+          // One drag, one undo step.
+          onChange={(adj) => update((d) => void (d.main.elements[sel.i].adjust = adj), true)}
+          onApplyAll={
+            edl.main.elements.length > 1
+              ? () => update((d) => d.main.elements.forEach((e) => (e.adjust = cleanAdjust(el.adjust))))
+              : undefined
+          }
+        />
+      );
       return (
         <>
           <Zone>{el.type === "video" ? "Video clip" : "Image"}</Zone>
@@ -4680,6 +4799,7 @@ function Inspector({
                 />
               )}
               {mainCrop(el)}
+              {mainColour}
               <Row label="Clip audio">
                 <button
                   className={`${inputCls} text-left`}
@@ -4770,6 +4890,7 @@ function Inspector({
                 />
               )}
               {mainCrop(el)}
+              {mainColour}
               {mainFades}
             </>
           )}
@@ -4861,6 +4982,12 @@ function Inspector({
                   else delete m.crop;
                 })
               }
+            />
+          )}
+          {el.type !== "text" && (
+            <ColourAdjust
+              adjust={el.adjust}
+              onChange={(adj) => update((d) => void ((d.overlays![sel.ti].elements[sel.i] as OverlayMedia).adjust = adj), true)}
             />
           )}
           <PositionRow
