@@ -39,6 +39,21 @@ export type ClipAnalyzer = (
   focus: string | undefined,
 ) => Promise<{ keeps: { start: number; end: number }[]; notes: string } | { error: string }>;
 
+/** One of the project's highlights, as the model reads it and add_highlight places it. */
+export interface InstructHighlight {
+  id: string;
+  /** `asset:<id>` of its clip. */
+  src: string;
+  kind: "soundbite" | "broll";
+  /** Seconds into the clip. */
+  start: number;
+  end: number;
+  text: string;
+  speaker: string;
+  score: number;
+  kept: boolean;
+}
+
 export interface InstructFailure {
   error: string;
   detail: string;
@@ -198,6 +213,20 @@ const OPS = [
     },
   },
   {
+    name: "add_highlight",
+    description:
+      "Put one of the footage's highlights into the cut, as a main-track clip trimmed to it. Highlights are listed with the cut; use their id. A soundbite keeps its sound; b-roll plays without its own sound unless `sound` says otherwise.",
+    parameters: {
+      type: "object",
+      properties: {
+        highlight: { type: "string", description: "the highlight's id, as listed" },
+        at: { type: "integer", description: "0-based position on the main track to put it at; the end when left out" },
+        sound: { type: "boolean", description: "whether its own sound plays" },
+      },
+      required: ["highlight"],
+    },
+  },
+  {
     name: "set_format",
     description: `Change the shape of the finished video. ${FORMAT_PRESETS.map((p) => `${p.ratio} is ${p.name.toLowerCase()} (${p.hint})`).join("; ")}.`,
     parameters: {
@@ -211,7 +240,12 @@ const OPS = [
 const rid = () => Math.random().toString(36).slice(2, 10);
 
 /** Apply one operation to a draft. Returns what to tell the user, or an error. */
-export function apply(draft: Edl, name: string, args: Record<string, unknown>): { said: string } | { error: string } {
+export function apply(
+  draft: Edl,
+  name: string,
+  args: Record<string, unknown>,
+  highlights: Map<string, InstructHighlight> = new Map(),
+): { said: string } | { error: string } {
   const main = draft.main.elements as unknown as Clip[];
   const clipAt = (n: unknown): Clip | null => {
     const i = Number(n);
@@ -332,6 +366,23 @@ export function apply(draft: Edl, name: string, args: Record<string, unknown>): 
       track.elements.splice(index, 1);
       return { said: "Removed a text element" };
     }
+    case "add_highlight": {
+      const h = highlights.get(String(args.highlight ?? ""));
+      if (!h) return { error: `there is no highlight "${args.highlight}"` };
+      const at = args.at === undefined ? main.length : Number(args.at);
+      if (!Number.isInteger(at) || at < 0 || at > main.length) return { error: `cannot put it at ${args.at}` };
+      const sound = typeof args.sound === "boolean" ? args.sound : h.kind === "soundbite";
+      main.splice(at, 0, {
+        id: rid(),
+        type: "video",
+        src: h.src,
+        trimStart: h.start,
+        duration: Math.round((h.end - h.start) * 100) / 100,
+        ...(sound ? {} : { sourceAudio: false }),
+      } as Clip);
+      const what = h.kind === "soundbite" ? `the soundbite "${h.text.slice(0, 40)}"` : `the shot of ${h.text.slice(0, 40).toLowerCase()}`;
+      return { said: `Added ${what} at position ${at}` };
+    }
     case "set_format": {
       // The same sizing and the same rescaling as the editor's Format picker.
       const preset = FORMAT_PRESETS.find((p) => p.ratio === args.format);
@@ -418,6 +469,18 @@ function describeEdl(edl: Edl, names: Map<string, string>): string {
   ].join("\n");
 }
 
+/** The highlights the model may use: kept ones first, then the best. */
+const MAX_LISTED = 120;
+
+function describeHighlights(list: InstructHighlight[]): string {
+  if (!list.length) return "";
+  const lines = list.slice(0, MAX_LISTED).map((h) => {
+    const what = h.kind === "soundbite" ? `${h.speaker ? `${h.speaker}: ` : ""}"${h.text.slice(0, 160)}"` : h.text.slice(0, 120);
+    return `  ${h.id}: ${h.kind}, score ${h.score}${h.kept ? ", kept" : ""}, ${(h.end - h.start).toFixed(1)}s, ${what}`;
+  });
+  return `\n\nHighlights from the footage (picked and scored from every clip; kept means a person chose it):\n${lines.join("\n")}`;
+}
+
 const SYSTEM = [
   "You edit a video by calling the operations you are given. You never write the document yourself.",
   "You cannot see or hear the footage. For anything that depends on its content (pauses, dead air, filler, 'cut where needed'), call clean_up_clip on each clip concerned.",
@@ -425,6 +488,7 @@ const SYSTEM = [
   "Positions on the main track are the order the clips play in.",
   "Make the smallest set of changes that does what was asked, then stop and say in one sentence what you changed.",
   "If the request cannot be done with these operations, say so plainly instead of guessing.",
+  "When highlights are listed, they are the best parts of the footage: to build or extend a cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then higher scores, and keep to the length asked for.",
 ].join(" ");
 
 /**
@@ -439,6 +503,8 @@ export async function instructEdit(
   /** Source length in seconds by `asset:<id>`, to know where a clip's window ends. */
   sourceSeconds: Map<string, number> = new Map(),
   analyze?: ClipAnalyzer,
+  /** The project's highlights, kept first then best: what add_highlight places. */
+  highlights: InstructHighlight[] = [],
 ): Promise<{ edl: Edl; said: string; applied: AppliedOp[] } | { failure: InstructFailure | EdlInvalid }> {
   if (!cfg.openrouterKey) {
     return {
@@ -453,8 +519,14 @@ export async function instructEdit(
   const applied: AppliedOp[] = [];
   const messages: Record<string, unknown>[] = [
     { role: "system", content: SYSTEM },
-    { role: "user", content: `The cut right now:\n${describeEdl(draft, assetNames)}\n\nWhat to change: ${instruction}` },
+    {
+      role: "user",
+      content: `The cut right now:\n${describeEdl(draft, assetNames)}${describeHighlights(highlights)}\n\nWhat to change: ${instruction}`,
+    },
   ];
+  const byId = new Map(highlights.map((h) => [h.id, h]));
+  // Offered only when there are highlights to place.
+  const ops = highlights.length ? OPS : OPS.filter((op) => op.name !== "add_highlight");
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -464,7 +536,7 @@ export async function instructEdit(
         model: MODEL,
         messages,
         temperature: 0.1,
-        tools: OPS.map((op) => ({ type: "function", function: op })),
+        tools: ops.map((op) => ({ type: "function", function: op })),
       }),
     });
     if (!res.ok) {
@@ -507,7 +579,7 @@ export async function instructEdit(
         args = { ...args, clip: id === undefined ? args.clip : now };
       }
       const out =
-        name === "clean_up_clip" ? await cleanUp(draft, args, sourceSeconds, analyze) : apply(draft, name, args);
+        name === "clean_up_clip" ? await cleanUp(draft, args, sourceSeconds, analyze) : apply(draft, name, args, byId);
       if ("said" in out) applied.push(out.said);
       // The model plans its next round from this, so the last answer carries
       // the cut as it now stands, positions included.
