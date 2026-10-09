@@ -157,6 +157,9 @@ ALTER TABLE edit_projects ADD COLUMN footage_step_at TEXT;
 -- `highlights_at`: when the project asked for them; NULL, it hasn't. Clips
 -- logged after that join in by themselves.
 ALTER TABLE edit_projects ADD COLUMN highlights_at TEXT;
+-- When a person stopped the reading; NULL, it runs. Stopped, clips in line go
+-- back and clips logged later don't join, until highlights are asked again.
+ALTER TABLE edit_projects ADD COLUMN highlights_stopped_at TEXT;
 -- Per clip: NULL (not asked) | waiting | running | done | failed. A clip done
 -- with a skip_reason was judged not worth an editor's time, and why.
 ALTER TABLE project_footage ADD COLUMN highlights_status TEXT;

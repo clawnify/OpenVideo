@@ -14,6 +14,7 @@ import {
   Loader2,
   RotateCcw,
   Sparkles,
+  Square,
   Star,
   X,
 } from "lucide-react";
@@ -57,6 +58,7 @@ interface SkippedClip {
 
 interface HighlightList {
   asked: boolean;
+  stopped: boolean;
   brief: string;
   clips: { logged: number; done: number; pending: number; failed: number; skipped: number; not_asked: number };
   counts: { total: number; soundbites: number; broll: number; kept: number; dropped: number; open: number };
@@ -385,6 +387,15 @@ function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId
       setBusy(false);
     }
   };
+  const stop = async () => {
+    setBusy(true);
+    try {
+      await api.send("POST", `/api/projects/${projectId}/highlights/stop`, {});
+      onAgain();
+    } finally {
+      setBusy(false);
+    }
+  };
   const read = clips.done + clips.failed;
   return (
     <div className="mb-3 text-fine text-muted">
@@ -395,7 +406,7 @@ function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId
             Reading clips: {read} of {read + clips.pending}
           </>
         ) : (
-          `${plural(clips.done, "clip", "clips")} read`
+          `${plural(clips.done, "clip", "clips")} read${list.stopped ? " (stopped)" : ""}`
         )}
         {" · "}
         {plural(counts.total, "pick", "picks")} ({plural(counts.soundbites, "soundbite", "soundbites")}, {counts.broll} b-roll) ·{" "}
@@ -433,9 +444,22 @@ function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId
             <RotateCcw className="w-3.5 h-3.5" /> Retry {clips.failed} failed
           </button>
         )}
+        {clips.pending > 0 && (
+          <button
+            onClick={stop}
+            disabled={busy}
+            className={btnGhost}
+            title="Stop reading. The picks found so far stay, and clips logged from now on wait until you ask again."
+          >
+            <Square className="w-3.5 h-3.5" /> Stop
+          </button>
+        )}
         {clips.pending === 0 && clips.not_asked > 0 && (
           <button onClick={() => again(false)} disabled={busy} className={btnGhost}>
-            <Sparkles className="w-3.5 h-3.5" /> Read {clips.not_asked} new {clips.not_asked === 1 ? "clip" : "clips"}
+            <Sparkles className="w-3.5 h-3.5" />{" "}
+            {list.stopped
+              ? `Read the ${plural(clips.not_asked, "clip", "clips")} not read`
+              : `Read ${clips.not_asked} new ${clips.not_asked === 1 ? "clip" : "clips"}`}
           </button>
         )}
         {clips.pending === 0 && !editing && (
