@@ -123,7 +123,9 @@ POST  /api/projects/{id}/highlights/items    { "clip": "<clipId>", "start"?, "en
 GET   /api/projects/{id}/highlights/export?format=csv|xml&pick=keep|not_dropped&root=&fps=
 ```
 
-`again` reads every clip again; what a person kept or dropped stays as it is.
+`again` reads every clip again; what a person kept or dropped stays as it is,
+and each reading learns from those calls (the latest 15 kept and 15 dropped)
+beside the brief. A `PATCH` with `pick` is how you teach it.
 A soundbite's `speaker` is who says it as the clip's log describes them; it
 names a person only when the clip itself does (said, shown or logged), so
 correct it with the person's name and title when you know them.

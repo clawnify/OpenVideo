@@ -496,9 +496,17 @@ assert.equal(r.data.pending, logged);
 d = await deliver();
 assert.ok(world.prompts.length > promptsBefore);
 assert.ok(world.prompts.slice(promptsBefore).some((p) => p.includes("Already reviewed by a person")), "reviewed stretches are passed as taken");
+const again = world.prompts.slice(promptsBefore).join("\n");
+assert.match(again, /\] kept: /, "each reviewed stretch says whether it was kept");
+assert.match(again, /\] dropped: /, "or dropped");
+assert.match(again, /Learn their taste from it/, "the reading learns from the calls");
+assert.ok(again.includes(`"${first.text.slice(0, 160)}" (scored ${first.score} when proposed)`), "a kept pick is shown as kept, with the score it had");
+assert.ok(again.includes(`"${second.text.slice(0, 160)}" (scored`), "a dropped one too");
+assert.ok(again.includes('"Used anyway" (added by them)'), "and a person's own pick as theirs");
+assert.ok(again.indexOf("Dropped:") > again.indexOf("Kept:"));
 assert.equal(db.prepare("SELECT pick FROM footage_highlights WHERE id = ?").get(first.id).pick, "keep", "a kept pick survives finding again");
 assert.equal(db.prepare("SELECT pick FROM footage_highlights WHERE id = ?").get(second.id).pick, "drop", "so does a dropped one");
-console.log("11d ok: finding again keeps a person's calls and tells the model about them");
+console.log("11d ok: finding again keeps a person's calls, tells the model about them, and passes kept and dropped as the taste to learn");
 
 // Stop: a find-again in line is stopped before any delivery reads it. Clips
 // read before keep their picks and count as read; a clip never read goes back

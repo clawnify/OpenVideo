@@ -121,7 +121,7 @@ describe("readHighlights", () => {
   });
 
   it("never picks again over what a person already reviewed", () => {
-    const reviewed = { ...interview, taken: [{ start: 3.3, end: 10.1, text: "Shipping" }] };
+    const reviewed = { ...interview, taken: [{ start: 3.3, end: 10.1, text: "Shipping", pick: "keep" as const }] };
     const out = readHighlights(
       answer([{ clip: 1, use: true, skip_reason: "", highlights: [{ kind: "soundbite", start: "0:03.4", end: "0:06.1", text: "Shipping…", speaker: "", score: 5, reason: "" }] }]),
       [reviewed],
@@ -149,6 +149,23 @@ describe("highlightsPrompt", () => {
     expect(p).toContain("No speech.");
     expect(p).toMatch(/Flat or log colour[^.]*neither is a reason to skip/);
     expect(p).toMatch(/so no word is cut/);
+  });
+
+  it("says what a person kept and dropped, on the clip and as a taste to learn from", () => {
+    const reviewed = { ...interview, taken: [{ start: 3.3, end: 6.1, text: "Shipping fast", pick: "keep" as const }, { start: 8, end: 9, text: "Um, so", pick: "drop" as const }] };
+    const p = highlightsPrompt("A sizzle", [reviewed], {
+      kept: [{ kind: "soundbite", text: "Shipping fast is the whole point.", speaker: "woman in green", score: 3, own: false }, { kind: "broll", text: "Logo wall", speaker: "", score: 3, own: true }],
+      dropped: [{ kind: "broll", text: "Crowd walking past", speaker: "", score: 4, own: false }],
+    });
+    expect(p).toContain("[0:03.3-0:06.1] kept: Shipping fast; [0:08.0-0:09.0] dropped: Um, so");
+    expect(p).toMatch(/Learn their taste from it/);
+    expect(p).toMatch(/the brief wins/);
+    expect(p).toContain('Kept:\n- soundbite, woman in green: "Shipping fast is the whole point." (scored 3 when proposed)\n- b-roll: "Logo wall" (added by them)');
+    expect(p).toContain('Dropped:\n- b-roll: "Crowd walking past" (scored 4 when proposed)');
+    // The taste comes before the clips, and nothing is said when there is none.
+    expect(p.indexOf("Kept:")).toBeLessThan(p.indexOf("CLIP 1:"));
+    expect(highlightsPrompt("A sizzle", [interview])).not.toMatch(/Learn their taste/);
+    expect(highlightsPrompt("A sizzle", [interview], { kept: [], dropped: [] })).not.toMatch(/Learn their taste/);
   });
 
   it("asks for every field it reads", () => {

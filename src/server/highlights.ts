@@ -51,8 +51,38 @@ export interface HighlightClip {
   /** WebVTT, or null when there is none (no speech, or not made). */
   transcript: string | null;
   /** Stretches a person already kept or dropped: never picked again. */
-  taken?: { start: number; end: number; text: string }[];
+  taken?: Reviewed[];
 }
+
+/** A stretch of a clip a person already kept or dropped. */
+export interface Reviewed {
+  start: number;
+  end: number;
+  text: string;
+  pick: "keep" | "drop";
+}
+
+/**
+ * What a person has kept and dropped across the project, latest first: the
+ * taste a reading learns from, beside the brief.
+ */
+export interface Taste {
+  kept: TasteExample[];
+  dropped: TasteExample[];
+}
+
+export interface TasteExample {
+  kind: HighlightKind;
+  text: string;
+  speaker: string;
+  /** The score it had when it was proposed. */
+  score: number;
+  /** A pick the person added themselves. */
+  own: boolean;
+}
+
+/** How many of each a prompt carries: enough to show a taste, bounded however long the review. */
+export const TASTE_EXAMPLES = 15;
 
 export interface ClipVerdict {
   id: string;
@@ -148,7 +178,9 @@ function clipBlock(n: number, c: HighlightClip): string {
     lines.push("No speech.");
   }
   if (c.taken?.length) {
-    lines.push(`Already reviewed by a person, don't pick again or overlap: ${c.taken.map((t) => `[${stamp(t.start)}-${stamp(t.end)}] ${t.text.slice(0, 80)}`).join("; ")}`);
+    lines.push(
+      `Already reviewed by a person, don't pick again or overlap: ${c.taken.map((t) => `[${stamp(t.start)}-${stamp(t.end)}] ${t.pick === "keep" ? "kept" : "dropped"}: ${t.text.slice(0, 80)}`).join("; ")}`,
+    );
   }
   return lines.join("\n");
 }
@@ -182,7 +214,19 @@ export function batchClips<T extends HighlightClip>(clips: T[], limits = BATCH):
   return out;
 }
 
-export function highlightsPrompt(brief: string, clips: HighlightClip[]): string {
+function tasteBlock(taste: Taste | undefined): string {
+  if (!taste || (!taste.kept.length && !taste.dropped.length)) return "";
+  const line = (e: TasteExample) =>
+    `- ${e.kind === "soundbite" ? "soundbite" : "b-roll"}${e.speaker ? `, ${e.speaker.slice(0, 60)}` : ""}: "${e.text.slice(0, 160)}" (${e.own ? "added by them" : `scored ${e.score} when proposed`})`;
+  const parts = [
+    "The person reviewing these picks has already kept and dropped some in this project, latest first. Learn their taste from it: score picks like the kept ones higher, and leave out or mark down picks like the ones they drop. Where this and the brief above disagree, the brief wins.",
+  ];
+  if (taste.kept.length) parts.push(`Kept:\n${taste.kept.map(line).join("\n")}`);
+  if (taste.dropped.length) parts.push(`Dropped:\n${taste.dropped.map(line).join("\n")}`);
+  return `\n\n${parts.join("\n")}`;
+}
+
+export function highlightsPrompt(brief: string, clips: HighlightClip[], taste?: Taste): string {
   const goal = brief.trim() ? brief.trim().slice(0, 2000) : "a short highlight video of this shoot";
   return `You are the assistant editor making selects for: ${goal}
 
@@ -200,7 +244,7 @@ A soundbite's speaker is who says it as the log describes them ("man in a red sh
 
 Picks in a clip never overlap, and the same moment is never picked twice. When two clips show the same moment (two cameras, or a retake), pick from the better one and say so in the other's reason or skip reason.
 
-How many: as many as are worth an editor's look. A 5-second shot has none or one. A long interview or talk: read it all, start to finish, and pick every strong soundbite, roughly one for every two or three minutes of talk and more where it is strong; a 45-minute interview usually gives fifteen or more. The logger's picks are a hint: include the strong ones, and find the others they missed.
+How many: as many as are worth an editor's look. A 5-second shot has none or one. A long interview or talk: read it all, start to finish, and pick every strong soundbite, roughly one for every two or three minutes of talk and more where it is strong; a 45-minute interview usually gives fifteen or more. The logger's picks are a hint: include the strong ones, and find the others they missed.${tasteBlock(taste)}
 
 ${clips.map((c, i) => clipBlock(i + 1, c)).join("\n\n")}`;
 }
@@ -304,6 +348,7 @@ export async function findHighlights(
   key: string | undefined,
   brief: string,
   clips: HighlightClip[],
+  taste?: Taste,
 ): Promise<{ verdicts: ClipVerdict[] } | { failure: HighlightsFailure }> {
   if (!key) {
     return {
@@ -321,7 +366,7 @@ export async function findHighlights(
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: MODEL,
-        messages: [{ role: "user", content: highlightsPrompt(brief, clips) }],
+        messages: [{ role: "user", content: highlightsPrompt(brief, clips, taste) }],
         max_tokens: 24_000,
         temperature: 0.2,
         response_format: { type: "json_schema", json_schema: { name: "highlights", strict: true, schema: HIGHLIGHTS_SCHEMA } },
@@ -442,13 +487,35 @@ export async function stepHighlights(cfg: MediaConfig, key: string | undefined, 
       LIMIT ?`,
     [projectId, HIGHLIGHT_CALLS * BATCH.clips],
   );
-  const taken = new Map<string, { start: number; end: number; text: string }[]>();
+  // What a person reviewed, latest first: each clip's own stretches are never
+  // picked again, and the latest calls across the project are the taste the
+  // reading learns from.
+  const taken = new Map<string, Reviewed[]>();
+  let taste: Taste | undefined;
   if (rows.length) {
-    const reviewed = await query<{ footage_id: string; src_in: number; src_out: number; text: string }>(
-      "SELECT footage_id, src_in, src_out, text FROM footage_highlights WHERE project_id = ? AND pick IS NOT NULL",
+    const reviewed = await query<{
+      footage_id: string;
+      src_in: number;
+      src_out: number;
+      text: string;
+      pick: "keep" | "drop";
+      kind: HighlightKind;
+      speaker: string;
+      score: number;
+      origin: string;
+    }>(
+      `SELECT footage_id, src_in, src_out, text, pick, kind, speaker, score, origin FROM footage_highlights
+        WHERE project_id = ? AND pick IS NOT NULL ORDER BY updated_at DESC, id`,
       [projectId],
     );
-    for (const r of reviewed) taken.set(r.footage_id, [...(taken.get(r.footage_id) ?? []), { start: r.src_in, end: r.src_out, text: r.text }]);
+    for (const r of reviewed) {
+      taken.set(r.footage_id, [...(taken.get(r.footage_id) ?? []), { start: r.src_in, end: r.src_out, text: r.text, pick: r.pick }]);
+    }
+    const example = (r: (typeof reviewed)[number]): TasteExample => ({ kind: r.kind, text: r.text, speaker: r.speaker, score: r.score, own: r.origin === "person" });
+    taste = {
+      kept: reviewed.filter((r) => r.pick === "keep").slice(0, TASTE_EXAMPLES).map(example),
+      dropped: reviewed.filter((r) => r.pick === "drop").slice(0, TASTE_EXAMPLES).map(example),
+    };
   }
 
   // The rate and size a timeline for the editor's own software needs, for
@@ -500,7 +567,7 @@ export async function stepHighlights(cfg: MediaConfig, key: string | undefined, 
   let blocked: string | null = null;
   await Promise.all(
     batches.map(async (b) => {
-      const found = await findHighlights(key, project.brief, b);
+      const found = await findHighlights(key, project.brief, b, taste);
       if ("failure" in found) {
         // Busy or unreachable: back in line for a later step. Anything else
         // would fail the same way again, so the clips say why.
