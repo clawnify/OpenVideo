@@ -219,3 +219,8 @@ ALTER TABLE project_footage ADD COLUMN copy_id TEXT;
 -- other refusal sends it back to be re-encoded.
 ALTER TABLE project_footage ADD COLUMN transcode INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE project_footage ADD COLUMN transcode_job TEXT;
+
+-- A project's version: every write adds one. A writer that read revision N
+-- saves only while the project is still at N, so an editor, an agent and a
+-- teammate cannot overwrite each other's work without seeing it first.
+ALTER TABLE edit_projects ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;

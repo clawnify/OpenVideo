@@ -194,7 +194,7 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | DELETE | `/api/assets/{id}` | Remove from the library; 409 `in_use`, naming the projects, while any project uses it |
 | PUT  | `/api/drive/folder` | `{ folderId }` limits browsing to one folder, `null` clears it |
 | GET  | `/api/projects` | List projects |
-| GET  | `/api/projects/{id}` | Get one (includes the `edl` document and `brief`) |
+| GET  | `/api/projects/{id}` | Get one (includes the `edl` document, `brief` and `revision`) |
 | POST | `/api/projects` | Create `{ name, brief?, edl? }` (empty 720p timeline if omitted), or `{ folder, name?, brief?, language? }` from a Drive folder |
 | GET  | `/api/projects/{id}/footage` | The project's footage from Drive and each clip's log; moves the import and logging on → `{ counts, items, next_offset, imports_paused, logging_paused }` |
 | GET  | `/api/projects/{id}/footage/{clipId}` | One clip with its full log |
@@ -207,9 +207,9 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | PATCH | `/api/projects/{id}/highlights/{hid}` | A person's call `{ pick?: keep\|drop\|null, start?, end?, speaker?, text? }` |
 | POST | `/api/projects/{id}/highlights/items` | A person's own pick `{ clip, start?, end?, kind?, text? }`, kept |
 | GET  | `/api/projects/{id}/highlights/export` | `format=csv\|xml`: a sheet, or a Premiere Pro / Resolve timeline of the picks |
-| PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |
-| POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
-| POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied }` |
+| PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl?, revision? }` — the EDL is validated on save; 409 `conflict` when `revision` is stale |
+| POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt?, revision? }` — AI assembles the main track from several clips |
+| POST | `/api/projects/{id}/instruct` | `{ instruction, revision? }` — change the existing cut in words → `{ edl, said, applied, revision }` |
 | DELETE | `/api/projects/{id}` | Delete a project, its export history and its footage from Drive; `202 { remaining }` means call again |
 | POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job, `status: "exporting"` |
 | GET  | `/api/exports/{id}` | One export; read it until it is no longer `exporting` |
@@ -351,8 +351,21 @@ placed by hand; don't add captions on footage that already shows subtitles.
 ### Worked examples (read → transform → save)
 
 Every edit is the same loop: `GET /api/projects/{id}` → change the `edl`
-object → `PUT /api/projects/{id}` with `{ "edl": … }`. The PUT validates and
-tells you exactly what's wrong if anything is.
+object → `PUT /api/projects/{id}` with `{ "edl": …, "revision": … }`. The PUT
+validates and tells you exactly what's wrong if anything is.
+
+**Send back the `revision` you read.** The user may have the project open in
+the editor while you work, and a teammate or another tab can save it too.
+Every save adds one to `revision`, and a PUT that names the revision it read
+lands only if nobody saved in between. Otherwise it answers 409
+`{ "error": "conflict", "revision": <current> }` and changes nothing: read the
+project again and redo your change on that version, never resend the stale
+document. A PUT without `revision` overwrites whatever is there, so leave it
+out only when that is what you mean. An editor that is open and has nothing
+unsaved shows your saved change within a few seconds; one with unsaved edits
+asks the person which version to keep. `instruct` and `autocut` take the same
+optional `revision`, and refuse with the same 409 if the project is saved
+somewhere else while they run.
 
 **1. "Cut the first 10 seconds off the intro"** — add trim to that clip:
 

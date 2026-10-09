@@ -41,6 +41,7 @@ import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
 import { instructEdit, type InstructHighlight } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
+import { etagMatches } from "../shared/sync";
 
 type Bindings = {
   DB: D1Database;
@@ -548,6 +549,8 @@ interface EditProject {
   brief: string;
   created_at: string;
   updated_at: string;
+  /** Adds one on every write; a guarded write names the revision it read. */
+  revision: number;
 }
 
 interface ExportJob {
@@ -591,8 +594,19 @@ app.get("/api/projects", async (c) => {
 app.get("/api/projects/:id", async (c) => {
   const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
   if (!row) return c.json({ error: "Not found" }, 404);
+  // The revision is the ETag, so an open editor can ask "anything new?" every
+  // few seconds and get an empty 304 back instead of the whole document.
+  const etag = `"${row.revision}"`;
+  c.header("ETag", etag);
+  c.header("Cache-Control", "no-store");
+  if (etagMatches(c.req.header("If-None-Match"), etag)) return c.body(null, 304);
   return c.json(projectOut(row));
 });
+
+/** 409 for a write based on a revision the project has moved past. */
+function conflict(c: Context, revision: number, detail: string) {
+  return c.json({ error: "conflict", detail, revision }, 409);
+}
 
 app.post("/api/projects", async (c) => {
   const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string; folder?: string; language?: string }>();
@@ -636,19 +650,31 @@ app.put("/api/projects/:id", async (c) => {
   const existing = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
   if (!existing) return c.json({ error: "Not found" }, 404);
 
-  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string }>();
+  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string; revision?: unknown }>();
+  // `revision` is optional: without it the write wins, as it always did.
+  // With it, the write only lands on the version the writer read.
+  if (b.revision !== undefined && b.revision !== existing.revision) {
+    return conflict(
+      c,
+      existing.revision,
+      `The project changed since you read it: it is at revision ${existing.revision}. Read it again and redo your change on that.`,
+    );
+  }
   let edlJson = existing.edl;
   if (b.edl !== undefined) {
     const v = validateEdl(b.edl);
     if ("invalid" in v) return c.json(v.invalid, 422);
     edlJson = JSON.stringify(v.edl);
   }
-  await run(
-    "UPDATE edit_projects SET name = ?, edl = ?, brief = ?, updated_at = datetime('now') WHERE id = ?",
-    [b.name?.trim() || existing.name, edlJson, b.brief !== undefined ? b.brief.trim() : existing.brief, id],
+  // Guarded on the revision read above, so fields this request left out are
+  // never filled from a version another write has already replaced.
+  const [row] = await guardedWrite<EditProject>(
+    `UPDATE edit_projects SET name = ?, edl = ?, brief = ?, revision = revision + 1, updated_at = datetime('now')
+      WHERE id = ? AND revision = ? RETURNING *`,
+    [b.name?.trim() || existing.name, edlJson, b.brief !== undefined ? b.brief.trim() : existing.brief, id, existing.revision],
   );
-  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
-  return c.json(projectOut(row!));
+  if (!row) return changedWhileRunning(c, id, "The project changed while this was being saved. Read it again and redo your change on that.");
+  return c.json(projectOut(row));
 });
 
 // Auto-cut: assemble the project's main track from several clips in ONE model
@@ -688,9 +714,16 @@ app.post("/api/projects/:id/instruct", async (c) => {
   const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
   if (!project) return c.json({ error: "Project not found" }, 404);
 
-  const b = await c.req.json<{ instruction?: string }>().catch(() => ({}) as { instruction?: string });
+  const b = await c.req
+    .json<{ instruction?: string; revision?: unknown }>()
+    .catch(() => ({}) as { instruction?: string; revision?: unknown });
   const instruction = b.instruction?.trim();
   if (!instruction) return c.json({ error: "invalid_request", detail: "instruction is required" }, 422);
+  // The caller names the version it is looking at, so the model never edits
+  // one it has not seen.
+  if (b.revision !== undefined && b.revision !== project.revision) {
+    return conflict(c, project.revision, "The project changed since you read it. Read it again, then ask.");
+  }
 
   const current = validateEdl(JSON.parse(project.edl));
   if ("invalid" in current) return c.json(current.invalid, 422);
@@ -730,11 +763,14 @@ app.post("/api/projects/:id/instruct", async (c) => {
   );
   if ("failure" in out) return c.json(out.failure, 422);
 
-  await run("UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ?", [
-    JSON.stringify(out.edl),
-    project.id,
-  ]);
-  return c.json({ edl: out.edl, said: out.said, applied: out.applied });
+  // The model worked on the version read at the start, which can be a minute
+  // old by now: write only if nothing else saved in between.
+  const [saved] = await guardedWrite(
+    "UPDATE edit_projects SET edl = ?, revision = revision + 1, updated_at = datetime('now') WHERE id = ? AND revision = ? RETURNING revision",
+    [JSON.stringify(out.edl), project.id, project.revision],
+  );
+  if (!saved) return changedWhileRunning(c, project.id);
+  return c.json({ edl: out.edl, said: out.said, applied: out.applied, revision: project.revision + 1 });
 });
 
 app.post("/api/projects/:id/autocut", async (c) => {
@@ -745,8 +781,11 @@ app.post("/api/projects/:id/autocut", async (c) => {
   }
 
   const b = await c.req
-    .json<{ asset_ids?: string[]; prompt?: string }>()
-    .catch(() => ({}) as { asset_ids?: string[]; prompt?: string });
+    .json<{ asset_ids?: string[]; prompt?: string; revision?: unknown }>()
+    .catch(() => ({}) as { asset_ids?: string[]; prompt?: string; revision?: unknown });
+  if (b.revision !== undefined && b.revision !== project.revision) {
+    return conflict(c, project.revision, "The project changed since you read it. Read it again, then run Auto-cut.");
+  }
   const ids = Array.isArray(b.asset_ids) ? b.asset_ids : [];
   if (ids.length === 0) return c.json({ error: "autocut_failed", detail: "asset_ids is required" }, 422);
 
@@ -807,13 +846,34 @@ app.post("/api/projects/:id/autocut", async (c) => {
 
   const v = validateEdl(edl);
   if ("invalid" in v) return c.json(v.invalid, 422);
-  await run("UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ?", [
-    JSON.stringify(v.edl),
-    project.id,
-  ]);
-  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [project.id]);
-  return c.json({ ...projectOut(row!), notes: cut.result.notes });
+  const [row] = await guardedWrite<EditProject>(
+    "UPDATE edit_projects SET edl = ?, revision = revision + 1, updated_at = datetime('now') WHERE id = ? AND revision = ? RETURNING *",
+    [JSON.stringify(v.edl), project.id, project.revision],
+  );
+  if (!row) return changedWhileRunning(c, project.id);
+  return c.json({ ...projectOut(row), notes: cut.result.notes });
 });
+
+/**
+ * A write guarded by `WHERE ... AND revision = ?`, answered with RETURNING:
+ * no row back means it did not land. Read from the rows rather than the
+ * `changes` count, because not every storage this app can run on reports
+ * one, and a missing count reads as 0, which would refuse every save.
+ */
+function guardedWrite<T = { revision: number }>(sql: string, params: unknown[]) {
+  return query<T>(sql, params);
+}
+
+/** A guarded write found the project at another revision; 404 if it is gone. */
+async function changedWhileRunning(
+  c: Context,
+  id: string,
+  detail = "The project was saved somewhere else while this ran, so nothing was applied. Try again on the latest version.",
+) {
+  const row = await get<{ revision: number }>("SELECT revision FROM edit_projects WHERE id = ?", [id]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return conflict(c, row.revision, detail);
+}
 
 app.delete("/api/projects/:id", async (c) => {
   const id = c.req.param("id");
@@ -1269,8 +1329,12 @@ app.post("/api/projects/:id/highlights", async (c) => {
   const b = await c.req.json<{ brief?: unknown; again?: unknown }>().catch(() => ({}) as { brief?: unknown; again?: unknown });
   const brief = typeof b.brief === "string" ? b.brief.trim().slice(0, 2000) : null;
   await run(
-    "UPDATE edit_projects SET highlights_at = COALESCE(highlights_at, datetime('now')), highlights_stopped_at = NULL, brief = COALESCE(?, brief) WHERE id = ?",
-    [brief, id],
+    // A new brief is a write to the project like any other: it adds a revision,
+    // so an open editor picks it up instead of saving its old brief over it.
+    `UPDATE edit_projects SET highlights_at = COALESCE(highlights_at, datetime('now')), highlights_stopped_at = NULL,
+            brief = COALESCE(?, brief), revision = revision + (? IS NOT NULL AND ? IS NOT brief)
+      WHERE id = ?`,
+    [brief, brief, brief, id],
   );
   await run(
     `UPDATE project_footage SET highlights_status = 'waiting', highlights_error = NULL
