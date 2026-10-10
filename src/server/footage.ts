@@ -670,6 +670,9 @@ const DRIVE_WAIT_ALL =
 /** How long a clip Drive refused waits before each new try: about a day in all. */
 const DRIVE_RETRY_MS = [30, 60, 120, 240, 240, 240, 240, 240].map((m) => m * 60_000);
 
+/** Why a file over the video host's limit can't come in, in the size people see. */
+const overHostLimit = (bytes: number) => `${(bytes / 1e9).toFixed(1)} GB is over the video host's 30 GB limit`;
+
 /**
  * Drive refused the clip. It lifts its limit within a day, so the clip waits
  * and is tried again by itself, further apart each time, then gives up. A clip
@@ -712,14 +715,16 @@ async function dropUpload(cfg: MediaConfig, r: WorkRow): Promise<boolean> {
 
 /**
  * Drive won't hand the file over whole: open an upload for it to come in a
- * piece at a time instead. Null when that can't help, so the clip waits on
- * Drive: it won't serve even a piece, the file is over the video host's limit,
- * or the clip is marked for a re-encode, which reads the whole file.
+ * piece at a time instead. A file over the video host's limit fails with that
+ * reason instead: waiting on Drive can't get it in. Null when pieces can't
+ * help, so the clip waits on Drive: it won't serve even a piece, or the clip
+ * is marked for a re-encode, which reads the whole file.
  */
 async function openRelay(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWide: boolean; detail: string } | null> {
-  if (r.transcode) return null;
   const size = await rangedSize(r.drive_file_id);
-  if (!size || size > MAX_RELAY_BYTES) return null;
+  if (!size) return null;
+  if (size > MAX_RELAY_BYTES) return { orgWide: false, detail: overHostLimit(size) };
+  if (r.transcode) return null;
   await dropFailedCopy(cfg, r);
   const opened = await openMediaUpload(cfg, size, r.name);
   if ("failure" in opened) return ORG_LIMITS.has(opened.failure.error) ? { orgWide: true, detail: opened.failure.detail } : null;
@@ -833,6 +838,8 @@ async function startImport(
     }
     return { orgWide: false, detail: verdict.reason ?? "that file isn't a video" };
   }
+  // The video host would refuse it after pulling it ("MaxFileSizeError"): say so first.
+  if (verdict.size && verdict.size > MAX_RELAY_BYTES) return { orgWide: false, detail: overHostLimit(verdict.size) };
 
   return importFrom(cfg, r, url, verdict.contentType?.startsWith("video/") ? verdict.contentType : "video/mp4", verdict.size ?? 0);
 }

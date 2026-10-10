@@ -154,7 +154,9 @@ and on a heavy day it refuses the files of a whole folder for a while. It
 refuses the whole file but still serves pieces of it, so a refused file of up
 to 30 GB comes in a piece at a time instead, in the background steps only:
 `status: "importing"`, with `received` saying how much is in. A big file takes
-a while this way. A clip Drive won't serve even a piece of, or one over 30 GB,
+a while this way. A file over 30 GB, the most the video host takes, fails at
+once with that reason, before anything is pulled: retry it if the limit is
+raised. A clip Drive won't serve even a piece of
 is not failed: it waits (`status: "waiting"` with `retry_at`, counted in
 `counts.drive_waiting`) and is tried again by itself, further apart each time,
 for about a day, after which it fails with the reason. One that was coming in

@@ -115,6 +115,8 @@ globalThis.fetch = async (input, init = {}) => {
       if (big.refuseFrom !== undefined && start >= big.refuseFrom) return quotaPage();
       return new Response(zeros(end - start + 1), { status: 206, headers: { "content-type": "video/mp4", "content-range": `bytes ${start}-${end}/${big.size}` } });
     }
+    const served = world.servedSizes?.[id];
+    if (served && !ranged) return new Response("x".repeat(64), { status: 200, headers: { "content-type": "video/mp4", "content-length": String(served) } });
     // Over the limit and refusing pieces too: nothing gets it in but waiting.
     if (id === fid("q1") && !world.quotaLifted) return quotaPage();
     if (id.startsWith("conn") && id !== "conn_big___________________" && !ranged) {
@@ -473,7 +475,7 @@ world.quotaLifted = true;
 // piece at a time, on deliveries only, into an upload on the media service,
 // and carries on from where the upload stands after a piece that didn't land
 // or a wait on Drive. An upload about to expire starts again on a new one; a
-// file over the video host's 30 GB limit waits on Drive as before.
+// file over the video host's 30 GB limit fails at once, saying so.
 {
   const P = 200 * 2 ** 20;
   const A = 2 * P + 3 * 2 ** 20;
@@ -504,8 +506,8 @@ world.quotaLifted = true;
   assert.equal(pieces(), 0, "a read sends no pieces");
   const a1 = uploadOf("INTERVIEW_A.MP4");
   assert.deepEqual([world.uploads.get(a1).size, world.uploads.get(a1).name], [A, "INTERVIEW_A.MP4"]);
-  assert.equal(it["STATIC.MP4"].status, "waiting", "over 30 GB: it waits on Drive, as before");
-  assert.match(it["STATIC.MP4"].error, /Waiting for Google Drive/);
+  assert.equal(it["STATIC.MP4"].status, "failed", "over 30 GB: no wait can get it in");
+  assert.equal(it["STATIC.MP4"].error, "33.3 GB is over the video host's 30 GB limit");
   assert.ok(![...world.uploads.values()].some((x) => x.name === "STATIC.MP4"), "and no upload is opened for it");
 
   // First delivery: INTERVIEW_A's second piece doesn't land, and INTERVIEW_B's
@@ -555,7 +557,7 @@ world.quotaLifted = true;
   r = await call("DELETE", `/api/projects/${p4}`);
   assert.equal(r.status, 200, JSON.stringify(r.data));
   assert.ok(world.media.get(a1).deleted && world.media.get(b2).deleted);
-  console.log("7c ok: a file Drive won't hand over whole comes in by pieces on deliveries, carries on after a failed piece and a wait on Drive, restarts an expiring upload; over 30 GB still waits");
+  console.log("7c ok: a file Drive won't hand over whole comes in by pieces on deliveries, carries on after a failed piece and a wait on Drive, restarts an expiring upload; over 30 GB fails at once, saying so");
 }
 
 // 7d. Deleting a project deletes an upload still under way; one the service
@@ -600,6 +602,23 @@ world.quotaLifted = true;
   r = await call("DELETE", `/api/projects/${p6}`);
   assert.equal(r.status, 200, JSON.stringify(r.data));
   console.log("7e ok: a piece the video host refuses for good fails the clip with its reason, and deletes the upload");
+}
+
+// 7f. A file Drive serves whole but over the video host's 30 GB limit is not
+// handed over to be refused after the pull: it fails at once, saying so.
+{
+  world.servedSizes = { [fid("stage")]: 34_000_000_000 };
+  world.drive[fid("day8")] = page("Day 8", [fileEntry(fid("stage"), "STAGE.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day8")}` });
+  const p8 = r.data.id;
+  const before = (world.importUrls ?? []).length;
+  const item = (await call("GET", `/api/projects/${p8}/footage?logs=0`)).data.items[0];
+  assert.equal(item.status, "failed", JSON.stringify(item));
+  assert.equal(item.error, "34.0 GB is over the video host's 30 GB limit");
+  assert.equal((world.importUrls ?? []).length, before, "nothing was handed to the video host");
+  r = await call("DELETE", `/api/projects/${p8}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  console.log("7f ok: a file over the video host's 30 GB limit fails at once with the reason, never pulled");
 }
 
 // 8. Retry puts failures back in line.
