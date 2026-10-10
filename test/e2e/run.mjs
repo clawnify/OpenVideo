@@ -38,7 +38,9 @@ const fid = (s) => (s + "_".repeat(28)).slice(0, 28);
 
 const world = {
   drive: {},
-  media: new Map(), // uid → { polls, name, deleted }
+  media: new Map(), // uid → { polls, name, deleted, pendingUpload }
+  uploads: new Map(), // uid → { size, at, name, patches }: uploads opened on the media service
+  big: {}, // Drive file id → { size, refuseFrom }: files Drive serves only in pieces
   jobs: new Map(),
   calls: [],
   importRefusal: null,
@@ -68,6 +70,24 @@ setDrive();
 
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 let uidN = 0;
+// `n` bytes, made as they are read: a piece of a big file costs no memory.
+const ZEROS = new Uint8Array(1 << 20);
+const zeros = (n) => {
+  let left = n;
+  return new ReadableStream({
+    pull(c) {
+      if (left <= 0) return c.close();
+      const k = Math.min(left, ZEROS.length);
+      c.enqueue(ZEROS.subarray(0, k));
+      left -= k;
+    },
+  });
+};
+const quotaPage = () =>
+  new Response("<html><head><title>Google Drive - Quota exceeded</title></head><body>Too many users have viewed or downloaded this file recently.</body></html>", {
+    status: 200,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
 globalThis.fetch = async (input, init = {}) => {
   const url = typeof input === "string" ? input : input.url;
   const method = init.method ?? "GET";
@@ -78,17 +98,70 @@ globalThis.fetch = async (input, init = {}) => {
     return html ? new Response(html, { status: 200, headers: { "content-type": "text/html" } }) : new Response("no", { status: 404 });
   }
   if (u.hostname === "drive.usercontent.google.com") {
-    const ranged = new Headers(init.headers ?? {}).has("range");
+    const range = new Headers(init.headers ?? {}).get("range");
+    const ranged = range !== null;
     const id = u.searchParams.get("id");
-    if ((id === fid("q1") && !world.quotaLifted || (id.startsWith("conn") && id !== "conn_big___________________")) && !ranged) {
+    // Over Drive's daily download limit: the whole file gets the quota page,
+    // a piece its bytes, unless Drive is refusing pieces from some point on.
+    const big = world.big[id];
+    if (big) {
+      if (!ranged) {
+        (world.wholeAsks ??= []).push(id);
+        return quotaPage();
+      }
+      const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(range);
+      const start = Number(a);
+      const end = Math.min(Number(b), big.size - 1);
+      if (big.refuseFrom !== undefined && start >= big.refuseFrom) return quotaPage();
+      return new Response(zeros(end - start + 1), { status: 206, headers: { "content-type": "video/mp4", "content-range": `bytes ${start}-${end}/${big.size}` } });
+    }
+    // Over the limit and refusing pieces too: nothing gets it in but waiting.
+    if (id === fid("q1") && !world.quotaLifted) return quotaPage();
+    if (id.startsWith("conn") && id !== "conn_big___________________" && !ranged) {
       // Over Drive's daily download limit: ranged reads still work, the whole file doesn't.
-      return new Response("<html><head><title>Google Drive - Quota exceeded</title></head><body>Too many users have viewed or downloaded this file recently.</body></html>", { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      return quotaPage();
     }
     return ranged
       ? new Response("xx", { status: 206, headers: { "content-type": "video/mp4", "content-range": "bytes 0-1/123456789" } })
       : new Response("x".repeat(64), { status: 200, headers: { "content-type": "video/mp4", "content-length": "123456789" } });
   }
+  // The media service's resumable upload, with the video host's rules: a
+  // named user agent ("error code: 1010" otherwise), a piece only at the
+  // upload's own offset, at most 200 MiB, and every piece but the last at
+  // least 5 MiB and a multiple of 256 KiB.
+  if (u.hostname === "upload.test") {
+    const id = u.pathname.split("/").pop();
+    const up = world.uploads.get(id);
+    const h = new Headers(init.headers ?? {});
+    if (!h.get("user-agent")) return new Response("error code: 1010", { status: 403 });
+    if (h.get("tus-resumable") !== "1.0.0") return new Response(null, { status: 412 });
+    if (!up || world.media.get(id)?.deleted) return new Response(null, { status: 404 });
+    if (method === "HEAD") return new Response(null, { status: 200, headers: { "Upload-Offset": String(up.at), "Upload-Length": String(up.size) } });
+    if (method === "PATCH") {
+      if (world.refusePatches === id) return new Response("Decoding Error", { status: 400 });
+      if (world.patchFails?.(id, up.at)) return new Response("busy", { status: 503 });
+      if (Number(h.get("upload-offset")) !== up.at) return new Response(null, { status: 409 });
+      if (h.get("content-type") !== "application/offset+octet-stream") return new Response(null, { status: 415 });
+      let n = 0;
+      for await (const chunk of init.body) n += chunk.byteLength;
+      const last = up.at + n === up.size;
+      if (n > 200 * 2 ** 20 || up.at + n > up.size || (!last && (n < 5 * 2 ** 20 || n % (256 * 1024) !== 0))) {
+        return new Response("bad chunk", { status: 400 });
+      }
+      up.patches.push(up.at);
+      up.at += n;
+      if (last) world.media.get(id).pendingUpload = false;
+      return new Response(null, { status: 204, headers: { "Upload-Offset": String(up.at) } });
+    }
+  }
   if (u.hostname === "svc.test") {
+    if (u.pathname === "/media/uploads" && method === "POST") {
+      const body = JSON.parse(init.body);
+      const id = (++uidN).toString(16).padStart(32, "0");
+      world.media.set(id, { polls: 0, name: body.name, pendingUpload: true });
+      world.uploads.set(id, { size: body.size, at: 0, name: body.name, patches: [] });
+      return json(201, { id, upload_url: `https://upload.test/tus/${id}?tusv2=true`, expires_at: new Date(Date.now() + 6 * 3600_000).toISOString() });
+    }
     if (u.pathname === "/media/import") {
       if (world.importRefusal) return json(409, world.importRefusal);
       const id = (++uidN).toString(16).padStart(32, "0");
@@ -124,6 +197,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (m) {
       const v = world.media.get(m[1]);
       if (!v || v.deleted) return json(404, { error: "not_found" });
+      if (v.pendingUpload) return json(200, { id: m[1], state: "pendingupload", ready: false, duration: null, error: null });
       v.polls++;
       if (v.name === "HIGH.MP4") return json(200, { id: m[1], state: "error", ready: false, duration: null, error: "The video bitrate exceeded the maximum acceptable value of 200 Mbps." });
       const ready = v.polls >= 2;
@@ -361,11 +435,13 @@ const probes = () => world.calls.filter((c) => c.includes(fid("q1")) && c.includ
 const probesBefore = probes();
 await statuses();
 assert.equal(probes(), probesBefore, "a read before it is due leaves Drive alone");
-// "Try Google Drive again now" asks at once.
+// "Try Google Drive again now" asks at once: the whole file, then one byte to
+// see whether it would come in pieces (this file's pieces are refused too).
 r = await call("POST", `/api/projects/${pid}/footage/retry`);
 assert.equal(r.data.imports, 1);
 f = await statuses();
-assert.equal(probes(), probesBefore + 1);
+assert.equal(probes(), probesBefore + 2);
+assert.ok(![...world.uploads.values()].some((x) => x.name === "B_0009.MP4"), "Drive refusing pieces too: no upload is opened");
 // Drive lifts the limit: when it is due, it imports.
 world.quotaLifted = true;
 db.prepare("UPDATE project_footage SET retry_at = ? WHERE name = 'B_0009.MP4'").run(new Date(Date.now() - 1000).toISOString());
@@ -384,6 +460,139 @@ console.log("7b ok: a clip Drive refuses waits, is tried again when due (or now 
 db.prepare("DELETE FROM assets WHERE id = (SELECT asset_id FROM project_footage WHERE name = 'B_0009.MP4')").run();
 db.prepare("DELETE FROM project_footage WHERE name = 'B_0009.MP4'").run();
 world.quotaLifted = true;
+
+// 7c. A file Drive won't hand over whole still serves pieces: it comes in a
+// piece at a time, on deliveries only, into an upload on the media service,
+// and carries on from where the upload stands after a piece that didn't land
+// or a wait on Drive. An upload about to expire starts again on a new one; a
+// file over the video host's 30 GB limit waits on Drive as before.
+{
+  const P = 200 * 2 ** 20;
+  const A = 2 * P + 3 * 2 ** 20;
+  world.big[fid("big1")] = { size: A };
+  world.big[fid("big2")] = { size: 12 * 2 ** 20 };
+  world.big[fid("huge")] = { size: 31 * 2 ** 30 };
+  world.drive[fid("day4")] = page("Day 4", [
+    fileEntry(fid("big1"), "INTERVIEW_A.MP4"),
+    fileEntry(fid("big2"), "INTERVIEW_B.MP4"),
+    fileEntry(fid("huge"), "STATIC.MP4"),
+  ]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day4")}` });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  const p4 = r.data.id;
+  const items4 = async () => Object.fromEntries((await call("GET", `/api/projects/${p4}/footage?logs=0`)).data.items.map((i) => [i.name, i]));
+  const deliver4 = async () => {
+    const body = JSON.stringify({ project_id: p4 });
+    const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+    assert.equal(res.status, 200, await res.text());
+  };
+  const uploadOf = (name) => db.prepare("SELECT upload_uid FROM project_footage WHERE project_id = ? AND name = ?").get(p4, name).upload_uid;
+  const pieces = () => world.calls.filter((c) => c.startsWith("PATCH https://upload.test/")).length;
+
+  // A read opens the uploads and sends no pieces.
+  let it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].status, "importing", JSON.stringify(it["INTERVIEW_A.MP4"]));
+  assert.deepEqual(it["INTERVIEW_A.MP4"].received, { bytes: 0, size: A });
+  assert.equal(pieces(), 0, "a read sends no pieces");
+  const a1 = uploadOf("INTERVIEW_A.MP4");
+  assert.deepEqual([world.uploads.get(a1).size, world.uploads.get(a1).name], [A, "INTERVIEW_A.MP4"]);
+  assert.equal(it["STATIC.MP4"].status, "waiting", "over 30 GB: it waits on Drive, as before");
+  assert.match(it["STATIC.MP4"].error, /Waiting for Google Drive/);
+  assert.ok(![...world.uploads.values()].some((x) => x.name === "STATIC.MP4"), "and no upload is opened for it");
+
+  // First delivery: INTERVIEW_A's second piece doesn't land, and INTERVIEW_B's
+  // upload is about to expire, so it starts again on a new one.
+  world.patchFails = (id, at) => id === a1 && at === P && !world.patchFailed && (world.patchFailed = true);
+  const b1 = uploadOf("INTERVIEW_B.MP4");
+  db.prepare("UPDATE project_footage SET upload_expires = ? WHERE project_id = ? AND name = 'INTERVIEW_B.MP4'").run(new Date(Date.now() + 60_000).toISOString(), p4);
+  await deliver4();
+  assert.deepEqual(world.uploads.get(a1).patches, [0], "one piece in; the next didn't land");
+  it = await items4();
+  assert.deepEqual(it["INTERVIEW_A.MP4"].received, { bytes: P, size: A });
+  assert.equal(world.media.get(b1).deleted, true, "the upload about to expire is deleted");
+  const b2 = uploadOf("INTERVIEW_B.MP4");
+  assert.ok(b2 && b2 !== b1, "and a new one opened");
+
+  // Second delivery: A carries on from where its upload stands, until Drive
+  // refuses a piece; it then waits on Drive and keeps its upload. B is all in.
+  world.big[fid("big1")].refuseFrom = 2 * P;
+  await deliver4();
+  assert.deepEqual(world.uploads.get(a1).patches, [0, P], "carried on from where the upload stood");
+  it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].status, "waiting", JSON.stringify(it["INTERVIEW_A.MP4"]));
+  assert.ok(it["INTERVIEW_A.MP4"].retry_at);
+  assert.equal(uploadOf("INTERVIEW_A.MP4"), a1, "its upload is kept while it waits");
+  assert.equal(it["INTERVIEW_B.MP4"].asset?.media_uid, b2, "INTERVIEW_B is in, as its upload's video");
+
+  // Asking Drive again now: it carries on without asking for the whole file again.
+  world.big[fid("big1")].refuseFrom = undefined;
+  const wholeAsks = () => world.wholeAsks.filter((x) => x === fid("big1")).length;
+  const asked = wholeAsks();
+  r = await call("POST", `/api/projects/${p4}/footage/retry`);
+  assert.equal(r.data.imports, 2, "A, and the file over the limit");
+  it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].status, "importing");
+  assert.equal(wholeAsks(), asked, "an upload under way carries on: Drive isn't asked for the whole file");
+  await deliver4();
+  assert.deepEqual(world.uploads.get(a1).patches, [0, P, 2 * P], "every piece once, in order");
+  it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].received, null);
+  assert.deepEqual([it["INTERVIEW_A.MP4"].asset?.media_uid, it["INTERVIEW_A.MP4"].asset?.size], [a1, A]);
+
+  // From there it is imported like any other: ready, then logged.
+  for (let i = 0; i < 10 && !["INTERVIEW_A.MP4", "INTERVIEW_B.MP4"].every((n) => it[n].log_status === "done"); i++) it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].status, "ready");
+  assert.equal(it["INTERVIEW_A.MP4"].log_status, "done");
+  assert.equal(it["INTERVIEW_B.MP4"].log_status, "done");
+  r = await call("DELETE", `/api/projects/${p4}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.ok(world.media.get(a1).deleted && world.media.get(b2).deleted);
+  console.log("7c ok: a file Drive won't hand over whole comes in by pieces on deliveries, carries on after a failed piece and a wait on Drive, restarts an expiring upload; over 30 GB still waits");
+}
+
+// 7d. Deleting a project deletes an upload still under way; one the service
+// won't delete keeps its clip for the next call.
+{
+  world.big[fid("big5")] = { size: 2 * 2 ** 20 };
+  world.drive[fid("day5")] = page("Day 5", [fileEntry(fid("big5"), "INTERVIEW_C.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day5")}` });
+  const p5 = r.data.id;
+  await call("GET", `/api/projects/${p5}/footage?logs=0`);
+  const u5 = db.prepare("SELECT upload_uid FROM project_footage WHERE project_id = ?").get(p5).upload_uid;
+  assert.ok(u5, "the read opened an upload");
+  world.refuseMediaDeletes = 1;
+  r = await call("DELETE", `/api/projects/${p5}`);
+  assert.equal(r.status, 202, JSON.stringify(r.data));
+  assert.ok(!world.media.get(u5).deleted, "refused: the clip stays, with its upload");
+  r = await call("DELETE", `/api/projects/${p5}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(world.media.get(u5).deleted, true);
+  console.log("7d ok: deleting a project deletes an upload under way, after a refusal too");
+}
+
+// 7e. A piece the video host turns away for good fails the clip with the
+// host's reason, and its upload is deleted: sending it again can't help.
+{
+  world.big[fid("big6")] = { size: 3 * 2 ** 20 };
+  world.drive[fid("day6")] = page("Day 6", [fileEntry(fid("big6"), "INTERVIEW_D.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day6")}` });
+  const p6 = r.data.id;
+  await call("GET", `/api/projects/${p6}/footage?logs=0`);
+  const u6 = db.prepare("SELECT upload_uid FROM project_footage WHERE project_id = ?").get(p6).upload_uid;
+  assert.ok(u6, "the read opened an upload");
+  world.refusePatches = u6;
+  const body = JSON.stringify({ project_id: p6 });
+  const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+  assert.equal(res.status, 200, await res.text());
+  const row = db.prepare("SELECT status, error, upload_uid FROM project_footage WHERE project_id = ?").get(p6);
+  assert.equal(row.status, "failed", JSON.stringify(row));
+  assert.equal(row.error, "the video host refused a piece of this file (400: Decoding Error)");
+  assert.equal(row.upload_uid, null);
+  assert.equal(world.media.get(u6).deleted, true, "its upload is deleted");
+  r = await call("DELETE", `/api/projects/${p6}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  console.log("7e ok: a piece the video host refuses for good fails the clip with its reason, and deletes the upload");
+}
 
 // 8. Retry puts failures back in line.
 db.prepare("UPDATE project_footage SET status = 'failed', error = 'x' WHERE project_id = ? AND name = 'B_0002.MP4'").run(pid);

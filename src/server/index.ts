@@ -830,8 +830,14 @@ app.delete("/api/projects/:id", async (c) => {
   // service, counted against the org's storage until it is deleted there, so
   // a big shoot is deleted a batch per call: 202 says how many are left, and
   // calling again carries on. A clip another project uses stays, in the library.
-  const footage = await query<{ id: string; asset_id: string | null; media_uid: string | null; copy_id: string | null }>(
-    `SELECT f.id, f.asset_id, a.media_uid, f.copy_id FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+  const footage = await query<{
+    id: string;
+    asset_id: string | null;
+    media_uid: string | null;
+    copy_id: string | null;
+    upload_uid: string | null;
+  }>(
+    `SELECT f.id, f.asset_id, a.media_uid, f.copy_id, f.upload_uid FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
       WHERE f.project_id = ? LIMIT ?`,
     [id, FOOTAGE_DELETE_BATCH],
   );
@@ -855,6 +861,15 @@ app.delete("/api/projects/:id", async (c) => {
     await Promise.all(
       footage.map(async (f) => {
         if (copyLeft.has(f.id)) return;
+        // A file coming in a piece at a time has an upload open, holding
+        // storage until it is deleted.
+        if (f.upload_uid) {
+          try {
+            await deleteMedia(mediaCfg(c.env), f.upload_uid);
+          } catch {
+            return; // kept for the next call
+          }
+        }
         if (f.asset_id) {
           const usedElsewhere = await get(
             "SELECT 1 AS used FROM edit_projects WHERE id != ? AND edl LIKE ? LIMIT 1",
@@ -963,6 +978,8 @@ async function advanceFootage(
   const outcome = await stepFootage(mediaCfg(c.env), projectId, {
     drive: after === "delivery" ? drive : undefined,
     startImports: !(drive && after === "read"),
+    // Pieces of a file Drive won't hand over whole take a while: deliveries only.
+    relay: after === "delivery",
   });
   // Highlights are read only on a delivery: a model call takes up to half a
   // minute, and a read answers at once. A read still keeps the chain booked.
@@ -995,6 +1012,8 @@ interface FootageItemRow {
   size: number | null;
   duration: number | null;
   media_uid: string | null;
+  upload_size: number | null;
+  upload_done: number | null;
 }
 
 function footageOut(r: FootageItemRow) {
@@ -1006,6 +1025,8 @@ function footageOut(r: FootageItemRow) {
     error: r.error,
     // Set while the clip waits on Google Drive: when it is tried again.
     retry_at: r.retry_at,
+    // Set while a file Drive won't hand over whole comes in a piece at a time.
+    received: r.upload_size ? { bytes: r.upload_done ?? 0, size: r.upload_size } : null,
     asset: r.asset_id
       ? {
           id: r.asset_id,
@@ -1024,7 +1045,7 @@ function footageOut(r: FootageItemRow) {
 }
 
 const FOOTAGE_COLUMNS = `f.id, f.name, f.folder, f.status, f.error, f.retry_at, f.log_status, f.log_error, f.asset_id,
-       a.key, a.content_type, a.size, a.duration, a.media_uid`;
+       a.key, a.content_type, a.size, a.duration, a.media_uid, f.upload_size, f.upload_done`;
 
 function intParam(v: string | undefined, fallback: number, min: number, max: number): number {
   const n = Number.parseInt(v ?? "", 10);
