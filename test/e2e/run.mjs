@@ -489,7 +489,11 @@ assert.ok(csv.slice(1).every((l) => l.includes(",Kept,")));
 console.log("11c ok: sheet export,", total, "rows by default, 2 kept");
 
 // Find again: unreviewed picks are replaced, a person's calls stay, and the
-// model is told what was already reviewed.
+// model is told what was already reviewed. A b-roll shot is dropped too, so
+// the taste holds a dropped pick whose words no kept pick has.
+const droppedShot = (await call("GET", `/api/projects/${pid}/highlights?kind=broll&pick=open`)).data.highlights[0];
+r = await call("PATCH", `/api/projects/${pid}/highlights/${droppedShot.id}`, { pick: "drop" });
+assert.equal(r.status, 200, JSON.stringify(r.data));
 const promptsBefore = world.prompts.length;
 r = await call("POST", `/api/projects/${pid}/highlights`, { again: true });
 assert.equal(r.data.pending, logged);
@@ -501,12 +505,18 @@ assert.match(again, /\] kept: /, "each reviewed stretch says whether it was kept
 assert.match(again, /\] dropped: /, "or dropped");
 assert.match(again, /Learn their taste from it/, "the reading learns from the calls");
 assert.ok(again.includes(`"${first.text.slice(0, 160)}" (scored ${first.score} when proposed)`), "a kept pick is shown as kept, with the score it had");
-assert.ok(again.includes(`"${second.text.slice(0, 160)}" (scored`), "a dropped one too");
 assert.ok(again.includes('"Used anyway" (added by them)'), "and a person's own pick as theirs");
-assert.ok(again.indexOf("Dropped:") > again.indexOf("Kept:"));
+assert.ok(again.indexOf("Dropped:") > again.indexOf("Kept:"), "dropped picks follow kept ones");
+const droppedList = again.slice(again.indexOf("Dropped:")).split("\n\n")[0];
+assert.ok(droppedList.includes(`"${droppedShot.text}" (scored`), "a dropped pick is shown as dropped");
+// The two best picks are two takes of one line (the stub says the same words
+// on every clip with speech): one kept, one dropped. The dropped take is not
+// taught as a line the person didn't want.
+assert.equal(second.text, first.text);
+assert.ok(!droppedList.includes(`"${second.text}"`), "a dropped take of a kept line is left out of the taste");
 assert.equal(db.prepare("SELECT pick FROM footage_highlights WHERE id = ?").get(first.id).pick, "keep", "a kept pick survives finding again");
 assert.equal(db.prepare("SELECT pick FROM footage_highlights WHERE id = ?").get(second.id).pick, "drop", "so does a dropped one");
-console.log("11d ok: finding again keeps a person's calls, tells the model about them, and passes kept and dropped as the taste to learn");
+console.log("11d ok: finding again keeps a person's calls, tells the model about them, and passes kept and dropped as the taste to learn, without another take of a kept line");
 
 // Stop: a find-again in line is stopped before any delivery reads it. Clips
 // read before keep their picks and count as read; a clip never read goes back

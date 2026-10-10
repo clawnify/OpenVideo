@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HIGHLIGHTS_SCHEMA,
+  TASTE_EXAMPLES,
   batchClips,
   findHighlights,
   highlightsPrompt,
   readHighlights,
   snapToCues,
   stamp,
+  tasteFrom,
   vetSpeaker,
   type HighlightClip,
+  type ReviewedPick,
 } from "../src/server/highlights";
 import type { ClipLog } from "../src/server/footage";
 import { parseVtt } from "../src/shared/transcript";
@@ -127,6 +130,37 @@ describe("readHighlights", () => {
       [reviewed],
     );
     expect(out[0].highlights).toEqual([]);
+  });
+});
+
+describe("tasteFrom", () => {
+  const pick = (p: "keep" | "drop", text: string, extra: Partial<ReviewedPick> = {}): ReviewedPick => ({
+    pick: p,
+    kind: "soundbite",
+    text,
+    speaker: "",
+    score: 3,
+    origin: "ai",
+    ...extra,
+  });
+
+  it("leaves out a dropped take of a line that was kept, and keeps the rest in order", () => {
+    const t = tasteFrom([
+      pick("keep", "Shipping fast is the whole point."),
+      pick("drop", "shipping fast — is the whole point"),
+      pick("drop", "Um, so, yeah."),
+      pick("keep", "Logo wall", { kind: "broll", origin: "person" }),
+    ]);
+    expect(t.kept.map((e) => [e.text, e.own])).toEqual([["Shipping fast is the whole point.", false], ["Logo wall", true]]);
+    expect(t.dropped.map((e) => e.text)).toEqual(["Um, so, yeah."]);
+  });
+
+  it("never matches two picks on empty words, and stops at the bound", () => {
+    expect(tasteFrom([pick("keep", "..."), pick("drop", "!!")]).dropped).toHaveLength(1);
+    const many = Array.from({ length: 40 }, (_, i) => pick(i % 2 ? "drop" : "keep", `line ${i}`));
+    const t = tasteFrom(many);
+    expect([t.kept.length, t.dropped.length]).toEqual([TASTE_EXAMPLES, TASTE_EXAMPLES]);
+    expect(t.kept[0].text).toBe("line 0");
   });
 });
 
