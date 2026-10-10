@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { LOG_SCHEMA, logPrompt, parseClock, pollLog, readLog, startLog } from "../src/server/footage";
+import { LOG_SCHEMA, logPrompt, parseClock, pollLog, readLog, startLog, tooShortLog } from "../src/server/footage";
 
 const cfg = { servicesUrl: "https://svc.test", token: "clw_x" };
 const reply = (status: number, body: unknown) =>
@@ -14,6 +14,14 @@ describe("parseClock", () => {
     expect(parseClock("1:02:03")).toBe(3723);
     expect(parseClock("12.5")).toBe(12.5);
     expect(parseClock("soon")).toBeNaN();
+  });
+});
+
+describe("tooShortLog", () => {
+  it("is a log like any other, read back as written", () => {
+    const log = tooShortLog(0.28);
+    expect(log).toMatchObject({ summary: "A 0.3 s clip, too short to use.", quality: "unusable", issues: "too short to use", quotes: [], moments: [] });
+    expect(readLog(log, 0.28)).toEqual(log);
   });
 });
 

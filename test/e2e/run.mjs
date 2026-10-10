@@ -126,7 +126,8 @@ globalThis.fetch = async (input, init = {}) => {
       v.polls++;
       if (v.name === "HIGH.MP4") return json(200, { id: m[1], state: "error", ready: false, duration: null, error: "The video bitrate exceeded the maximum acceptable value of 200 Mbps." });
       const ready = v.polls >= 2;
-      return json(200, { id: m[1], state: ready ? "ready" : "inprogress", ready, duration: ready ? 60 : null, error: null });
+      const length = v.name === "SHORT.MP4" ? 0.28 : 60;
+      return json(200, { id: m[1], state: ready ? "ready" : "inprogress", ready, duration: ready ? length : null, error: null });
     }
     m = /^\/media\/([0-9a-f]{32})\/prepare$/.exec(u.pathname);
     if (m) {
@@ -589,6 +590,19 @@ assert.equal(b6().highlights_status, null, "not read until a delivery");
 d = await deliver();
 assert.equal(db.prepare("SELECT highlights_status FROM project_footage WHERE project_id = ? AND name = 'B_0006.MP4'").get(pid).highlights_status, "done");
 console.log("11f ok: a clip logged later is read by itself");
+
+// A clip a fraction of a second long is logged as too short, without an
+// analysis: there is nothing in it to read, and the analysis fails on it.
+setDrive([fileEntry(fid("b3"), "B_0003.MP4"), fileEntry(fid("b5"), "B_0005.MP4"), fileEntry(fid("b4"), "B_0004.MP4"), fileEntry(fid("b6"), "B_0006.MP4"), fileEntry(fid("s1"), "SHORT.MP4")]);
+await call("POST", `/api/projects/${pid}/footage/sync`);
+const jobsBeforeShort = world.jobs.size;
+const short = () => db.prepare("SELECT status, log_status, log FROM project_footage WHERE project_id = ? AND name = 'SHORT.MP4'").get(pid);
+for (let i = 0; i < 10 && short().log_status !== "done"; i++) f = await statuses();
+assert.equal(short().status, "ready");
+assert.equal(short().log_status, "done", JSON.stringify(short()));
+assert.deepEqual(JSON.parse(short().log), { summary: "A 0.3 s clip, too short to use.", kind: "other", quality: "unusable", issues: "too short to use", quotes: [], moments: [], visible_text: [] });
+assert.equal(world.jobs.size, jobsBeforeShort, "no analysis was asked for");
+console.log("11g ok: a clip under a second is logged as too short, without an analysis");
 
 // 10. Deleting the project deletes its footage, a batch at a time.
 const stmt = db.prepare("INSERT INTO project_footage (project_id, drive_file_id, name, folder) VALUES (?, ?, ?, 'Bulk')");
