@@ -24,12 +24,14 @@ export const PIECE_BYTES = 200 * 1024 * 1024;
 export const MAX_RELAY_BYTES = 30 * 1024 ** 3;
 
 /**
- * Start no new piece once a step has relayed this long. The platform's queue
- * delivers a batch of jobs one after another, so a long step holds up other
- * apps' deliveries. At Drive's pace (about 10 MB/s a range) a piece takes some
- * 20 s, so a step relays for under a minute.
+ * Start no new piece once a step has relayed this long. At Drive's pace (10 to
+ * 14 MB/s a range, measured from a Worker) a piece takes 15 to 20 s, so a step
+ * moves three or four pieces a clip and lasts a minute or so. Deliveries come
+ * about every three minutes, so this is most of the speed: 30 s moved one or
+ * two. The cost is that the platform's queue delivers a batch of jobs one
+ * after another, so a longer step holds up other apps' deliveries for longer.
  */
-export const RELAY_BUDGET_MS = 30_000;
+export const RELAY_BUDGET_MS = 60_000;
 
 /** Clips moved on at once in a step: each holds two connections while a piece is on its way. */
 export const RELAY_AT_ONCE = 2;
