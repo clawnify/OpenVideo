@@ -26,6 +26,7 @@ import { parseVtt, type Cue } from "../shared/transcript";
 import { fadeGain, heardFor } from "../shared/fade";
 import { sharedPrefix } from "../shared/names";
 import { repeatPasses } from "../shared/passes";
+import { playbackVerdict } from "../shared/playback";
 import {
   DEFAULT_TRANSITION_SECONDS,
   MAX_TRANSITION_SECONDS,
@@ -321,7 +322,12 @@ async function errJson(r: Response): Promise<{ error?: string; detail?: string; 
 export const api = {
   async get<T>(url: string): Promise<T> {
     const r = await fetch(url);
-    if (!r.ok) throw new Error((await errJson(r)).error || r.statusText);
+    if (!r.ok) {
+      const e = await errJson(r);
+      // The status and the service's own code go with the error, so a caller
+      // can tell something gone for good from a hiccup.
+      throw Object.assign(new Error(e.error || r.statusText), { status: r.status, code: e.error });
+    }
     return r.json();
   },
   async send<T>(method: string, url: string, body?: unknown): Promise<T> {
@@ -2492,12 +2498,16 @@ function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<st
       const broken: string[] = [];
       for (const id of key.split(",")) {
         if (stopped()) return;
+        let verdict: ReturnType<typeof playbackVerdict>;
         try {
-          const r = await api.get<{ ready: boolean; state?: string }>(`/api/assets/${id}/playback`);
-          (r.ready ? done : r.state === "error" ? broken : waiting).push(id);
-        } catch {
-          /* a hiccup: ask again on the next pass */
+          verdict = playbackVerdict(await api.get<{ ready: boolean; state?: string }>(`/api/assets/${id}/playback`));
+        } catch (err) {
+          verdict = playbackVerdict(err as { status?: number; code?: string });
         }
+        // A retry is a hiccup: asked again on the next pass.
+        if (verdict === "ready") done.push(id);
+        else if (verdict === "failed") broken.push(id);
+        else if (verdict === "waiting") waiting.push(id);
       }
       if (stopped()) return;
       if (done.length) setReady((cur) => new Set([...cur, ...done]));
