@@ -145,6 +145,18 @@ async function sendPiece(
   return res.ok && Number.isInteger(next) && next > offset ? next : null;
 }
 
+/**
+ * Reads one piece of the file: Drive's answer, to be checked and streamed on.
+ * Null when it couldn't be asked (asked again on the next step).
+ */
+export type PieceReader = (start: number, end: number, signal: AbortSignal) => Promise<Response | null>;
+
+/** The file's shared link: fast, and free of any broker. */
+export function sharedLinkReader(fileId: string): PieceReader {
+  return (start, end, signal) =>
+    fetch(directDownloadUrl(fileId), { headers: { Range: `bytes=${start}-${end}` }, signal }).catch(() => null);
+}
+
 export type RelayResult =
   /** Every byte is in. `contentType` is what Drive said the file is. */
   | { state: "done"; contentType: string }
@@ -161,9 +173,16 @@ export type RelayResult =
  * Append pieces of a Drive file to its open upload until the file is all in
  * or `until` (a Date.now() time) passes; a piece already on its way finishes.
  * `progress` hears each new offset.
+ *
+ * Each piece is read from the first of `readers` that serves it: the shared
+ * link, then the org's Drive connection. Drive's limit can come to refuse a
+ * shared link's pieces too, past some point in the file, while its API, asked
+ * as the connected account, still serves them. Once a later reader has served
+ * a piece, the rest of this call starts from it.
  */
 export async function relayPieces(
-  upload: { url: string; fileId: string; size: number },
+  upload: { url: string; size: number },
+  readers: PieceReader[],
   until: number,
   progress: (received: number) => Promise<void>,
 ): Promise<RelayResult> {
@@ -171,6 +190,7 @@ export async function relayPieces(
   if (at === "gone") return { state: "gone" };
   if (at === null) return { state: "moving" };
   let contentType = "video/mp4";
+  let first = 0;
   while (at < upload.size && Date.now() < until) {
     const piece = nextPiece(at, upload.size)!;
     // One signal cuts both ends of the piece: the read from Drive and the send.
@@ -178,13 +198,23 @@ export async function relayPieces(
     const timer = setTimeout(() => cut.abort(), PIECE_TIMEOUT_MS);
     let sent: Awaited<ReturnType<typeof sendPiece>>;
     try {
-      const res = await fetch(directDownloadUrl(upload.fileId), {
-        headers: { Range: `bytes=${piece.start}-${piece.end}` },
-        signal: cut.signal,
-      }).catch(() => null);
-      if (!res) break;
-      const verdict = pieceVerdict(res.status, res.headers.get("content-type"), res.headers.get("content-range"), piece, upload.size);
-      if (verdict !== "ok" || !res.body) {
+      let res: Response | null = null;
+      let verdict: ReturnType<typeof pieceVerdict> = "refused";
+      for (let i = first; i < readers.length; i++) {
+        res = await readers[i](piece.start, piece.end, cut.signal);
+        if (!res) {
+          verdict = "retry";
+          break;
+        }
+        verdict = pieceVerdict(res.status, res.headers.get("content-type"), res.headers.get("content-range"), piece, upload.size);
+        if (verdict === "ok") {
+          first = i;
+          break;
+        }
+        await res.body?.cancel().catch(() => {});
+        if (verdict === "retry") break;
+      }
+      if (verdict !== "ok" || !res?.body) {
         cut.abort();
         if (verdict === "refused") return { state: "drive" };
         break;

@@ -23,7 +23,9 @@ import {
 import {
   DRIVE_FILE_ID,
   SHARED_WITH_ME,
-  driveDownloadLink,
+  driveActionLink,
+  driveFileLink,
+  driveFilePiece,
   driveRemove,
   driveFolderName,
   driveStatus,
@@ -314,7 +316,11 @@ app.post("/api/drive/import", async (c) => {
     return c.json({ error: `that file is outside ${limit.name}` }, 403);
   }
 
-  const file = await driveDownloadLink(c.env, b.fileId);
+  // Through the connection's Drive API. A file over what one answer carries
+  // (250 MB) takes the broker's download action instead: nothing here reads
+  // a library import in pieces.
+  const link = await driveFileLink(c.env, b.fileId);
+  const file = "tooBig" in link ? await driveActionLink(c.env, b.fileId) : link;
 
   // A video goes to the media service: it fetches the link itself, so nothing
   // passes through this app and no size ceiling applies. Stills and sound are
@@ -940,13 +946,18 @@ async function addFolder(
 /** The org's Google Drive connection as a footage source, when it has one. */
 async function driveSource(env: Bindings): Promise<DriveSource | undefined> {
   if (!env.CREDENTIALS) return undefined;
-  const status = await driveStatus(env).catch(() => ({ connected: false }));
-  if (!status.connected) return undefined;
+  const status = await driveStatus(env).catch(() => null);
+  if (!status?.connected || !status.service) return undefined;
+  const service = status.service;
   const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
   return {
+    piece: (fileId, start, end, signal) => driveFilePiece(env, service, fileId, start, end, signal),
     async download(fileId) {
       try {
-        const file = await driveDownloadLink(env, fileId);
+        const file = await driveFileLink(env, fileId);
+        // Footage always has its shared link: a bigger file comes by that,
+        // a piece at a time when Drive won't hand it over whole.
+        if ("tooBig" in file) return { error: "over what one answer through the connection carries (250 MB)" };
         return { url: file.url, mimeType: file.mimeType };
       } catch (e) {
         return { error: message(e) };
