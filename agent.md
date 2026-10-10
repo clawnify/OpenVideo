@@ -160,11 +160,11 @@ When the org has a Google Drive connection whose account can open the
 folder, clips are downloaded through it instead, as that account, which
 Drive's limit on shared links doesn't touch. Those downloads run in the
 background steps only. A file too big for the connection's temporary storage
-(seen at 9 GB; 3.4 GB passed) is copied inside Google into a temporary
-folder of the connected account ("OpenVideo imports (temporary)"), shared
-with the link, imported from the copy, and the copy is deleted once the
-import is over (or with the project). Only if that fails too does it come by
-the original's shared link.
+(seen at 9 GB; 3.4 GB passed) comes by the original's shared link, with the
+waits above. It is never copied inside Google first: Drive answers a header
+check on a fresh copy of a big file with an empty page, and the video host
+refuses such a download. Copies an earlier version made are deleted once
+their import is over (or with the project).
 
 A source over the video host's 200 Mbps cap (all-intra camera files) is
 re-encoded on the way in, by itself: it imports a little later, as high-quality

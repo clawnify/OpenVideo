@@ -333,9 +333,7 @@ interface WorkRow {
 export interface DriveSource {
   /** A short-lived link to the file's bytes, fetched as the connected account. */
   download(fileId: string): Promise<{ url: string; mimeType: string } | { error: string }>;
-  /** For a file too big to download that way: a copy in the connected account, shared with the link. */
-  copy(fileId: string, name: string): Promise<{ fileId: string } | { error: string }>;
-  /** Delete such a copy once its import is over. */
+  /** Delete a copy an earlier version made in the connected account for an import. */
   remove(fileId: string): Promise<void>;
 }
 
@@ -398,7 +396,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
   if (opts.drive) {
     await run(
       `UPDATE project_footage SET retry_at = NULL, error = NULL
-        WHERE project_id = ? AND status = 'waiting' AND retry_at IS NOT NULL AND link_only < 2`,
+        WHERE project_id = ? AND status = 'waiting' AND retry_at IS NOT NULL AND link_only = 0`,
       [projectId],
     );
     const done = await query<{ id: string; copy_id: string }>(
@@ -657,27 +655,14 @@ async function startImport(
   drive?: DriveSource,
 ): Promise<true | { orgWide: boolean; detail: string; driveLimit?: true }> {
   // Through the org's connection first. A file it can't hand over (too big for
-  // the connector's temporary storage) comes from a copy the connection makes
-  // in its own account, shared with the link, and deleted once imported; and
-  // when even that fails, by the original's shared link.
-  if (drive && r.link_only < 2) {
-    if (!r.link_only) {
-      const got = await drive.download(r.drive_file_id).catch((e: unknown) => ({ error: String(e) }));
-      if ("url" in got) return importFrom(cfg, r, got.url, got.mimeType.startsWith("video/") ? got.mimeType : "video/mp4", 0);
-      await setRow(r.id, { link_only: 1 });
-    }
-    if (r.copy_id) {
-      // The copy from an earlier try makes way for a fresh one. One that
-      // can't be deleted is imported from again rather than left behind.
-      if (!(await removeCopy(drive, r.copy_id))) return importFrom(cfg, r, directDownloadUrl(r.copy_id), "video/mp4", 0);
-      await setRow(r.id, { copy_id: null });
-    }
-    const copy = await drive.copy(r.drive_file_id, r.name).catch((e: unknown) => ({ error: String(e) }));
-    if ("fileId" in copy) {
-      await setRow(r.id, { copy_id: copy.fileId });
-      return importFrom(cfg, r, directDownloadUrl(copy.fileId), "video/mp4", 0);
-    }
-    // Neither way through the connection worked: the shared link, with its waits.
+  // the connector's temporary storage) comes by the original's shared link,
+  // with its waits. Not by a copy in the connected account: Drive answers a
+  // header check on a fresh copy of a big file with an empty page while the
+  // file itself downloads, and the video host, which checks first, refuses
+  // the download as inconsistent.
+  if (drive && !r.link_only) {
+    const got = await drive.download(r.drive_file_id).catch((e: unknown) => ({ error: String(e) }));
+    if ("url" in got) return importFrom(cfg, r, got.url, got.mimeType.startsWith("video/") ? got.mimeType : "video/mp4", 0);
     await setRow(r.id, { link_only: 2 });
   }
   const url = directDownloadUrl(r.drive_file_id);

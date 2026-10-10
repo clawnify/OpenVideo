@@ -179,36 +179,7 @@ export async function driveDownloadLink(
   return { url: file.s3url, name: file.name || fileId, mimeType: file.mimetype || "application/octet-stream" };
 }
 
-/**
- * A copy of a file the connected account can open, made inside Google (no
- * bytes pass through anyone) into `folderId` of that account, and shared with
- * the link. For a file too big to download through the connection: the copy
- * is a new file, so the original's limits on shared-link downloads don't
- * apply to it, and the media service pulls it at any size.
- */
-export async function driveCopyForImport(env: ConnectionsEnv, fileId: string, name: string, folderId: string): Promise<string> {
-  const service = await requireDriveService(env);
-  const prefix = service.toUpperCase();
-  const copy = (await connect(service, env).run(`${prefix}_COPY_FILE_ADVANCED`, {
-    fileId,
-    name,
-    parents: [folderId],
-    supportsAllDrives: true,
-  })) as { id?: string };
-  if (!copy?.id) throw new Error("Google Drive returned no copy");
-  await connect(service, env).run(`${prefix}_CREATE_PERMISSION`, { file_id: copy.id, type: "anyone", role: "reader" });
-  return copy.id;
-}
-
-/** A folder in the connected account's own Drive. */
-export async function driveCreateFolder(env: ConnectionsEnv, name: string): Promise<string> {
-  const service = await requireDriveService(env);
-  const folder = (await connect(service, env).run(`${service.toUpperCase()}_CREATE_FOLDER`, { name })) as { id?: string };
-  if (!folder?.id) throw new Error("Google Drive returned no folder");
-  return folder.id;
-}
-
-/** Delete a file the app made in the connected account (a copy made for an import). */
+/** Delete a file the app made in the connected account (a copy an earlier version made for an import). */
 export async function driveRemove(env: ConnectionsEnv, fileId: string): Promise<void> {
   const service = await requireDriveService(env);
   await connect(service, env).run(`${service.toUpperCase()}_GOOGLE_DRIVE_DELETE_FOLDER_OR_FILE_ACTION`, { fileId, supportsAllDrives: true });
