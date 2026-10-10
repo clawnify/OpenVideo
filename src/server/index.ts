@@ -23,8 +23,6 @@ import {
 import {
   DRIVE_FILE_ID,
   SHARED_WITH_ME,
-  driveCopyForImport,
-  driveCreateFolder,
   driveDownloadLink,
   driveRemove,
   driveFolderName,
@@ -930,19 +928,6 @@ async function driveSource(env: Bindings): Promise<DriveSource | undefined> {
   const status = await driveStatus(env).catch(() => ({ connected: false }));
   if (!status.connected) return undefined;
   const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
-  // Copies for import land in one folder of the connected account's Drive,
-  // made the first time one is needed (and again if someone deleted it).
-  const copyFolder = async (fresh: boolean): Promise<string> => {
-    const row = fresh ? null : await get<{ value: string }>("SELECT value FROM app_settings WHERE key = 'drive_copy_folder'");
-    if (row?.value) return row.value;
-    const id = await driveCreateFolder(env, "OpenVideo imports (temporary)");
-    await run(
-      `INSERT INTO app_settings (key, value, updated_at) VALUES ('drive_copy_folder', ?, datetime('now'))
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-      [id],
-    );
-    return id;
-  };
   return {
     async download(fileId) {
       try {
@@ -950,17 +935,6 @@ async function driveSource(env: Bindings): Promise<DriveSource | undefined> {
         return { url: file.url, mimeType: file.mimeType };
       } catch (e) {
         return { error: message(e) };
-      }
-    },
-    async copy(fileId, name) {
-      try {
-        return { fileId: await driveCopyForImport(env, fileId, name, await copyFolder(false)) };
-      } catch {
-        try {
-          return { fileId: await driveCopyForImport(env, fileId, name, await copyFolder(true)) };
-        } catch (e) {
-          return { error: message(e) };
-        }
       }
     },
     remove: (fileId) => driveRemove(env, fileId),

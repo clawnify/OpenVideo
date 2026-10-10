@@ -79,7 +79,8 @@ globalThis.fetch = async (input, init = {}) => {
   }
   if (u.hostname === "drive.usercontent.google.com") {
     const ranged = new Headers(init.headers ?? {}).has("range");
-    if ((u.searchParams.get("id") === fid("q1") && !world.quotaLifted || u.searchParams.get("id").startsWith("conn")) && !ranged) {
+    const id = u.searchParams.get("id");
+    if ((id === fid("q1") && !world.quotaLifted || (id.startsWith("conn") && id !== "conn_big___________________")) && !ranged) {
       // Over Drive's daily download limit: ranged reads still work, the whole file doesn't.
       return new Response("<html><head><title>Google Drive - Quota exceeded</title></head><body>Too many users have viewed or downloaded this file recently.</body></html>", { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
     }
@@ -626,22 +627,14 @@ console.log(`10 ok: project deleted in two calls, ${deleted} media copies delete
 
 // 12. With the org's Google Drive connection, clips come in through it, not
 // the shared link: on deliveries only (a download through it is slow). A file
-// the connection can't hand over comes by the shared link from then on.
+// the connection can't hand over comes by the original's shared link from
+// then on, never by a copy in the connected account.
 env.CREDENTIALS = {
   async listConnected() {
     return ["googledrive"];
   },
   async executeTool(service, action, args) {
     (world.connActions ??= []).push(action);
-    if (action === "GOOGLEDRIVE_CREATE_FOLDER") return { successful: true, data: { id: "tmpfolder_________________" } };
-    if (action === "GOOGLEDRIVE_COPY_FILE_ADVANCED") {
-      assert.deepEqual(args.parents, ["tmpfolder_________________"]);
-      return { successful: true, data: { id: `copy${args.fileId.slice(4)}` } };
-    }
-    if (action === "GOOGLEDRIVE_CREATE_PERMISSION") {
-      assert.deepEqual([args.type, args.role], ["anyone", "reader"]);
-      return { successful: true, data: {} };
-    }
     if (action === "GOOGLEDRIVE_GOOGLE_DRIVE_DELETE_FOLDER_OR_FILE_ACTION") {
       world.removeTries = (world.removeTries ?? 0) + 1;
       if (world.refuseRemoves > 0) {
@@ -676,22 +669,27 @@ const small = f2.items.find((i) => i.name === "A_0001.MP4");
 const big = f2.items.find((i) => i.name === "Interview.MP4");
 assert.equal(small.status, "importing", JSON.stringify(small));
 assert.ok(world.importUrls.includes("https://temp.r2.test/conn_small_________________"), "imported from the connection's link");
-// Too big for the connection's download: a copy in the connected account, shared with the link.
+// Too big for the connection's download: the original's shared link, the same
+// delivery, and no copy, permission or folder made in the connected account.
 assert.equal(big.status, "importing", JSON.stringify(big));
-const copyId = "copy_big___________________";
-assert.ok(world.importUrls.includes(`https://drive.usercontent.google.com/download?id=${copyId}&export=download&confirm=t`), "imported from the copy's link");
-assert.equal(db.prepare("SELECT copy_id FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().copy_id, copyId);
+assert.ok(world.importUrls.includes("https://drive.usercontent.google.com/download?id=conn_big___________________&export=download&confirm=t"), "imported from the original's shared link");
+assert.equal(db.prepare("SELECT link_only, copy_id FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().link_only, 2);
+assert.ok(!world.connActions.some((a) => /COPY_FILE|CREATE_PERMISSION|CREATE_FOLDER/.test(a)), JSON.stringify(world.connActions));
 const callsBefore = world.connCalls;
-// The imports finish; the next delivery deletes the copy (Drive refuses the
-// first try: the copy stays on the clip and goes on the next one), and the
-// connection's download isn't tried again for the file it couldn't take.
+// A copy an earlier version made for this clip is deleted once the import is
+// over (Drive refuses the first try: it stays on the clip and goes on the
+// next), and the connection's download isn't tried again for the file it
+// couldn't take.
+const leftover = "copy_left__________________";
+db.prepare("UPDATE project_footage SET copy_id = ? WHERE drive_file_id = 'conn_big___________________'").run(leftover);
 world.refuseRemoves = 1;
 for (let i = 0; i < 6; i++) await deliver2();
 assert.equal(world.connCalls, callsBefore);
-assert.deepEqual(world.removed, [copyId], "the copy is deleted once imported");
+assert.equal(db.prepare("SELECT status FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().status, "ready");
+assert.deepEqual(world.removed, [leftover], "the leftover copy is deleted once the import is over");
 assert.equal(world.removeTries, 2, "a refused delete keeps the copy on the clip and is tried again");
 assert.equal(db.prepare("SELECT copy_id FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().copy_id, null);
-console.log("12 ok: imports through the Drive connection on deliveries; a file too big for it comes from a copy, deleted once imported, after a refused delete too");
+console.log("12 ok: imports through the Drive connection on deliveries; a file too big for it comes by its shared link, no copy made; a leftover copy is deleted, after a refused delete too");
 
 // 13. A source over the video host's bitrate cap goes back in line marked for
 // re-encoding; the re-encode becomes a media id, and the clip is ready.
