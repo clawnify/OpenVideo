@@ -41,6 +41,7 @@ import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
 import { instructEdit, type InstructHighlight } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
+import { COMMENTS_PER_MINUTE, MAX_PROJECT_COMMENTS, parseComment, type PublicComment } from "./comments";
 
 type Bindings = {
   DB: D1Database;
@@ -890,6 +891,7 @@ app.delete("/api/projects/:id", async (c) => {
   const keys = jobs.map((j) => renderKey(j.output_url)).filter((k): k is string => k !== null);
   if (keys.length) await deleteUpload(keys).catch(() => {});
   await run("DELETE FROM share_links WHERE project_id = ?", [id]);
+  await run("DELETE FROM review_comments WHERE project_id = ?", [id]);
   await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM edit_projects WHERE id = ?", [id]);
   return c.json({ ok: true });
@@ -1699,6 +1701,8 @@ interface ShareLink {
   token: string;
   project_id: string;
   export_id: number;
+  /** 1: viewers can comment. */
+  comments: number;
   created_at: string;
 }
 
@@ -1724,6 +1728,7 @@ async function shareOut(c: { req: { url: string } }, projectId: string) {
     exported_at: link.exported_at,
     // A finished export newer than the one viewers see.
     newer_export: latest && latest.id !== link.export_id ? latest.id : null,
+    comments: link.comments === 1,
     created_at: link.created_at,
   };
 }
@@ -1748,9 +1753,66 @@ app.put("/api/projects/:id/share", async (c) => {
   return c.json(await shareOut(c, id));
 });
 
+// Lets viewers comment, or stops new comments (the ones left stay).
+app.patch("/api/projects/:id/share", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  if (typeof body?.comments !== "boolean") return c.json({ error: "comments: true or false" }, 400);
+  const res = await run("UPDATE share_links SET comments = ? WHERE project_id = ?", [body.comments ? 1 : 0, id]);
+  if (!res.changes) return c.json({ error: "no_link", detail: "create a link first" }, 404);
+  return c.json(await shareOut(c, id));
+});
+
 app.delete("/api/projects/:id/share", async (c) => {
   await run("DELETE FROM share_links WHERE project_id = ?", [c.req.param("id")]);
   return c.json({ url: null, can_share: true });
+});
+
+// ── Review comments (comments.ts) ────────────────────────────────────
+
+interface ReviewComment {
+  id: string;
+  project_id: string;
+  export_id: number;
+  at: number | null;
+  body: string;
+  author: string;
+  resolved_at: string | null;
+  created_at: string;
+}
+
+// Every comment on the project, newest first, with when each one's export
+// finished: a comment's time is in that export, and the cut may have changed
+// since. `shared_export_id` is the export the link plays now, if there is a link.
+app.get("/api/projects/:id/comments", async (c) => {
+  const id = c.req.param("id");
+  const project = await get<{ updated_at: string }>("SELECT updated_at FROM edit_projects WHERE id = ?", [id]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+  const comments = await query<ReviewComment & { exported_at: string | null }>(
+    `SELECT r.*, e.updated_at AS exported_at FROM review_comments r
+       LEFT JOIN export_jobs e ON e.id = r.export_id
+      WHERE r.project_id = ? ORDER BY r.created_at DESC, r.id LIMIT ?`,
+    [id, MAX_PROJECT_COMMENTS],
+  );
+  const link = await get<{ export_id: number }>("SELECT export_id FROM share_links WHERE project_id = ?", [id]);
+  return c.json({ comments, shared_export_id: link?.export_id ?? null, project_updated_at: project.updated_at });
+});
+
+app.patch("/api/projects/:id/comments/:cid", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (typeof body?.resolved !== "boolean") return c.json({ error: "resolved: true or false" }, 400);
+  const res = await run(
+    `UPDATE review_comments SET resolved_at = ${body.resolved ? "COALESCE(resolved_at, datetime('now'))" : "NULL"}
+      WHERE id = ? AND project_id = ?`,
+    [c.req.param("cid"), c.req.param("id")],
+  );
+  if (!res.changes) return c.json({ error: "Comment not found" }, 404);
+  return c.json({ ok: true });
+});
+
+app.delete("/api/projects/:id/comments/:cid", async (c) => {
+  await run("DELETE FROM review_comments WHERE id = ? AND project_id = ?", [c.req.param("cid"), c.req.param("id")]);
+  return c.json({ ok: true });
 });
 
 // The public half: the only routes reachable without signing in (clawnify.json
@@ -1759,8 +1821,8 @@ app.delete("/api/projects/:id/share", async (c) => {
 
 /** The link's project and the export it is pinned to, if the link is live. */
 async function sharedExport(token: string) {
-  return get<{ name: string; export_id: number; output_url: string | null }>(
-    `SELECT p.name, s.export_id, e.output_url
+  return get<{ name: string; project_id: string; export_id: number; output_url: string | null; duration: number | null; comments: number }>(
+    `SELECT p.name, s.project_id, s.export_id, e.output_url, e.duration, s.comments
        FROM share_links s
        JOIN edit_projects p ON p.id = s.project_id
        JOIN export_jobs e ON e.id = s.export_id AND e.status = 'completed'
@@ -1778,7 +1840,71 @@ app.get("/s/:token", async (c) => {
   if (!shared) {
     return c.html(notePage("This link doesn't work", "It may have been turned off. Ask whoever sent it for a new one."), 404);
   }
-  return c.html(sharePage(shared.name, `/s/${encodeURIComponent(c.req.param("token"))}/video?v=${shared.export_id}`));
+  const base = `/s/${encodeURIComponent(c.req.param("token"))}`;
+  const review = shared.comments
+    ? { comments: await linkComments(shared.project_id, shared.export_id), post: `${base}/comments`, v: shared.export_id }
+    : undefined;
+  return c.html(sharePage(shared.name, `${base}/video?v=${shared.export_id}`, review));
+});
+
+/** The comments viewers of a link see: those on the export it plays. */
+async function linkComments(projectId: string, exportId: number): Promise<PublicComment[]> {
+  const rows = await query<ReviewComment>(
+    "SELECT * FROM review_comments WHERE project_id = ? AND export_id = ? ORDER BY created_at, id LIMIT ?",
+    [projectId, exportId, MAX_PROJECT_COMMENTS],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    at: r.at,
+    body: r.body,
+    author: r.author,
+    resolved: r.resolved_at !== null,
+    created_at: r.created_at,
+  }));
+}
+
+// A viewer's comment. Answers with the link's comments, so the page shows
+// what others left meanwhile too.
+app.post("/s/:token/comments", async (c) => {
+  for (const [k, v] of Object.entries(PUBLIC_HEADERS)) c.header(k, v);
+  c.header("Cache-Control", "no-store");
+  const shared = await sharedExport(c.req.param("token"));
+  if (!shared) return c.json({ error: "not_found", detail: "This link doesn't work any more." }, 404);
+  if (!shared.comments) return c.json({ error: "comments_off", detail: "Comments are turned off for this video." }, 403);
+  const text = await c.req.text();
+  if (text.length > 8192) return c.json({ error: "too_large", detail: "That comment is too long." }, 413);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    raw = null;
+  }
+  const parsed = parseComment(raw, shared.duration);
+  if (!parsed.ok) return c.json({ error: "invalid", detail: parsed.detail }, 400);
+  const { v, at, body, author } = parsed.value;
+  if (v !== shared.export_id) {
+    return c.json({ error: "moved", detail: "This link now plays a newer version. Reload the page to comment on it." }, 409);
+  }
+  const counts = await get<{ total: number; recent: number }>(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(created_at >= datetime('now', '-1 minute')), 0) AS recent
+       FROM review_comments WHERE project_id = ?`,
+    [shared.project_id],
+  );
+  if ((counts?.recent ?? 0) >= COMMENTS_PER_MINUTE) {
+    return c.json({ error: "busy", detail: "Too many comments at once. Wait a minute and send it again." }, 429);
+  }
+  if ((counts?.total ?? 0) >= MAX_PROJECT_COMMENTS) {
+    return c.json({ error: "full", detail: "This video has as many comments as it can take." }, 429);
+  }
+  await run("INSERT INTO review_comments (project_id, export_id, at, body, author) VALUES (?, ?, ?, ?, ?)", [
+    shared.project_id,
+    v,
+    at,
+    body,
+    author,
+  ]);
+  return c.json({ comments: await linkComments(shared.project_id, v) }, 201);
 });
 
 // `v` names the export the page was rendered with. Only the pinned one is
