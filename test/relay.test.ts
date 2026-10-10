@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_RELAY_BYTES, PIECE_BYTES, nextPiece, pieceVerdict, rangedSize, relayPieces } from "../src/server/relay";
+import { MAX_RELAY_BYTES, PIECE_BYTES, nextPiece, pieceVerdict, rangedSize, relayPieces, sharedLinkReader } from "../src/server/relay";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -36,6 +36,8 @@ function fakeUpload(size: number, at = 0) {
     at,
     /** Where each piece that landed started. */
     patches: [] as number[],
+    /** Where each piece asked of the shared link started. */
+    asked: [] as number[],
     headers: [] as Headers[],
     refuseRange: (_start: number): "quota" | number | null => null,
     patchFails: (_at: number): number | "throw" | null => null,
@@ -50,6 +52,7 @@ function fakeUpload(size: number, at = 0) {
         const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(h.get("range") ?? "")!;
         const start = Number(a);
         const end = Number(b);
+        state.asked.push(start);
         const refusal = state.refuseRange(start);
         if (refusal === "quota") {
           return new Response("<html><head><title>Google Drive - Quota exceeded</title></head></html>", {
@@ -159,14 +162,15 @@ describe("rangedSize", () => {
 
 describe("relayPieces", () => {
   const SIZE = 2 * PIECE_BYTES + 3 * MiB;
-  const file = { url: UPLOAD, fileId: "file-id", size: SIZE };
+  const file = { url: UPLOAD, size: SIZE };
+  const link = [sharedLinkReader("file-id")];
   const later = () => Date.now() + 60_000;
   const quiet = async () => {};
 
   it("sends the file in order, a piece at a time, and says when it is all in", async () => {
     const up = fakeUpload(SIZE);
     const seen: number[] = [];
-    const result = await relayPieces(file, later(), async (n) => {
+    const result = await relayPieces(file, link, later(), async (n) => {
       seen.push(n);
     });
     expect(result).toEqual({ state: "done", contentType: "video/mp4" });
@@ -181,37 +185,37 @@ describe("relayPieces", () => {
 
   it("carries on from where the upload stands, not from a count of its own", async () => {
     const up = fakeUpload(SIZE, PIECE_BYTES + 7);
-    expect((await relayPieces(file, later(), quiet)).state).toBe("done");
+    expect((await relayPieces(file, link, later(), quiet)).state).toBe("done");
     expect(up.patches).toEqual([PIECE_BYTES + 7, 2 * PIECE_BYTES + 7]);
     expect(up.at).toBe(SIZE);
   });
 
   it("starts no piece once its time is up", async () => {
     const up = fakeUpload(SIZE);
-    expect(await relayPieces(file, Date.now() - 1, quiet)).toEqual({ state: "moving" });
+    expect(await relayPieces(file, link, Date.now() - 1, quiet)).toEqual({ state: "moving" });
     expect(up.patches).toEqual([]);
   });
 
   it("stops for Drive when it refuses a piece, keeping what landed", async () => {
     const up = fakeUpload(SIZE);
     up.refuseRange = (start) => (start >= PIECE_BYTES ? "quota" : null);
-    expect(await relayPieces(file, later(), quiet)).toEqual({ state: "drive" });
+    expect(await relayPieces(file, link, later(), quiet)).toEqual({ state: "drive" });
     expect(up.at).toBe(PIECE_BYTES);
   });
 
   it("leaves a hiccup to the next step: Drive busy, a lost connection, a piece the upload turned away", async () => {
     let up = fakeUpload(SIZE);
     up.refuseRange = () => 503;
-    expect(await relayPieces(file, later(), quiet)).toEqual({ state: "moving" });
+    expect(await relayPieces(file, link, later(), quiet)).toEqual({ state: "moving" });
 
     up = fakeUpload(SIZE);
     up.patchFails = (at) => (at === PIECE_BYTES ? "throw" : null);
-    expect(await relayPieces(file, later(), quiet)).toEqual({ state: "moving" });
+    expect(await relayPieces(file, link, later(), quiet)).toEqual({ state: "moving" });
     expect(up.at).toBe(PIECE_BYTES);
 
     up = fakeUpload(SIZE);
     up.patchFails = () => 500;
-    expect(await relayPieces(file, later(), quiet)).toEqual({ state: "moving" });
+    expect(await relayPieces(file, link, later(), quiet)).toEqual({ state: "moving" });
     expect(up.at).toBe(0);
   });
 
@@ -224,23 +228,67 @@ describe("relayPieces", () => {
       up.at = PIECE_BYTES; // someone else's first piece
       return 409;
     };
-    expect((await relayPieces(file, later(), quiet)).state).toBe("done");
+    expect((await relayPieces(file, link, later(), quiet)).state).toBe("done");
     expect(up.patches).toEqual([PIECE_BYTES, 2 * PIECE_BYTES]);
   });
 
   it("gives up on a piece the upload turns away for good, with the host's reason", async () => {
     const up = fakeUpload(SIZE);
     up.patchFails = () => 400;
-    expect(await relayPieces(file, later(), quiet)).toEqual({ state: "refused", detail: "400: Decoding Error" });
+    expect(await relayPieces(file, link, later(), quiet)).toEqual({ state: "refused", detail: "400: Decoding Error" });
     expect(up.at).toBe(0);
+  });
+
+  /** A second reader, as the Drive connection serves pieces: its own answer per range. */
+  const connection = (answer: (start: number) => "ok" | number | null) => {
+    const served: number[] = [];
+    const reader = async (start: number, end: number) => {
+      const a = answer(start);
+      if (a === null) return null;
+      if (typeof a === "number") return new Response(null, { status: a });
+      served.push(start);
+      return new Response(bytes(end - start + 1), {
+        status: 206,
+        headers: { "content-type": "video/mp4", "content-range": `bytes ${start}-${end}/${SIZE}` },
+      });
+    };
+    return { reader, served };
+  };
+
+  it("reads a piece the shared link refuses through the connection, and stays with it", async () => {
+    const up = fakeUpload(SIZE);
+    up.refuseRange = (start) => (start >= PIECE_BYTES ? "quota" : null);
+    const conn = connection(() => "ok");
+    expect((await relayPieces(file, [...link, conn.reader], later(), quiet)).state).toBe("done");
+    expect(up.patches).toEqual([0, PIECE_BYTES, 2 * PIECE_BYTES]);
+    expect(conn.served).toEqual([PIECE_BYTES, 2 * PIECE_BYTES]);
+    expect(up.asked, "once the connection served a piece, the refusing link isn't asked again").toEqual([0, PIECE_BYTES]);
+  });
+
+  it("waits on Drive only when every reader refuses the piece", async () => {
+    const up = fakeUpload(SIZE);
+    up.refuseRange = (start) => (start >= PIECE_BYTES ? "quota" : null);
+    const conn = connection(() => 403);
+    expect(await relayPieces(file, [...link, conn.reader], later(), quiet)).toEqual({ state: "drive" });
+    expect(up.at).toBe(PIECE_BYTES);
+  });
+
+  it("leaves the connection's hiccup to the next step", async () => {
+    const up = fakeUpload(SIZE);
+    up.refuseRange = (start) => (start >= PIECE_BYTES ? "quota" : null);
+    let conn = connection(() => null);
+    expect(await relayPieces(file, [...link, conn.reader], later(), quiet)).toEqual({ state: "moving" });
+    conn = connection(() => 503);
+    expect(await relayPieces(file, [...link, conn.reader], later(), quiet)).toEqual({ state: "moving" });
+    expect(up.at).toBe(PIECE_BYTES);
   });
 
   it("says when the upload can't take more", async () => {
     let up = fakeUpload(SIZE);
     up.headStatus = 404;
-    expect(await relayPieces(file, later(), quiet)).toEqual({ state: "gone" });
+    expect(await relayPieces(file, link, later(), quiet)).toEqual({ state: "gone" });
     up = fakeUpload(SIZE);
     up.patchFails = () => 410;
-    expect(await relayPieces(file, later(), quiet)).toEqual({ state: "gone" });
+    expect(await relayPieces(file, link, later(), quiet)).toEqual({ state: "gone" });
   });
 });

@@ -164,10 +164,12 @@ has its own limit.
 
 When the org has a Google Drive connection whose account can open the
 folder, clips are downloaded through it instead, as that account, which
-Drive's limit on shared links doesn't touch. Those downloads run in the
-background steps only. A file too big for the connection's temporary storage
-(seen at 9 GB; 3.4 GB passed) comes by the original's shared link, as above:
-whole, or a piece at a time when Drive refuses it whole. It is never copied inside Google first: Drive answers a header
+Drive's limit on shared links doesn't touch: Google's own Drive API, signed
+by the connection. Those downloads run in the background steps only. A file
+over 250 MB, more than one answer through the connection carries, comes by
+the original's shared link, as above: whole, or a piece at a time when Drive
+refuses it whole. A piece Drive refuses on the shared link (it can, after a
+few GB of one file) comes through the connection instead. It is never copied inside Google first: Drive answers a header
 check on a fresh copy of a big file with an empty page, and the video host
 refuses such a download. Copies an earlier version made are deleted once
 their import is over (or with the project).

@@ -21,7 +21,16 @@ import { query, get, run } from "./db";
 import { deleteMedia, importMedia, mediaState, openMediaUpload, prepareMedia, startTranscode, transcodeState, type MediaConfig } from "./media";
 import { refusalDetail } from "./refusal";
 import { directDownloadUrl, folderListingUrl, judgeLinkResponse, listFolderVideos, type FolderVideo } from "./drive-link";
-import { MAX_RELAY_BYTES, RELAY_AT_ONCE, RELAY_BUDGET_MS, RELAY_EXPIRY_MARGIN_MS, rangedSize, relayPieces } from "./relay";
+import {
+  MAX_RELAY_BYTES,
+  RELAY_AT_ONCE,
+  RELAY_BUDGET_MS,
+  RELAY_EXPIRY_MARGIN_MS,
+  rangedSize,
+  relayPieces,
+  sharedLinkReader,
+  type PieceReader,
+} from "./relay";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 
@@ -342,6 +351,11 @@ export interface DriveSource {
   download(fileId: string): Promise<{ url: string; mimeType: string } | { error: string }>;
   /** Delete a copy an earlier version made in the connected account for an import. */
   remove(fileId: string): Promise<void>;
+  /**
+   * One piece of a file through the connection: Drive's answer, with its own
+   * status and headers. It serves pieces the shared link refuses.
+   */
+  piece?(fileId: string, start: number, end: number, signal: AbortSignal): Promise<Response | null>;
 }
 
 /**
@@ -505,7 +519,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
   //     counts from here, so it doesn't matter what ran before.
   if (opts.relay && relaying.length) {
     const until = Date.now() + RELAY_BUDGET_MS;
-    await Promise.all(relaying.slice(0, RELAY_AT_ONCE).map((r) => relayClip(cfg, r, until)));
+    await Promise.all(relaying.slice(0, RELAY_AT_ONCE).map((r) => relayClip(cfg, r, until, opts.drive)));
   }
 
   // 2. Start imports while there is room, together. A refusal that is about
@@ -719,13 +733,19 @@ async function openRelay(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWide
   return true;
 }
 
-/** Move a clip coming in a piece at a time on, and settle it once it is all in. */
-async function relayClip(cfg: MediaConfig, r: WorkRow, until: number): Promise<void> {
+/**
+ * Move a clip coming in a piece at a time on, and settle it once it is all in.
+ * Pieces come from the shared link, or, where Drive refuses those, through the
+ * org's Drive connection when it has one.
+ */
+async function relayClip(cfg: MediaConfig, r: WorkRow, until: number, drive?: DriveSource): Promise<void> {
   const uid = r.upload_uid!;
   const expiring = r.upload_expires !== null && Date.parse(r.upload_expires) - Date.now() < RELAY_EXPIRY_MARGIN_MS;
+  const readers: PieceReader[] = [sharedLinkReader(r.drive_file_id)];
+  if (drive?.piece) readers.push((start, end, signal) => drive.piece!(r.drive_file_id, start, end, signal));
   const result = expiring
     ? ({ state: "gone" } as const)
-    : await relayPieces({ url: r.upload_url!, fileId: r.drive_file_id, size: r.upload_size! }, until, async (received) => {
+    : await relayPieces({ url: r.upload_url!, size: r.upload_size! }, readers, until, async (received) => {
         await setRow(r.id, { upload_done: received });
       });
   if (result.state === "moving") return;
@@ -787,8 +807,8 @@ async function startImport(
   // Already coming in a piece at a time, back from a wait on Drive: it
   // carries on from where its upload got to, on the next delivery.
   if (r.upload_uid) return true;
-  // Through the org's connection first. A file it can't hand over (too big for
-  // the connector's temporary storage) comes by the original's shared link,
+  // Through the org's connection first. A file it can't hand over (over the
+  // 250 MB one answer through it carries) comes by the original's shared link,
   // with its waits. Not by a copy in the connected account: Drive answers a
   // header check on a fresh copy of a big file with an empty page while the
   // file itself downloads, and the video host, which checks first, refuses

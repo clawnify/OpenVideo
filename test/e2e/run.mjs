@@ -125,6 +125,11 @@ globalThis.fetch = async (input, init = {}) => {
       ? new Response("xx", { status: 206, headers: { "content-type": "video/mp4", "content-range": "bytes 0-1/123456789" } })
       : new Response("x".repeat(64), { status: 200, headers: { "content-type": "video/mp4", "content-length": "123456789" } });
   }
+  // The broker's link to one piece it fetched (see proxyRequest below).
+  if (u.hostname === "temp.r2.test" && u.pathname.startsWith("/piece/")) {
+    const [a, b] = u.pathname.split("/").pop().split("-").map(Number);
+    return new Response(zeros(b - a + 1), { status: 200, headers: { "content-type": "video/mp4" } });
+  }
   // The media service's resumable upload, with the video host's rules: a
   // named user agent ("error code: 1010" otherwise), a piece only at the
   // upload's own offset, at most 200 MiB, and every piece but the last at
@@ -838,27 +843,57 @@ const deleted = [...world.media.values()].filter((v) => v.deleted).length;
 console.log(`10 ok: project deleted in two calls, ${deleted} media copies deleted, a refused one on the second`);
 
 // 12. With the org's Google Drive connection, clips come in through it, not
-// the shared link: on deliveries only (a download through it is slow). A file
-// the connection can't hand over comes by the original's shared link from
-// then on, never by a copy in the connected account.
+// the shared link: on deliveries only (a download through it is slow). The
+// calls are Google's own Drive API through the broker (`proxyRequest`); no
+// Composio action is run. A file over what one answer through it carries
+// (250 MB) comes by the original's shared link from then on, never by a copy
+// in the connected account.
+const CONN_SIZES = { conn_small_________________: 1000, conn_big___________________: 9_000_000_000, conn_high__________________: 2000 };
 env.CREDENTIALS = {
   async listConnected() {
     return ["googledrive"];
   },
-  async executeTool(service, action, args) {
+  async executeTool(service, action) {
     (world.connActions ??= []).push(action);
-    if (action === "GOOGLEDRIVE_GOOGLE_DRIVE_DELETE_FOLDER_OR_FILE_ACTION") {
+    return { data: null, error: "footage runs no action", successful: false };
+  },
+  // The broker as it answers since the proxy passes the provider's status and
+  // a file's link through: Google Drive's base already ends in /drive/v3.
+  async proxyRequest(service, orgId, req) {
+    (world.proxied ??= []).push(`${req.method} ${req.endpoint}`);
+    const q = Object.fromEntries((req.parameters ?? []).map((p) => [p.name, p.value]));
+    const m = /^\/files\/([^/?]+)$/.exec(req.endpoint);
+    if (service !== "googledrive" || !m) return { data: null, error: `googledrive 404: no ${req.endpoint}`, successful: false, status: 404 };
+    const id = decodeURIComponent(m[1]);
+    if (req.method === "DELETE") {
       world.removeTries = (world.removeTries ?? 0) + 1;
       if (world.refuseRemoves > 0) {
         world.refuseRemoves--;
-        return { successful: false, error: "User rate limit exceeded" };
+        return { data: { error: { code: 403 } }, error: "googledrive 403: User rate limit exceeded", successful: false, status: 403 };
       }
-      (world.removed ??= []).push(args.fileId);
-      return { successful: true, data: {} };
+      (world.removed ??= []).push(id);
+      return { data: null, error: null, successful: true, status: 204 };
     }
-    world.connCalls = (world.connCalls ?? 0) + 1;
-    if (args.fileId === "conn_big___________________") return { successful: false, error: "Insufficient disk space to download file" };
-    return { successful: true, data: { downloaded_file_content: { s3url: `https://temp.r2.test/${args.fileId}`, name: "x.MP4", mimetype: "video/mp4" } } };
+    if (q.alt === "media" && q.Range) {
+      // One piece, as the broker answers a ranged read: a link to its bytes,
+      // with Drive's own status and range.
+      const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(q.Range);
+      (world.proxiedRanges ??= []).push(Number(a));
+      return {
+        data: null,
+        error: null,
+        successful: true,
+        status: 206,
+        headers: { "content-range": `bytes ${a}-${b}/${CONN_SIZES[id]}` },
+        file: { url: `https://temp.r2.test/piece/${id}/${a}-${b}`, contentType: "video/mp4", size: Number(b) - Number(a) + 1, expiresAt: null },
+      };
+    }
+    if (q.alt === "media") {
+      world.connCalls = (world.connCalls ?? 0) + 1;
+      const size = CONN_SIZES[id] ?? 1000;
+      return { data: null, error: null, successful: true, status: 200, file: { url: `https://temp.r2.test/${id}`, contentType: "video/mp4", size, expiresAt: null } };
+    }
+    return { data: { name: "x.MP4", mimeType: "video/mp4", size: String(CONN_SIZES[id] ?? 1000) }, error: null, successful: true, status: 200 };
   },
 };
 env.CLAWNIFY_ORG_ID = "org1";
@@ -881,13 +916,16 @@ const small = f2.items.find((i) => i.name === "A_0001.MP4");
 const big = f2.items.find((i) => i.name === "Interview.MP4");
 assert.equal(small.status, "importing", JSON.stringify(small));
 assert.ok(world.importUrls.includes("https://temp.r2.test/conn_small_________________"), "imported from the connection's link");
-// Too big for the connection's download: the original's shared link, the same
-// delivery, and no copy, permission or folder made in the connected account.
+// Over what one answer through the connection carries: the original's shared
+// link, the same delivery. It was never asked for whole through the broker
+// (only its size), and no copy, permission or folder was made anywhere.
 assert.equal(big.status, "importing", JSON.stringify(big));
 assert.ok(world.importUrls.includes("https://drive.usercontent.google.com/download?id=conn_big___________________&export=download&confirm=t"), "imported from the original's shared link");
 assert.equal(db.prepare("SELECT link_only, copy_id FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().link_only, 2);
-assert.ok(!world.connActions.some((a) => /COPY_FILE|CREATE_PERMISSION|CREATE_FOLDER/.test(a)), JSON.stringify(world.connActions));
-const callsBefore = world.connCalls;
+const bigCalls = () => world.proxied.filter((c) => c.includes("conn_big"));
+assert.deepEqual(bigCalls(), ["GET /files/conn_big___________________"], "only its size was asked for");
+assert.deepEqual(world.connActions ?? [], [], "footage runs no Composio action");
+const callsBefore = bigCalls().length;
 // A copy an earlier version made for this clip is deleted once the import is
 // over (Drive refuses the first try: it stays on the clip and goes on the
 // next), and the connection's download isn't tried again for the file it
@@ -896,12 +934,44 @@ const leftover = "copy_left__________________";
 db.prepare("UPDATE project_footage SET copy_id = ? WHERE drive_file_id = 'conn_big___________________'").run(leftover);
 world.refuseRemoves = 1;
 for (let i = 0; i < 6; i++) await deliver2();
-assert.equal(world.connCalls, callsBefore);
+assert.equal(bigCalls().length, callsBefore, "the connection isn't asked again for the file it couldn't carry");
 assert.equal(db.prepare("SELECT status FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().status, "ready");
 assert.deepEqual(world.removed, [leftover], "the leftover copy is deleted once the import is over");
 assert.equal(world.removeTries, 2, "a refused delete keeps the copy on the clip and is tried again");
 assert.equal(db.prepare("SELECT copy_id FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().copy_id, null);
-console.log("12 ok: imports through the Drive connection on deliveries; a file too big for it comes by its shared link, no copy made; a leftover copy is deleted, after a refused delete too");
+assert.deepEqual(world.connActions ?? [], [], "still no Composio action");
+console.log("12 ok: imports through the Drive API over the connection on deliveries; a file over 250 MB comes by its shared link, never fetched whole through the broker, no copy made; a leftover copy is deleted, after a refused delete too");
+
+// 12b. A big file coming in by pieces, whose shared link Drive starts refusing
+// part-way (past about 4 GB read, live): the pieces it refuses come through
+// the connection, which still serves them, and the clip never waits.
+{
+  const P = 200 * 2 ** 20;
+  const size = 2 * P + 3 * 2 ** 20;
+  world.big[fid("big7")] = { size, refuseFrom: P };
+  CONN_SIZES[fid("big7")] = size;
+  world.drive[fid("day7")] = page("Day 7", [fileEntry(fid("big7"), "INTERVIEW_E.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day7")}` });
+  const p7 = r.data.id;
+  const deliver7 = async () => {
+    const body = JSON.stringify({ project_id: p7 });
+    const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+    assert.equal(res.status, 200, await res.text());
+  };
+  const row7 = () => db.prepare("SELECT status, upload_uid, asset_id, error FROM project_footage WHERE project_id = ?").get(p7);
+  await deliver7(); // over 250 MB for the connection: shared link, quota page, an upload opens
+  const u7 = row7().upload_uid;
+  assert.ok(u7, JSON.stringify(row7()));
+  world.proxiedRanges = [];
+  await deliver7(); // the pieces
+  assert.deepEqual(world.uploads.get(u7).patches, [0, P, 2 * P], "every piece in, in order");
+  assert.deepEqual(world.proxiedRanges, [P, 2 * P], "the refused pieces came through the connection");
+  assert.equal(row7().status, "importing");
+  assert.ok(row7().asset_id, "and the clip is in, without waiting on Drive");
+  r = await call("DELETE", `/api/projects/${p7}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  console.log("12b ok: pieces the shared link refuses part-way come through the Drive connection; the clip never waits");
+}
 
 // 13. A source over the video host's bitrate cap goes back in line marked for
 // re-encoding; the re-encode becomes a media id, and the clip is ready.
