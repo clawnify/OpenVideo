@@ -869,9 +869,10 @@ const STEP_GRACE_MS = 3 * 60_000;
 /**
  * Book the project's next step on the platform queue, a minute from now. The
  * queue calls POST /api/footage/step. A delivery always books its successor;
- * a read books one only when none is booked, or the booked one is overdue,
- * meaning the chain broke. Without a queue (local dev) nothing is booked and
- * reads alone move the footage on.
+ * a read books one only when none is booked, the booked one is overdue
+ * (meaning the chain broke), or it is booked later than this one would be
+ * (for clips waiting on Drive, say, when a person asks to try now). Without a
+ * queue (local dev) nothing is booked and reads alone move the footage on.
  */
 export async function bookStep(
   env: QueueEnv,
@@ -879,12 +880,13 @@ export async function bookStep(
   projectId: string,
   opts: { after: "delivery" | "read"; bookedAt: string | null; at?: string | null },
 ): Promise<string | null> {
-  if (opts.after === "read" && opts.bookedAt && Date.parse(opts.bookedAt) > Date.now() - STEP_GRACE_MS) {
-    return opts.bookedAt;
-  }
   // A minute from now, or later when nothing can move before then.
   const earliest = Math.max(Date.now() + 60_000, opts.at ? Date.parse(opts.at) : 0);
   const runAt = new Date(Math.ceil(earliest / 60_000) * 60_000);
+  if (opts.after === "read" && opts.bookedAt) {
+    const booked = Date.parse(opts.bookedAt);
+    if (booked > Date.now() - STEP_GRACE_MS && booked <= runAt.getTime()) return opts.bookedAt;
+  }
   try {
     await enqueueJob(env, {
       targetUrl: `${origin}/api/footage/step`,
