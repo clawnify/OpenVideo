@@ -719,6 +719,12 @@ assert.equal(r.data.comments.length, 2);
 assert.equal(r.data.shared_export_id, e1);
 const logo = r.data.comments.find((c) => c.body === "Logo is too small");
 assert.equal(logo.at, 12.5);
+// "Changed since" is judged from when the export read the cut (its request),
+// not when the render finished: an edit made while it rendered still counts.
+db.prepare("UPDATE export_jobs SET created_at = '2026-01-01 10:00:00', updated_at = '2026-01-01 10:20:00' WHERE id = ?").run(e1);
+assert.equal((await call("GET", `/api/projects/${pc}/comments`)).data.comments[0].cut_at, "2026-01-01 10:00:00");
+const oversized = await app.request(`https://open-video.apps.clawnify.com/s/${tok}/comments`, { method: "POST", headers: { "content-type": "application/json", "content-length": "9000" }, body: "x".repeat(9000) }, env, ctx);
+assert.equal(oversized.status, 413, "an oversized body is refused before it is read");
 assert.equal((await call("PATCH", `/api/projects/${pc}/comments/${logo.id}`, { resolved: true })).status, 200);
 assert.equal((await call("PATCH", `/api/projects/other/comments/${logo.id}`, { resolved: true })).status, 404, "another project's id");
 r = await viewer({ v: e1, at: 1, body: "One more", author: "Ada" });

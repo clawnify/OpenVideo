@@ -5039,8 +5039,8 @@ interface ReviewComment {
   author: string;
   resolved_at: string | null;
   created_at: string;
-  /** When that export finished. */
-  exported_at: string | null;
+  /** When that export read the cut (its request; the render came later). */
+  cut_at: string | null;
 }
 
 interface CommentsList {
@@ -5134,7 +5134,7 @@ function CommentsPanel({ comments, onShow }: { comments: CommentsState; onShow: 
   // A comment's time is in the export it was made on. Once the cut has
   // changed since, the same moment may sit elsewhere on the timeline.
   const shared = all.find((c) => c.export_id === data.shared_export_id);
-  const editedSince = !!shared?.exported_at && data.project_updated_at > shared.exported_at;
+  const editedSince = !!shared?.cut_at && data.project_updated_at > shared.cut_at;
 
   if (all.length === 0) {
     return (

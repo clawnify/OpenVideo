@@ -1782,14 +1782,15 @@ interface ReviewComment {
 }
 
 // Every comment on the project, newest first, with when each one's export
-// finished: a comment's time is in that export, and the cut may have changed
-// since. `shared_export_id` is the export the link plays now, if there is a link.
+// read the cut (`cut_at`, the export's request: the EDL is read then, and a
+// render can take minutes): a comment's time is in that export, and the cut
+// may have changed since. `shared_export_id` is the export the link plays now.
 app.get("/api/projects/:id/comments", async (c) => {
   const id = c.req.param("id");
   const project = await get<{ updated_at: string }>("SELECT updated_at FROM edit_projects WHERE id = ?", [id]);
   if (!project) return c.json({ error: "Project not found" }, 404);
-  const comments = await query<ReviewComment & { exported_at: string | null }>(
-    `SELECT r.*, e.updated_at AS exported_at FROM review_comments r
+  const comments = await query<ReviewComment & { cut_at: string | null }>(
+    `SELECT r.*, e.created_at AS cut_at FROM review_comments r
        LEFT JOIN export_jobs e ON e.id = r.export_id
       WHERE r.project_id = ? ORDER BY r.created_at DESC, r.id LIMIT ?`,
     [id, MAX_PROJECT_COMMENTS],
@@ -1871,6 +1872,9 @@ app.post("/s/:token/comments", async (c) => {
   const shared = await sharedExport(c.req.param("token"));
   if (!shared) return c.json({ error: "not_found", detail: "This link doesn't work any more." }, 404);
   if (!shared.comments) return c.json({ error: "comments_off", detail: "Comments are turned off for this video." }, 403);
+  if (Number(c.req.header("Content-Length") ?? 0) > 8192) {
+    return c.json({ error: "too_large", detail: "That comment is too long." }, 413);
+  }
   const text = await c.req.text();
   if (text.length > 8192) return c.json({ error: "too_large", detail: "That comment is too long." }, 413);
   let raw: unknown;

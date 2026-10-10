@@ -220,7 +220,7 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | PUT  | `/api/projects/{id}/share` | Turn the link on, or move it to the newest export → `{ url }`; the address stays the same |
 | PATCH | `/api/projects/{id}/share` | `{ comments: true\|false }` lets the link's viewers comment, or stops new comments |
 | DELETE | `/api/projects/{id}/share` | Turn the link off; the address stops working for everyone |
-| GET  | `/api/projects/{id}/comments` | Viewers' comments → `{ comments: [{ id, export_id, at, body, author, resolved_at, exported_at }], shared_export_id }` |
+| GET  | `/api/projects/{id}/comments` | Viewers' comments → `{ comments: [{ id, export_id, at, body, author, resolved_at, cut_at }], shared_export_id }` |
 | PATCH | `/api/projects/{id}/comments/{cid}` | `{ resolved: true\|false }` |
 | DELETE | `/api/projects/{id}/comments/{cid}` | Delete a comment, for viewers too |
 
