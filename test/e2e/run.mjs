@@ -437,8 +437,11 @@ await statuses();
 assert.equal(probes(), probesBefore, "a read before it is due leaves Drive alone");
 // "Try Google Drive again now" asks at once: the whole file, then one byte to
 // see whether it would come in pieces (this file's pieces are refused too).
+// It also books a step a minute out, in place of the one booked for when the
+// clip was due: with a Drive connection only a delivery starts an import.
 r = await call("POST", `/api/projects/${pid}/footage/retry`);
 assert.equal(r.data.imports, 1);
+assert.ok(Date.parse(world.lastEnqueue.run_at ?? world.lastEnqueue.runAt) < Date.now() + 3 * 60_000, "a step is booked for now, not for when the clip was due");
 f = await statuses();
 assert.equal(probes(), probesBefore + 2);
 assert.ok(![...world.uploads.values()].some((x) => x.name === "B_0009.MP4"), "Drive refusing pieces too: no upload is opened");
