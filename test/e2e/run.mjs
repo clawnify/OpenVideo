@@ -992,6 +992,43 @@ console.log("12 ok: imports through the Drive API over the connection on deliver
   console.log("12b ok: pieces the shared link refuses part-way come through the Drive connection; the clip never waits");
 }
 
+// 12c. A file whose shared link Drive refuses entirely, even its first byte:
+// its size and every piece come through the connection, and it never waits.
+// 12d. The same for a file over the video host's 30 GB limit: the
+// connection's size says so, and it fails at once with the reason.
+{
+  const P = 200 * 2 ** 20;
+  const size = 2 * P + 3 * 2 ** 20;
+  world.big[fid("big9")] = { size, refuseFrom: 0 };
+  CONN_SIZES[fid("big9")] = size;
+  world.big[fid("huge9")] = { size: 33_000_000_000, refuseFrom: 0 };
+  CONN_SIZES[fid("huge9")] = 33_000_000_000;
+  world.drive[fid("day9")] = page("Day 9", [fileEntry(fid("big9"), "INTERVIEW_F.MP4"), fileEntry(fid("huge9"), "STAGE_B.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day9")}` });
+  const p9 = r.data.id;
+  const deliver9 = async () => {
+    const body = JSON.stringify({ project_id: p9 });
+    const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+    assert.equal(res.status, 200, await res.text());
+  };
+  const row9 = (name) => db.prepare("SELECT status, error, upload_uid, upload_size, asset_id FROM project_footage WHERE project_id = ? AND name = ?").get(p9, name);
+  await deliver9();
+  const u9 = row9("INTERVIEW_F.MP4").upload_uid;
+  assert.ok(u9, JSON.stringify(row9("INTERVIEW_F.MP4")));
+  assert.equal(row9("INTERVIEW_F.MP4").upload_size, size, "the size came through the connection");
+  assert.deepEqual([row9("STAGE_B.MP4").status, row9("STAGE_B.MP4").error], ["failed", "33.0 GB is over the video host's 30 GB limit"]);
+  assert.ok(![...world.uploads.values()].some((x) => x.name === "STAGE_B.MP4"), "no upload for the file over the limit");
+  world.proxiedRanges = [];
+  await deliver9();
+  assert.deepEqual(world.uploads.get(u9).patches, [0, P, 2 * P], "every piece in, in order");
+  assert.deepEqual(world.proxiedRanges, [0, P, 2 * P], "every piece through the connection");
+  assert.ok(row9("INTERVIEW_F.MP4").asset_id, "and the clip is in");
+  r = await call("DELETE", `/api/projects/${p9}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  console.log("12c ok: a file whose shared link Drive refuses entirely comes in through the connection, size and pieces");
+  console.log("12d ok: one over the 30 GB limit fails at once, on the connection's size");
+}
+
 // 13. A source over the video host's bitrate cap goes back in line marked for
 // re-encoding; the re-encode becomes a media id, and the clip is ready.
 world.drive[fid("day3")] = page("Day 3", [fileEntry("conn_high__________________", "HIGH.MP4")]);

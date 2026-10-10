@@ -356,6 +356,8 @@ export interface DriveSource {
    * status and headers. It serves pieces the shared link refuses.
    */
   piece?(fileId: string, start: number, end: number, signal: AbortSignal): Promise<Response | null>;
+  /** A file's size through the connection, when the shared link won't serve even a byte. */
+  size?(fileId: string): Promise<number | null>;
 }
 
 /**
@@ -716,12 +718,18 @@ async function dropUpload(cfg: MediaConfig, r: WorkRow): Promise<boolean> {
 /**
  * Drive won't hand the file over whole: open an upload for it to come in a
  * piece at a time instead. A file over the video host's limit fails with that
- * reason instead: waiting on Drive can't get it in. Null when pieces can't
- * help, so the clip waits on Drive: it won't serve even a piece, or the clip
- * is marked for a re-encode, which reads the whole file.
+ * reason instead: waiting on Drive can't get it in. The size comes from the
+ * shared link, or, when Drive refuses even a byte of that, from the org's
+ * Drive connection, which then serves the pieces too. Null when nothing can
+ * help, so the clip waits on Drive: no size from either, or the clip is marked
+ * for a re-encode, which reads the whole file.
  */
-async function openRelay(cfg: MediaConfig, r: WorkRow): Promise<true | { orgWide: boolean; detail: string } | null> {
-  const size = await rangedSize(r.drive_file_id);
+async function openRelay(
+  cfg: MediaConfig,
+  r: WorkRow,
+  drive?: DriveSource,
+): Promise<true | { orgWide: boolean; detail: string } | null> {
+  const size = (await rangedSize(r.drive_file_id)) ?? (drive?.size ? await drive.size(r.drive_file_id) : null);
   if (!size) return null;
   if (size > MAX_RELAY_BYTES) return { orgWide: false, detail: overHostLimit(size) };
   if (r.transcode) return null;
@@ -834,7 +842,7 @@ async function startImport(
   if (!verdict.ok) {
     // Drive's limit refuses the whole file but still serves pieces of it.
     if (/<title>[^<]*quota exceeded/i.test(page)) {
-      return (await openRelay(cfg, r)) ?? { orgWide: false, detail: DRIVE_QUOTA, driveLimit: true };
+      return (await openRelay(cfg, r, drive)) ?? { orgWide: false, detail: DRIVE_QUOTA, driveLimit: true };
     }
     return { orgWide: false, detail: verdict.reason ?? "that file isn't a video" };
   }

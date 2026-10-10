@@ -26,6 +26,7 @@ import {
   driveActionLink,
   driveFileLink,
   driveFilePiece,
+  driveFileSize,
   driveRemove,
   driveFolderName,
   driveStatus,
@@ -952,6 +953,7 @@ async function driveSource(env: Bindings): Promise<DriveSource | undefined> {
   const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
   return {
     piece: (fileId, start, end, signal) => driveFilePiece(env, service, fileId, start, end, signal),
+    size: (fileId) => driveFileSize(env, service, fileId),
     async download(fileId) {
       try {
         const file = await driveFileLink(env, fileId);
