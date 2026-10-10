@@ -20,6 +20,7 @@
   "api": {
     "public_routes": [
       { "path": "/s/**", "methods": ["GET", "HEAD"] },
+      { "path": "/s/*/comments", "methods": ["POST"] },
       { "path": "/api/footage/step", "methods": ["POST"] }
     ],
     "server_routes": ["/s/*"]

@@ -699,4 +699,67 @@ for (let i = 0; i < 5 && row3().status !== "ready"; i++) await deliver3();
 assert.equal(row3().status, "ready", JSON.stringify(row3()));
 assert.equal(row3().transcode_job, null);
 console.log("13 ok: a clip over the bitrate cap is re-encoded on the way in and imports");
+// 14. Review comments on a share link: off until turned on, pinned to the
+// export the link plays, resolved in the editor, and refused past a rate.
+r = await call("POST", "/api/projects", { name: "Sizzle" });
+const pc = r.data.id;
+const exp = (secs) => Number(db.prepare("INSERT INTO export_jobs (project_id, status, output_url, duration) VALUES (?, 'completed', '/api/uploads/renders/x.mp4', ?)").run(pc, secs).lastInsertRowid);
+const e1 = exp(30);
+r = await call("PUT", `/api/projects/${pc}/share`);
+assert.equal(r.data.comments, false, "a new link takes no comments");
+const tok = new URL(r.data.url).pathname.split("/")[2];
+const viewer = (body) => call("POST", `/s/${tok}/comments`, body);
+const page1 = await call("GET", `/s/${tok}`);
+assert.ok(!page1.data.includes("comment-form"), "no form while comments are off");
+r = await viewer({ v: e1, at: 3, body: "hi", author: "Ada" });
+assert.equal(r.status, 403);
+r = await call("PATCH", `/api/projects/${pc}/share`, { comments: true });
+assert.equal(r.data.comments, true);
+assert.ok((await call("GET", `/s/${tok}`)).data.includes("comment-form"));
+r = await viewer({ v: e1, at: 12.5, body: "Logo is too small", author: "Ada" });
+assert.equal(r.status, 201, JSON.stringify(r.data));
+r = await viewer({ v: e1, at: null, body: "Love the pace", author: "Bo" });
+assert.equal(r.data.comments.length, 2, "the answer lists the link's comments");
+assert.equal((await viewer({ v: e1, at: 99, body: "x", author: "Bo" })).status, 400, "past the end");
+assert.equal((await viewer({ v: e1, at: 1, body: "x", author: "" })).status, 400, "no name");
+assert.equal((await call("POST", "/s/nope/comments", { v: e1, body: "x", author: "A" })).status, 404);
+// The editor sees them, resolves one; viewers see it resolved.
+r = await call("GET", `/api/projects/${pc}/comments`);
+assert.equal(r.data.comments.length, 2);
+assert.equal(r.data.shared_export_id, e1);
+const logo = r.data.comments.find((c) => c.body === "Logo is too small");
+assert.equal(logo.at, 12.5);
+// "Changed since" is judged from when the export read the cut (its request),
+// not when the render finished: an edit made while it rendered still counts.
+db.prepare("UPDATE export_jobs SET created_at = '2026-01-01 10:00:00', updated_at = '2026-01-01 10:20:00' WHERE id = ?").run(e1);
+assert.equal((await call("GET", `/api/projects/${pc}/comments`)).data.comments[0].cut_at, "2026-01-01 10:00:00");
+const oversized = await app.request(`https://open-video.apps.clawnify.com/s/${tok}/comments`, { method: "POST", headers: { "content-type": "application/json", "content-length": "9000" }, body: "x".repeat(9000) }, env, ctx);
+assert.equal(oversized.status, 413, "an oversized body is refused before it is read");
+assert.equal((await call("PATCH", `/api/projects/${pc}/comments/${logo.id}`, { resolved: true })).status, 200);
+assert.equal((await call("PATCH", `/api/projects/other/comments/${logo.id}`, { resolved: true })).status, 404, "another project's id");
+r = await viewer({ v: e1, at: 1, body: "One more", author: "Ada" });
+assert.equal(r.data.comments.find((c) => c.id === logo.id).resolved, true);
+// The link moves to a newer export: a page still playing the old one is told to reload,
+// the new export starts with no comments, and the editor keeps the old ones.
+const e2 = exp(40);
+await call("PUT", `/api/projects/${pc}/share`);
+r = await viewer({ v: e1, at: 1, body: "late", author: "Ada" });
+assert.equal(r.status, 409);
+assert.ok(!(await call("GET", `/s/${tok}`)).data.includes("Logo is too small"), "old export's comments stay off the new page");
+r = await viewer({ v: e2, at: 35, body: "Better", author: "Ada" });
+assert.equal(r.data.comments.length, 1);
+assert.equal((await call("GET", `/api/projects/${pc}/comments`)).data.comments.length, 4);
+// Too many at once is refused; turning comments off keeps the ones left.
+let last;
+for (let i = 0; i < 20; i++) last = await viewer({ v: e2, at: 1, body: `spam ${i}`, author: "Bot" });
+assert.equal(last.status, 429, JSON.stringify(last.data));
+await call("PATCH", `/api/projects/${pc}/share`, { comments: false });
+assert.equal((await viewer({ v: e2, body: "x", author: "A" })).status, 403);
+r = await call("GET", `/api/projects/${pc}/comments`);
+assert.ok(r.data.comments.length >= 4);
+assert.equal((await call("DELETE", `/api/projects/${pc}/comments/${r.data.comments[0].id}`)).status, 200);
+assert.equal((await call("GET", `/api/projects/${pc}/comments`)).data.comments.length, r.data.comments.length - 1);
+await call("DELETE", `/api/projects/${pc}`);
+assert.equal(db.prepare("SELECT COUNT(*) AS n FROM review_comments WHERE project_id = ?").get(pc).n, 0, "deleting the project deletes its comments");
+console.log("14 ok: review comments off by default, on per link, pinned to an export, resolved, rate-limited, deleted with the project");
 console.log("ALL OK");

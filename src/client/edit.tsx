@@ -78,6 +78,7 @@ import {
   Image as ImageIcon,
   Link2,
   Loader2,
+  MessageSquare,
   Music,
   Pause,
   Play,
@@ -285,7 +286,7 @@ export interface Edl {
   captions?: ProjectCaptions;
 }
 
-type RailTab = "media" | "audio" | "text" | "captions";
+type RailTab = "media" | "audio" | "text" | "captions" | "comments";
 
 export interface EditProject {
   id: string;
@@ -1252,6 +1253,19 @@ export function EditEditor({
     setPlayhead(clamped);
   }, [total]);
 
+  const comments = useComments(initial.id, tab === "comments");
+  const commentMarks = useMemo(
+    () => (comments.data?.comments ?? []).filter((c) => c.at !== null && !c.resolved_at),
+    [comments.data],
+  );
+  const showComment = useCallback(
+    (c: ReviewComment) => {
+      setPlaying(false);
+      if (c.at !== null) seek(c.at);
+    },
+    [seek],
+  );
+
   // Master clock — drives the playhead state (media elements sync in Player).
   useEffect(() => {
     if (!playing) {
@@ -1545,6 +1559,8 @@ export function EditEditor({
           edl={edl}
           update={update}
           transcripts={transcripts}
+          comments={comments}
+          onShowComment={showComment}
         />
         <Player
           pane={pane}
@@ -1596,6 +1612,11 @@ export function EditEditor({
         splitAtPlayhead={splitAtPlayhead}
         splitAt={splitAt}
         deleteSelected={deleteSelected}
+        commentMarks={commentMarks}
+        onShowComment={(c) => {
+          showComment(c);
+          setTab("comments");
+        }}
       />
     </div>
   );
@@ -1710,6 +1731,8 @@ function LeftPanel({
   edl,
   update,
   transcripts,
+  comments,
+  onShowComment,
 }: {
   projectId: string;
   initialFootage: FootageList;
@@ -1724,6 +1747,8 @@ function LeftPanel({
   setAssets: React.Dispatch<React.SetStateAction<Asset[]>>;
   onAdd: (a: Asset) => void;
   onAddText: () => void;
+  comments: CommentsState;
+  onShowComment: (c: ReviewComment) => void;
 }) {
   const uploads = useUploads();
   useEffect(() => onUploaded((a) => setAssets((prev) => (prev.some((x) => x.id === a.id) ? prev : [a, ...prev]))), [setAssets]);
@@ -1773,23 +1798,33 @@ function LeftPanel({
             ["audio", Music, "Audio"],
             ["text", TypeIcon, "Text"],
             ["captions", CaptionsIcon, "Captions"],
+            ["comments", MessageSquare, "Review"],
           ] as const
         ).map(([key, Icon, label]) => (
           <button
             key={key}
             onClick={() => setTab(key)}
             aria-pressed={tab === key}
-            className={`w-11 py-2 rounded-sm flex flex-col items-center gap-1 text-fine ${
+            className={`relative w-11 py-2 rounded-sm flex flex-col items-center gap-1 text-fine ${
               tab === key ? "bg-surface text-foreground shadow-raised" : "text-muted hover:text-foreground"
             }`}
           >
             <Icon className="w-4 h-4" />
             {label}
+            {key === "comments" && comments.open > 0 && (
+              <span className="absolute top-1 right-1 min-w-4 h-4 px-1 rounded-full bg-primary text-on-primary text-[10px] leading-4 tabular-nums">
+                <span className="sr-only">, </span>
+                {comments.open}
+                <span className="sr-only"> open</span>
+              </span>
+            )}
           </button>
         ))}
       </div>
       <div className="flex-1 min-w-0 overflow-y-auto p-3">
-        {tab === "captions" ? (
+        {tab === "comments" ? (
+          <CommentsPanel comments={comments} onShow={onShowComment} />
+        ) : tab === "captions" ? (
           <CaptionsPanel
             edl={edl}
             update={update}
@@ -4992,6 +5027,214 @@ function PositionRow({
   );
 }
 
+// ── review comments ─────────────────────────────────────────────────────────
+
+/** A comment a viewer left on the share link (server: review_comments). */
+interface ReviewComment {
+  id: string;
+  export_id: number;
+  /** Seconds into the export it was made on; null: about the whole video. */
+  at: number | null;
+  body: string;
+  author: string;
+  resolved_at: string | null;
+  created_at: string;
+  /** When that export read the cut (its request; the render came later). */
+  cut_at: string | null;
+}
+
+interface CommentsList {
+  comments: ReviewComment[];
+  shared_export_id: number | null;
+  project_updated_at: string;
+}
+
+type CommentsState = ReturnType<typeof useComments>;
+
+/** "1:05" or "1:02:05": a comment's moment, as viewers saw it. */
+function fmtClock(t: number): string {
+  const s = Math.floor(t);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${r}` : `${m}:${r}`;
+}
+
+/**
+ * The project's comments: read on open (for the ruler's marks), again each
+ * time the panel is shown, and every minute while it stays shown, so a
+ * reviewer's notes turn up without a reload.
+ */
+function useComments(projectId: string, showing: boolean) {
+  const [data, setData] = useState<CommentsList | null>(null);
+  const [error, setError] = useState("");
+  const load = useCallback(() => {
+    api
+      .get<CommentsList>(`/api/projects/${projectId}/comments`)
+      .then((d) => {
+        setData(d);
+        setError("");
+      })
+      .catch((e) => setError((e as Error).message));
+  }, [projectId]);
+  useEffect(() => {
+    setData(null);
+    load();
+  }, [load]);
+  useEffect(() => {
+    if (!showing) return;
+    load();
+    const t = setInterval(load, 60_000);
+    return () => clearInterval(t);
+  }, [showing, load]);
+
+  const patch = (id: string, fn: (c: ReviewComment) => ReviewComment | null) =>
+    setData((d) =>
+      d && { ...d, comments: d.comments.flatMap((c) => (c.id === id ? (fn(c) ?? []) : [c])) },
+    );
+  const resolve = async (c: ReviewComment, resolved: boolean) => {
+    const before = c.resolved_at;
+    patch(c.id, (x) => ({ ...x, resolved_at: resolved ? new Date().toISOString() : null }));
+    try {
+      await api.send("PATCH", `/api/projects/${projectId}/comments/${c.id}`, { resolved });
+    } catch (e) {
+      patch(c.id, (x) => ({ ...x, resolved_at: before }));
+      setError((e as Error).message);
+    }
+  };
+  const remove = async (c: ReviewComment) => {
+    try {
+      await api.send("DELETE", `/api/projects/${projectId}/comments/${c.id}`);
+      patch(c.id, () => null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+  const open = data?.comments.filter((c) => !c.resolved_at).length ?? 0;
+  return { data, error, open, load, resolve, remove };
+}
+
+function CommentsPanel({ comments, onShow }: { comments: CommentsState; onShow: (c: ReviewComment) => void }) {
+  const [view, setView] = useState<"open" | "resolved">("open");
+  const [deleting, setDeleting] = useState<ReviewComment | null>(null);
+  const { data } = comments;
+  if (!data) {
+    return comments.error ? (
+      <div className="text-fine text-danger">{comments.error}</div>
+    ) : (
+      <Loader2 className="w-4 h-4 animate-spin text-muted" />
+    );
+  }
+  const all = data.comments;
+  const resolved = all.filter((c) => c.resolved_at);
+  const shown = (view === "open" ? all.filter((c) => !c.resolved_at) : resolved)
+    .slice()
+    // By moment in the video, the whole-video ones last; newest export first.
+    .sort((a, b) => b.export_id - a.export_id || (a.at ?? Infinity) - (b.at ?? Infinity) || a.created_at.localeCompare(b.created_at));
+  // A comment's time is in the export it was made on. Once the cut has
+  // changed since, the same moment may sit elsewhere on the timeline.
+  const shared = all.find((c) => c.export_id === data.shared_export_id);
+  const editedSince = !!shared?.cut_at && data.project_updated_at > shared.cut_at;
+
+  if (all.length === 0) {
+    return (
+      <div className="space-y-2">
+        <p className="text-body-sm">No comments yet.</p>
+        <p className="text-fine text-faint">
+          Share the video and turn on “Viewers can comment”. People you send the link to can then leave notes at a
+          moment in the video, and they show up here and on the timeline.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-0.5 p-0.5 rounded-sm bg-surface shadow-edge">
+          {(
+            [
+              ["open", `Open ${all.length - resolved.length}`],
+              ["resolved", `Resolved ${resolved.length}`],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setView(key)}
+              aria-pressed={view === key}
+              className={`h-7 rounded-xs text-fine ${view === key ? "bg-surface-sunken text-foreground" : "text-muted hover:text-foreground"}`}
+            >
+              {label}
+            </button>
+          ))}
+      </div>
+      {editedSince && (
+        <p className="text-fine text-faint">
+          You have changed the cut since the shared export, so a comment's moment may have moved on the timeline.
+        </p>
+      )}
+      {comments.error && <div className="text-fine text-danger">{comments.error}</div>}
+      {shown.length === 0 && <p className="text-fine text-muted">{view === "open" ? "All resolved." : "None resolved yet."}</p>}
+      <ul className="space-y-2">
+        {shown.map((c) => (
+          <li key={c.id} className={`${card} p-2 space-y-1`}>
+            <div className="flex items-center gap-1">
+              <span className="text-fine font-medium truncate flex-1" title={c.author}>
+                {c.author}
+              </span>
+              <button
+                onClick={() => comments.resolve(c, !c.resolved_at)}
+                className={btnIcon}
+                title={c.resolved_at ? "Reopen" : "Resolve"}
+                aria-label={c.resolved_at ? `Reopen comment from ${c.author}` : `Resolve comment from ${c.author}`}
+              >
+                {c.resolved_at ? <Undo2 className="w-4 h-4" /> : <Check className="w-4 h-4" />}
+              </button>
+              <button
+                onClick={() => setDeleting(c)}
+                className={btnIcon}
+                title="Delete"
+                aria-label={`Delete comment from ${c.author}`}
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-body-sm whitespace-pre-wrap break-words">{c.body}</p>
+            <div className="flex items-center gap-1.5 text-fine text-faint">
+              {c.at !== null ? (
+                <button
+                  onClick={() => onShow(c)}
+                  className="h-5 px-1.5 rounded-xs bg-surface-sunken text-foreground tabular-nums hover:bg-border"
+                  title="Go to this moment"
+                  aria-label={`Go to ${fmtClock(c.at)}`}
+                >
+                  {fmtClock(c.at)}
+                </button>
+              ) : (
+                <span>General ·</span>
+              )}
+              <span className="truncate">
+                {fmtWhen(c.created_at)}
+                {c.export_id !== data.shared_export_id ? " · earlier export" : ""}
+              </span>
+            </div>
+          </li>
+        ))}
+      </ul>
+      {deleting && (
+        <ConfirmDialog
+          title={`Delete the comment from ${deleting.author}?`}
+          body="It is removed for everyone, viewers of the link included. To mark it as dealt with, resolve it instead."
+          onConfirm={() => {
+            const c = deleting;
+            setDeleting(null);
+            void comments.remove(c);
+          }}
+          onClose={() => setDeleting(null)}
+        />
+      )}
+    </div>
+  );
+}
+
 // ── share by link ───────────────────────────────────────────────────────────
 
 interface ShareState {
@@ -5001,6 +5244,8 @@ interface ShareState {
   /** On only: when the export viewers see finished, and a newer one if any. */
   exported_at?: string;
   newer_export?: number | null;
+  /** On only: whether viewers can comment. */
+  comments?: boolean;
 }
 
 /** "Oct 1, 14:02" from SQLite's space-separated UTC datetime. */
@@ -5034,11 +5279,11 @@ function ShareControl({ projectId }: { projectId: string }) {
     api.get<ShareState>(`/api/projects/${projectId}/share`).then(setShare).catch(() => {});
   }, [open, projectId]);
 
-  const change = async (method: "PUT" | "DELETE") => {
+  const change = async (method: "PUT" | "DELETE" | "PATCH", body?: { comments: boolean }) => {
     setBusy(true);
     setError("");
     try {
-      setShare(await api.send<ShareState>(method, `/api/projects/${projectId}/share`));
+      setShare(await api.send<ShareState>(method, `/api/projects/${projectId}/share`, body));
       setCopied(false);
       setConfirmOff(false);
     } catch (e) {
@@ -5098,6 +5343,22 @@ function ShareControl({ projectId }: { projectId: string }) {
                   {busy && <Loader2 className="w-4 h-4 animate-spin" />} Show the newest export
                 </button>
               ) : null}
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-col">
+                  <span className="text-body-sm">Viewers can comment</span>
+                  <span className="text-fine text-muted">With their name, at a moment in the video. You see them under Review.</span>
+                </div>
+                <button
+                  role="switch"
+                  aria-checked={!!share.comments}
+                  aria-label="Viewers can comment"
+                  disabled={busy}
+                  onClick={() => change("PATCH", { comments: !share.comments })}
+                  className={`relative shrink-0 w-9 h-5 rounded-full transition-colors ${share.comments ? "bg-primary" : "bg-border"}`}
+                >
+                  <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-surface shadow-raised transition-all ${share.comments ? "left-4.5" : "left-0.5"}`} />
+                </button>
+              </div>
               {/* Turning off is final for everyone holding the link (a new one
                   gets a new address), so it asks once, in place. */}
               {confirmOff ? (
@@ -5298,6 +5559,8 @@ function TimelinePanel({
   splitAtPlayhead,
   splitAt,
   deleteSelected,
+  commentMarks,
+  onShowComment,
 }: {
   pane: Pane;
   edl: Edl;
@@ -5317,6 +5580,9 @@ function TimelinePanel({
   /** Split the main-track clip under a timeline time (right-click "Split here"). */
   splitAt: (t: number) => void;
   deleteSelected: () => void;
+  /** Open comments with a time, marked on the ruler. */
+  commentMarks: ReviewComment[];
+  onShowComment: (c: ReviewComment) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(40); // px per second
@@ -5496,6 +5762,19 @@ function TimelinePanel({
                 <div key={t} className="absolute top-0 h-full border-l border-border text-fine text-faint pl-1 pt-0.5 tabular-nums" style={{ left: t * zoom }}>
                   {t % 1 === 0 ? fmtTime(t) : ""}
                 </div>
+              ))}
+              {commentMarks.map((c) => (
+                <button
+                  key={c.id}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={() => onShowComment(c)}
+                  title={`${c.author}: ${c.body}`}
+                  aria-label={`Comment from ${c.author} at ${fmtClock(c.at ?? 0)}`}
+                  className="group absolute top-0 bottom-0 -ml-2 w-4 flex items-end justify-center pb-px"
+                  style={{ left: (c.at ?? 0) * zoom }}
+                >
+                  <span className="w-2 h-2 rounded-full bg-ring ring-2 ring-surface group-hover:scale-125 transition-transform" />
+                </button>
               ))}
             </div>
           </div>
