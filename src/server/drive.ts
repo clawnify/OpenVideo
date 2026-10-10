@@ -252,6 +252,24 @@ export async function driveFileLink(
 }
 
 /**
+ * A Drive file's size through the connection, or null when the connection
+ * won't say. Drive can refuse even one byte of a file on its shared link while
+ * its API, asked as the connected account, still answers.
+ */
+export async function driveFileSize(env: ConnectionsEnv, service: DriveService, fileId: string): Promise<number | null> {
+  try {
+    const data = (await driveCall(env, service, "GET", `/files/${encodeURIComponent(fileId)}`, {
+      fields: "size",
+      supportsAllDrives: "true",
+    })) as { size?: string };
+    const size = Number(data.size);
+    return Number.isFinite(size) && size > 0 ? size : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * One piece of a Drive file through the connection, as a Response carrying
  * Drive's own status and headers and the bytes behind the broker's link. A
  * refusal comes back as its status, so the caller can tell it from a hiccup;

@@ -145,6 +145,19 @@ describe("downloading", () => {
   });
 });
 
+describe("a file's size through the connection", () => {
+  it("is Drive's own number, or null when the connection won't say", async () => {
+    const { driveFileSize } = await import("../src/server/drive");
+    let c = connection("googledrive", () => ok({ size: "32582232228" }));
+    expect(await driveFileSize(c.env, "googledrive", "big_id_00000")).toBe(32_582_232_228);
+    expect([c.sent[0].endpoint, param(c.sent[0], "fields")]).toEqual(["/files/big_id_00000", "size"]);
+    c = connection("googledrive", () => ({ data: null, error: "googledrive 404: gone", successful: false, status: 404 }));
+    expect(await driveFileSize(c.env, "googledrive", "gone_id_0000")).toBeNull();
+    c = connection("googledrive", () => ok({}));
+    expect(await driveFileSize(c.env, "googledrive", "doc_id_00000")).toBeNull();
+  });
+});
+
 describe("a piece through the connection", () => {
   const signal = new AbortController().signal;
 
