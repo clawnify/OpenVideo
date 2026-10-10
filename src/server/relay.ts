@@ -20,7 +20,11 @@ import { directDownloadUrl, judgeLinkResponse } from "./drive-link";
  */
 export const PIECE_BYTES = 200 * 1024 * 1024;
 
-/** The largest file the video host takes. A larger one waits on Drive, as before. */
+/**
+ * The largest file the video host takes ("30 GB"), whichever way it comes in.
+ * A larger one fails with that reason before anything is pulled: no wait can
+ * get it in.
+ */
 export const MAX_RELAY_BYTES = 30 * 1024 ** 3;
 
 /**
