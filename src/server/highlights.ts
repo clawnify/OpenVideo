@@ -84,6 +84,44 @@ export interface TasteExample {
 /** How many of each a prompt carries: enough to show a taste, bounded however long the review. */
 export const TASTE_EXAMPLES = 15;
 
+/** A reviewed pick as the database holds it. */
+export interface ReviewedPick {
+  pick: "keep" | "drop";
+  kind: HighlightKind;
+  text: string;
+  speaker: string;
+  score: number;
+  origin: string;
+}
+
+/** The words of a pick, without case or punctuation: what two takes of one line share. */
+function sameWords(text: string): string {
+  return text
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * The taste a reading learns from, `reviewed` latest first. A dropped pick
+ * that says what a kept one says is left out: it is another camera's take of
+ * a line the person kept, not a line they didn't want.
+ */
+export function tasteFrom(reviewed: ReviewedPick[]): Taste {
+  const example = (r: ReviewedPick): TasteExample => ({ kind: r.kind, text: r.text, speaker: r.speaker, score: r.score, own: r.origin === "person" });
+  const kept = reviewed.filter((r) => r.pick === "keep");
+  const keptWords = new Set(kept.map((r) => sameWords(r.text)).filter(Boolean));
+  return {
+    kept: kept.slice(0, TASTE_EXAMPLES).map(example),
+    dropped: reviewed
+      .filter((r) => r.pick === "drop" && !keptWords.has(sameWords(r.text)))
+      .slice(0, TASTE_EXAMPLES)
+      .map(example),
+  };
+}
+
 export interface ClipVerdict {
   id: string;
   /** Null when the clip is worth using; why not, otherwise. */
@@ -493,17 +531,7 @@ export async function stepHighlights(cfg: MediaConfig, key: string | undefined, 
   const taken = new Map<string, Reviewed[]>();
   let taste: Taste | undefined;
   if (rows.length) {
-    const reviewed = await query<{
-      footage_id: string;
-      src_in: number;
-      src_out: number;
-      text: string;
-      pick: "keep" | "drop";
-      kind: HighlightKind;
-      speaker: string;
-      score: number;
-      origin: string;
-    }>(
+    const reviewed = await query<ReviewedPick & { footage_id: string; src_in: number; src_out: number }>(
       `SELECT footage_id, src_in, src_out, text, pick, kind, speaker, score, origin FROM footage_highlights
         WHERE project_id = ? AND pick IS NOT NULL ORDER BY updated_at DESC, id`,
       [projectId],
@@ -511,11 +539,7 @@ export async function stepHighlights(cfg: MediaConfig, key: string | undefined, 
     for (const r of reviewed) {
       taken.set(r.footage_id, [...(taken.get(r.footage_id) ?? []), { start: r.src_in, end: r.src_out, text: r.text, pick: r.pick }]);
     }
-    const example = (r: (typeof reviewed)[number]): TasteExample => ({ kind: r.kind, text: r.text, speaker: r.speaker, score: r.score, own: r.origin === "person" });
-    taste = {
-      kept: reviewed.filter((r) => r.pick === "keep").slice(0, TASTE_EXAMPLES).map(example),
-      dropped: reviewed.filter((r) => r.pick === "drop").slice(0, TASTE_EXAMPLES).map(example),
-    };
+    taste = tasteFrom(reviewed);
   }
 
   // The rate and size a timeline for the editor's own software needs, for
