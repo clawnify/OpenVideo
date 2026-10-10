@@ -47,6 +47,25 @@ export interface ClipLog {
   visible_text: string[];
 }
 
+/**
+ * A clip shorter than this is an accidental recording (a tap of the record
+ * button). It is logged as too short without asking for an analysis, which
+ * has nothing to read in it and fails.
+ */
+export const MIN_LOG_SECONDS = 1;
+
+export function tooShortLog(duration: number): ClipLog {
+  return {
+    summary: `A ${duration.toFixed(1)} s clip, too short to use.`,
+    kind: "other",
+    quality: "unusable",
+    issues: "too short to use",
+    quotes: [],
+    moments: [],
+    visible_text: [],
+  };
+}
+
 const KINDS = ["interview", "stage", "b-roll", "other"] as const;
 const QUALITIES = ["good", "usable", "unusable"] as const;
 
@@ -568,8 +587,12 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
   //    org's render container, so only a few at a time.
   let copies = STEP_LIMITS.preparing - preparing.length;
   for (const r of ready) {
-    if (copies <= 0 || out.logsBlocked) break;
     if (r.log_status !== null) continue;
+    if (r.duration !== null && r.duration < MIN_LOG_SECONDS) {
+      await setRow(r.id, { log_status: "done", log: JSON.stringify(tooShortLog(r.duration)), log_error: null }, " AND log_status IS NULL");
+      continue;
+    }
+    if (copies <= 0 || out.logsBlocked) break;
     if (!(await setRow(r.id, { log_status: "preparing", log_error: null }, " AND log_status IS NULL"))) continue;
     copies--;
     await prepareMedia(cfg, r.media_uid!, r.language);
