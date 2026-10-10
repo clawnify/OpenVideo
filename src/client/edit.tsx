@@ -149,6 +149,8 @@ interface FootageItem {
   error: string | null;
   /** Set while it waits on Google Drive: when it is tried again. */
   retry_at?: string | null;
+  /** Set while a file Drive won't hand over whole comes in a piece at a time. */
+  received?: { bytes: number; size: number } | null;
   asset: Asset | null;
   log_status: "preparing" | "running" | "done" | "failed" | null;
   log_error: string | null;
@@ -2055,6 +2057,9 @@ function footageLine(i: FootageItem): string {
     return `Waiting for Google Drive, which is limiting downloads of this file. Trying again at ${at}`;
   }
   if (i.status === "waiting") return "Waiting to import";
+  if (i.status === "importing" && i.received) {
+    return `Importing: ${Math.floor((i.received.bytes / i.received.size) * 100)}% of ${fmtBytes(i.received.size)}`;
+  }
   if (i.status === "importing") return "Importing";
   if (i.status === "failed") return `Not imported: ${i.error ?? "unknown error"}`;
   if (i.log_status === "done" && i.log) return i.log.summary;

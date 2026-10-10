@@ -219,3 +219,14 @@ ALTER TABLE project_footage ADD COLUMN copy_id TEXT;
 -- other refusal sends it back to be re-encoded.
 ALTER TABLE project_footage ADD COLUMN transcode INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE project_footage ADD COLUMN transcode_job TEXT;
+
+-- A file Google Drive won't hand over whole (its download limit) still serves
+-- byte ranges, so it comes in a piece at a time, into an upload on the media
+-- service (src/server/relay.ts). Set while that upload is open: its id and
+-- link, when the link expires, the file's size, and how much is in so far
+-- (for showing; the upload itself says where it stands).
+ALTER TABLE project_footage ADD COLUMN upload_uid TEXT;
+ALTER TABLE project_footage ADD COLUMN upload_url TEXT;
+ALTER TABLE project_footage ADD COLUMN upload_expires TEXT;
+ALTER TABLE project_footage ADD COLUMN upload_size INTEGER;
+ALTER TABLE project_footage ADD COLUMN upload_done INTEGER;

@@ -82,6 +82,7 @@ otherwise), `next_offset`, and `items`:
 {
   "id": "…", "name": "B_0012.MP4", "folder": "Day 1/Cam B",
   "status": "ready",                       // waiting | importing | ready | failed
+  "received": null,                        // while it comes in a piece at a time: { "bytes", "size" }
   "asset": { "id": "…", "duration": 41.2 }, // the EDL uses "asset:<id>"
   "log_status": "done",                    // preparing | running | done | failed
   "log": {
@@ -149,19 +150,24 @@ each file's Drive link.
 cut from the kept soundbites" places them with its `add_highlight` operation.
 
 Google Drive limits how often a file shared with the link can be downloaded,
-and on a heavy day it refuses the files of a whole folder for a while. A clip it
-refuses is not failed: it waits (`status: "waiting"` with `retry_at`, counted in
+and on a heavy day it refuses the files of a whole folder for a while. It
+refuses the whole file but still serves pieces of it, so a refused file of up
+to 30 GB comes in a piece at a time instead, in the background steps only:
+`status: "importing"`, with `received` saying how much is in. A big file takes
+a while this way. A clip Drive won't serve even a piece of, or one over 30 GB,
+is not failed: it waits (`status: "waiting"` with `retry_at`, counted in
 `counts.drive_waiting`) and is tried again by itself, further apart each time,
-for about a day, after which it fails with the reason. `imports_paused` says so
-when every waiting clip is waiting on Drive. A copy of the folder in another
-Drive account has its own limit.
+for about a day, after which it fails with the reason. One that was coming in
+by pieces carries on from where it got to. `imports_paused` says so when every
+waiting clip is waiting on Drive. A copy of the folder in another Drive account
+has its own limit.
 
 When the org has a Google Drive connection whose account can open the
 folder, clips are downloaded through it instead, as that account, which
 Drive's limit on shared links doesn't touch. Those downloads run in the
 background steps only. A file too big for the connection's temporary storage
-(seen at 9 GB; 3.4 GB passed) comes by the original's shared link, with the
-waits above. It is never copied inside Google first: Drive answers a header
+(seen at 9 GB; 3.4 GB passed) comes by the original's shared link, as above:
+whole, or a piece at a time when Drive refuses it whole. It is never copied inside Google first: Drive answers a header
 check on a fresh copy of a big file with an empty page, and the video host
 refuses such a download. Copies an earlier version made are deleted once
 their import is over (or with the project).

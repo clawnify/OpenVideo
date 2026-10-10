@@ -144,12 +144,12 @@ export async function openMediaUpload(
   size: number,
   name: string,
   maxDurationSeconds?: number,
-): Promise<{ id: string; uploadUrl: string } | { failure: MediaFailure }> {
-  const res = await call<{ id: string; upload_url: string }>(cfg, "/uploads", {
+): Promise<{ id: string; uploadUrl: string; expiresAt: string | null } | { failure: MediaFailure }> {
+  const res = await call<{ id: string; upload_url: string; expires_at?: string }>(cfg, "/uploads", {
     method: "POST",
     body: JSON.stringify({ size, name, ...(maxDurationSeconds ? { max_duration_seconds: maxDurationSeconds } : {}) }),
   });
-  return "failure" in res ? res : { id: res.data.id, uploadUrl: res.data.upload_url };
+  return "failure" in res ? res : { id: res.data.id, uploadUrl: res.data.upload_url, expiresAt: res.data.expires_at ?? null };
 }
 
 export async function mediaState(cfg: MediaConfig, uid: string): Promise<{ media: MediaState } | { failure: MediaFailure }> {
