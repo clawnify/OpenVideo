@@ -131,10 +131,10 @@ reading sees a dozen clips, so a count in the brief only holds for each dozen.
 With a number, every clip is still read, then one more model call goes over
 all the picks and puts them in order for the brief: the best set of that many
 first (the mix the brief asks for, one clip may give most of it, never the
-same moment twice), then stand-ins. `pick=best` lists that set: kept picks
-first (they count toward the number; when more are kept than wanted, the best
-of them), then the model's order. Dropping one brings in the next with no new
-call. A new number orders them again; picks from clips read later do too, at
+same moment twice), then stand-ins. `pick=best` lists that set, best scored
+first (or by clip with `sort=clip`): kept picks count first toward the number
+(when more are kept than wanted, the best of them), then the model's choice.
+Dropping one brings in its next stand-in with no new call. A new number orders them again; picks from clips read later do too, at
 most every 15 minutes while footage is still coming in. The list says where it
 stands: `wanted`, `counts.best`, and `ranking: { status: waiting | running |
 done | failed, error, due }`.
