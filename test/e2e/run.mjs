@@ -895,6 +895,7 @@ console.log("11g ok: a clip under a second is logged as too short, without an an
   assert.ok(kept.every((k) => best.some((h) => h.id === k)), "every kept pick is in");
   const chosen = best.filter((h) => h.pick !== "keep");
   assert.ok(chosen.every((h) => h.kind === "broll"), "the model's choice, not the score's");
+  assert.ok(best.every((h, i) => i === 0 || best[i - 1].score >= h.score), "listed best scored first");
   const ranks = db.prepare("SELECT rank FROM footage_highlights WHERE project_id = ? AND pick IS NOT 'drop' ORDER BY rank").all(pid).map((x) => x.rank);
   assert.ok(ranks.every((x, i) => x === i + 1), `every pick not dropped has a place: ${ranks}`);
   console.log(`11h ok: best ${wanted} chosen in one call, kept picks in, the model's order over the score`);

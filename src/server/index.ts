@@ -1404,7 +1404,9 @@ app.post("/api/projects/:id/highlights/stop", async (c) => {
 // min_score=2..5, pick=best|open|keep|drop|not_dropped|all (default all),
 // folder= (a folder and everything inside it), sort=score|clip. Pages of 100,
 // at most 1000. skipped=1 adds the clips judged not worth using, and why.
-// pick=best is the project's best `wanted`, in the order the model put them.
+// pick=best is the project's best `wanted`: which they are is the model's
+// call; they are listed best scored first like the rest (the model's order
+// breaks ties; it lists a set as it read it, not by strength).
 app.get("/api/projects/:id/highlights", async (c) => {
   const id = c.req.param("id");
   const project = await get<{
@@ -1427,7 +1429,7 @@ app.get("/api/projects/:id/highlights", async (c) => {
     q("sort") === "clip"
       ? "f.folder, f.name, h.src_in"
       : pick === "best"
-        ? "COALESCE(h.rank, 1000000000), h.score DESC, f.folder, f.name, h.src_in"
+        ? "h.score DESC, COALESCE(h.rank, 1000000000), f.folder, f.name, h.src_in"
         : "h.score DESC, f.folder, f.name, h.src_in";
   const rows = await query<HighlightListRow>(
     `SELECT ${HIGHLIGHT_COLUMNS}
