@@ -1,16 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HIGHLIGHTS_SCHEMA,
+  RANKING_SCHEMA,
   TASTE_EXAMPLES,
   batchClips,
   findHighlights,
   highlightsPrompt,
+  rankHighlights,
+  rankingPool,
+  rankingPrompt,
   readHighlights,
+  readRanking,
   snapToCues,
   stamp,
   tasteFrom,
   vetSpeaker,
   type HighlightClip,
+  type RankCandidate,
   type ReviewedPick,
 } from "../src/server/highlights";
 import type { ClipLog } from "../src/server/footage";
@@ -267,5 +273,112 @@ describe("vetSpeaker", () => {
 
   it("falls back to nothing rather than a guess when the log names no speaker", () => {
     expect(vetSpeaker("Famous Founder", 1, 2, { ...talk, log: log({ quotes: [] }), transcript: null })).toBe("");
+  });
+});
+
+// ── the best of them ──────────────────────────────────────────────────────
+
+const pickOf = (id: string, over: Partial<RankCandidate> = {}): RankCandidate => ({
+  id,
+  kind: "broll",
+  start: 10,
+  end: 14,
+  text: `Shot ${id}`,
+  speaker: "",
+  score: 3,
+  reason: "energy",
+  kept: false,
+  name: `${id}.MP4`,
+  folder: "Day 1/Cam B",
+  ...over,
+});
+
+describe("rankingPool", () => {
+  it("reads the kept picks and the best scored first, listed clip by clip", () => {
+    const all = [pickOf("c", { score: 2 }), pickOf("a", { score: 5 }), pickOf("b", { score: 1, kept: true }), pickOf("d", { score: 4 })];
+    expect(rankingPool(all).map((p) => p.id)).toEqual(["a", "b", "c", "d"]);
+    // A budget for about two lines: the kept one and the best scored.
+    const two = rankingPrompt("", [all[1], all[2]], 2, 1).split("\n").filter((l) => l.startsWith("PICK")).join("\n").length + 2;
+    expect(rankingPool(all, two).map((p) => p.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("rankingPrompt", () => {
+  const pool = [
+    pickOf("p1", { kind: "soundbite", text: "Shipping fast is the whole point.", speaker: "woman in a red jacket", score: 5, reason: "the thesis", name: "A_0012.MP4", folder: "Day 1/Interview" }),
+    pickOf("p2", { kept: true }),
+    pickOf("p3", { score: 4 }),
+  ];
+
+  it("gives the brief, the number, every pick, and lets the brief outrank spreading the picks", () => {
+    const p = rankingPrompt("A 60 s sizzle of the booth", pool, 10, 2);
+    expect(p).toMatch(/narrowing the selects for: A 60 s sizzle of the booth/);
+    expect(p).toMatch(/Choose the 2 that make the best set/);
+    expect(p).toMatch(/\(the 3 best scored of 10\)/);
+    expect(p).toMatch(/most of the set can come from that one clip/);
+    expect(p).toMatch(/never has the same moment twice/);
+    expect(p).toContain('PICK 1: soundbite, 5/5, "A_0012.MP4" in "Day 1/Interview" at 0:10.0, 4.0 s. woman in a red jacket: "Shipping fast is the whole point." Why: the thesis');
+    expect(p).toContain('PICK 2: b-roll, 3/5, KEPT, "p2.MP4" in "Day 1/Cam B" at 0:10.0, 4.0 s. Shot p2 Why: energy');
+    expect(p).toMatch(/up to 1 more as `reserve`/);
+  });
+
+  it("counts the kept picks in, and narrows them when there are more than the number", () => {
+    expect(rankingPrompt("", pool, 3, 2)).toMatch(/The 1 picks marked KEPT were kept by the person reviewing: they are in `best`. Choose the other 1 to go with them./);
+    const allKept = pool.map((p) => ({ ...p, kept: true }));
+    expect(rankingPrompt("", allKept, 3, 2)).toMatch(/kept 3 picks \(marked KEPT\), more than the 2 wanted: `best` is the best 2 of the kept picks/);
+  });
+
+  it("asks for both lists, as numbers", () => {
+    expect(RANKING_SCHEMA.required).toEqual(["best", "reserve"]);
+    expect(RANKING_SCHEMA.properties.best.items.type).toBe("integer");
+  });
+});
+
+describe("readRanking", () => {
+  it("places what the model chose, then its stand-ins, then the rest by score", () => {
+    const pool = [pickOf("a", { score: 2 }), pickOf("b", { score: 5 }), pickOf("c", { score: 3 }), pickOf("d", { score: 4 })];
+    expect(readRanking({ best: [3, 1], reserve: [2] }, pool, pool)).toEqual(["c", "a", "b", "d"]);
+  });
+
+  it("ignores numbers it doesn't know and repeats, and puts a line said twice at the back", () => {
+    const pool = [
+      pickOf("a", { kind: "soundbite", text: "We made it!", score: 5 }),
+      pickOf("b", { kind: "soundbite", text: "we made it", score: 5, folder: "Day 1/Cam C" }),
+      pickOf("c"),
+    ];
+    expect(readRanking({ best: [0, 9, 1.5, "x", 1, 1, 2], reserve: [3] }, pool, pool)).toEqual(["a", "c", "b"]);
+  });
+
+  it("gives a place to every candidate, the ones the prompt left out too", () => {
+    const pool = [pickOf("a"), pickOf("b")];
+    const all = [...pool, pickOf("z", { score: 1 }), pickOf("y", { score: 5 })];
+    expect(readRanking({ best: [2], reserve: [] }, pool, all)).toEqual(["b", "y", "a", "z"]);
+    expect(readRanking(null, pool, all)).toEqual(["y", "a", "b", "z"]);
+  });
+});
+
+describe("rankHighlights", () => {
+  const all = [pickOf("a", { score: 2 }), pickOf("b", { score: 5 }), pickOf("c")];
+
+  it("says what is missing without a key, and asks again later when the model is busy or says nothing", async () => {
+    expect(await rankHighlights(undefined, "", all, 1)).toMatchObject({ failure: { error: "highlights_unavailable", retry: false } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("rate limited", { status: 429 })));
+    expect(await rankHighlights("k", "", all, 1)).toMatchObject({ failure: { retry: true } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("bad request", { status: 400 })));
+    expect(await rankHighlights("k", "", all, 1)).toMatchObject({ failure: { retry: false } });
+    const empty = JSON.stringify({ best: [], reserve: [] });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: empty } }] }))));
+    expect(await rankHighlights("k", "", all, 1)).toMatchObject({ failure: { retry: true } });
+  });
+
+  it("orders every candidate from a structured answer", async () => {
+    // The pool lists the picks clip by clip: a, b, c.
+    const content = JSON.stringify({ best: [3], reserve: [1] });
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content } }] })));
+    vi.stubGlobal("fetch", fetch);
+    expect(await rankHighlights("k", "brief", all, 1)).toEqual({ order: ["c", "a", "b"] });
+    const body = JSON.parse((fetch.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
+    expect(body.response_format.json_schema).toMatchObject({ name: "best_highlights", strict: true });
+    expect(body.messages[0].content).toMatch(/Choose the 1 that make the best set/);
   });
 });

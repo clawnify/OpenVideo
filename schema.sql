@@ -230,3 +230,16 @@ ALTER TABLE project_footage ADD COLUMN upload_url TEXT;
 ALTER TABLE project_footage ADD COLUMN upload_expires TEXT;
 ALTER TABLE project_footage ADD COLUMN upload_size INTEGER;
 ALTER TABLE project_footage ADD COLUMN upload_done INTEGER;
+
+-- How many highlights the project wants; NULL: every pick worth a look. Once
+-- every clip is read, one more model call puts the picks in order for the
+-- brief, the best set of that many first (src/server/highlights.ts). The
+-- ordering: NULL | waiting | running | done | failed, with the error, and
+-- when it was last claimed (a claim older than five minutes is taken over).
+ALTER TABLE edit_projects ADD COLUMN highlights_wanted INTEGER;
+ALTER TABLE edit_projects ADD COLUMN highlights_rank_status TEXT;
+ALTER TABLE edit_projects ADD COLUMN highlights_rank_error TEXT;
+ALTER TABLE edit_projects ADD COLUMN highlights_rank_at TEXT;
+-- A pick's place in that order, 1 the best. The best are the kept picks,
+-- then the first in this order; NULL: not placed yet.
+ALTER TABLE footage_highlights ADD COLUMN rank INTEGER;
