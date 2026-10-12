@@ -690,6 +690,8 @@ export async function stepRanking(key: string | undefined, projectId: string): P
   const project = await get<{ brief: string; highlights_wanted: number | null }>("SELECT brief, highlights_wanted FROM edit_projects WHERE id = ?", [
     projectId,
   ]);
+  // The number was taken away (or the project deleted) since: nothing to choose.
+  if (!project?.highlights_wanted) return { moving: false, blocked: null };
   const rows = await query<RankRow>(
     `SELECT h.id, h.kind, h.src_in, h.src_out, h.text, h.speaker, h.score, h.reason, h.pick, f.name, f.folder
        FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id
@@ -709,7 +711,7 @@ export async function stepRanking(key: string | undefined, projectId: string): P
     name: r.name,
     folder: r.folder,
   }));
-  const wanted = project?.highlights_wanted ?? 0;
+  const wanted = project.highlights_wanted;
   let order: string[];
   if (candidates.length <= wanted) {
     // Every one of them is in: there is nothing to choose.
@@ -720,7 +722,7 @@ export async function stepRanking(key: string | undefined, projectId: string): P
         WHERE project_id = ? AND pick IS NOT NULL ORDER BY updated_at DESC, id`,
       [projectId],
     );
-    const ranked = await rankHighlights(key, project?.brief ?? "", candidates, wanted, tasteFrom(reviewed));
+    const ranked = await rankHighlights(key, project.brief, candidates, wanted, tasteFrom(reviewed));
     if ("failure" in ranked) {
       // Busy or unreachable: again on a later step. Anything else would fail
       // the same way again, so it says why and waits for a person.
