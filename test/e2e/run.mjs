@@ -259,6 +259,16 @@ globalThis.fetch = async (input, init = {}) => {
     const prompt = body.messages[0].content;
     world.prompts.push(prompt);
     if (world.modelRefusal) return new Response(world.modelRefusal.body, { status: world.modelRefusal.status });
+    // Choosing the best: the b-roll, last listed first, then the soundbites as
+    // stand-ins. By score alone the soundbites (5) would come first.
+    if (/^PICK 1: /m.test(prompt)) {
+      const picks = [...prompt.matchAll(/^PICK (\d+): (soundbite|b-roll),/gm)].map((m) => ({ n: Number(m[1]), kind: m[2] }));
+      const content = JSON.stringify({
+        best: picks.filter((x) => x.kind === "b-roll").map((x) => x.n).reverse(),
+        reserve: picks.filter((x) => x.kind === "soundbite").map((x) => x.n),
+      });
+      return json(200, { choices: [{ message: { content } }] });
+    }
     // One answer per clip in the prompt: a soundbite where there is speech,
     // a shot everywhere, and B_0003 set aside.
     const clips = [...prompt.matchAll(/^CLIP (\d+): "([^"]+)"/gm)].map((m) => ({ n: Number(m[1]), name: m[2] }));
@@ -288,6 +298,7 @@ globalThis.fetch = async (input, init = {}) => {
 };
 
 // ── the scenario ──────────────────────────────────────────────────────────
+const MAX_WANTED_PLUS_ONE = () => 201;
 const { db, binding } = storage();
 const app = await fresh();
 const env = { STORAGE: binding, UPLOADS: {}, CLAWNIFY_TOKEN: "clw_test", SERVICES_URL: "https://svc.test", CLAWNIFY_QUEUE_URL: "https://queue.test/queue" };
@@ -840,6 +851,121 @@ assert.equal(short().log_status, "done", JSON.stringify(short()));
 assert.deepEqual(JSON.parse(short().log), { summary: "A 0.3 s clip, too short to use.", kind: "other", quality: "unusable", issues: "too short to use", quotes: [], moments: [], visible_text: [] });
 assert.equal(world.jobs.size, jobsBeforeShort, "no analysis was asked for");
 console.log("11g ok: a clip under a second is logged as too short, without an analysis");
+
+// How many: a number of highlights is chosen from all the picks in one more
+// model call, on a delivery once nothing is left to read. Dropping one of the
+// best brings in the next without the model; a new number orders them again.
+{
+  const isRanking = (p) => /^PICK 1: /m.test(p);
+  const rankings = () => world.prompts.filter(isRanking).length;
+  // At least one kept pick, so the best has to count it in.
+  if (!db.prepare("SELECT 1 FROM footage_highlights WHERE project_id = ? AND pick = 'keep'").get(pid)) {
+    const open = db.prepare("SELECT id FROM footage_highlights WHERE project_id = ? AND pick IS NULL AND kind = 'soundbite' LIMIT 1").get(pid);
+    assert.equal((await call("PATCH", `/api/projects/${pid}/highlights/${open.id}`, { pick: "keep" })).status, 200);
+  }
+  const kept = db.prepare("SELECT id FROM footage_highlights WHERE project_id = ? AND pick = 'keep'").all(pid).map((x) => x.id);
+  for (const bad of [0, MAX_WANTED_PLUS_ONE(), 2.5, "7"]) {
+    r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted: bad });
+    assert.equal(r.status, 400, `refused: ${bad}`);
+  }
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  assert.deepEqual([r.data.wanted, r.data.ranking, r.data.counts.best], [null, null, 0], "no number: no best");
+  const wanted = kept.length + 2;
+  const before = world.prompts.length;
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.ok(r.data.next_step_at, "a step is booked to choose them");
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.equal(world.prompts.length, before, "a read never calls the model");
+  assert.deepEqual([r.data.wanted, r.data.ranking.status, r.data.ranking.due], [wanted, "waiting", true]);
+  d = await deliver();
+  assert.equal(rankings(), 1, "one call chose them");
+  const prompt = world.prompts.at(-1);
+  assert.match(prompt, new RegExp(`Choose the ${wanted} that make the best set`));
+  assert.match(prompt, /picks marked KEPT were kept by the person reviewing: they are in `best`. Choose the other 2 to go with them/);
+  assert.match(prompt, /A 60 s sizzle of the booth/, "for the brief");
+  const pickLines = prompt.split("\n").filter((l) => l.startsWith("PICK "));
+  assert.ok(!pickLines.some((l) => l.includes(droppedShot.text)), "a dropped pick is not a candidate");
+  assert.ok(prompt.slice(prompt.indexOf("Dropped:")).includes(droppedShot.text), "only taste to learn from");
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.equal(r.data.ranking.status, "done");
+  assert.equal(r.data.counts.best, wanted);
+  let best = r.data.highlights;
+  assert.equal(best.length, wanted, JSON.stringify(best.map((h) => [h.kind, h.pick, h.score])));
+  assert.ok(kept.every((k) => best.some((h) => h.id === k)), "every kept pick is in");
+  const chosen = best.filter((h) => h.pick !== "keep");
+  assert.ok(chosen.every((h) => h.kind === "broll"), "the model's choice, not the score's");
+  const ranks = db.prepare("SELECT rank FROM footage_highlights WHERE project_id = ? AND pick IS NOT 'drop' ORDER BY rank").all(pid).map((x) => x.rank);
+  assert.ok(ranks.every((x, i) => x === i + 1), `every pick not dropped has a place: ${ranks}`);
+  console.log(`11h ok: best ${wanted} chosen in one call, kept picks in, the model's order over the score`);
+
+  // Dropping one of the best brings in the next, with no call; so does the export.
+  const out = chosen[0];
+  r = await call("PATCH", `/api/projects/${pid}/highlights/${out.id}`, { pick: "drop" });
+  assert.equal(r.status, 200);
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.equal(r.data.highlights.length, wanted);
+  assert.ok(!r.data.highlights.some((h) => h.id === out.id), "the dropped one left");
+  assert.ok(r.data.highlights.some((h) => !best.some((b) => b.id === h.id)), "the next came in");
+  assert.equal(rankings(), 1, "without a call");
+  best = r.data.highlights;
+  res = await app.request(`https://open-video.apps.clawnify.com/api/projects/${pid}/highlights/export?format=csv&pick=best`, {}, env, ctx);
+  csv = (await res.text()).replace(/^\uFEFF/, "").trim().split("\r\n");
+  assert.equal(csv.length, wanted + 1, "the export takes the best");
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best&kind=broll`);
+  assert.ok(r.data.highlights.every((h) => h.kind === "broll" && best.some((b) => b.id === h.id)), "filters narrow the best");
+  console.log("11h2 ok: a drop brings in the next without the model; the export and filters take the best");
+
+  // A new number orders them again; a busy model waits; a refusal says why
+  // and waits for a person; no number, no best.
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted: wanted + 1 });
+  d = await deliver();
+  assert.equal(rankings(), 2);
+  assert.match(world.prompts.at(-1), new RegExp(`Choose the ${wanted + 1} that make`));
+  world.modelRefusal = { status: 429, body: "rate limited" };
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted });
+  d = await deliver();
+  assert.ok(d.next_step_at, "busy: another step is booked");
+  assert.equal(db.prepare("SELECT highlights_rank_status FROM edit_projects WHERE id = ?").get(pid).highlights_rank_status, "waiting");
+  world.modelRefusal = { status: 400, body: "context too long" };
+  d = await deliver();
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.equal(r.data.ranking.status, "failed");
+  assert.match(r.data.ranking.error, /context too long/);
+  assert.equal(r.data.ranking.due, false);
+  assert.equal(r.data.highlights.length, wanted, "the last order still stands");
+  world.modelRefusal = null;
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted });
+  d = await deliver();
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  assert.equal(r.data.ranking.status, "done", "trying again chose them");
+  console.log("11h3 ok: a new number orders again; busy waits, a refusal says why, trying again works");
+
+  // Footage still coming in: new picks wait to be ordered again for a while,
+  // and a number a person sets never waits.
+  db.prepare("INSERT INTO project_footage (project_id, drive_file_id, name, folder, status, retry_at) VALUES (?, 'coming_file_000000000000000', 'LATE.MP4', 'Day 1/Cam B', 'waiting', '2099-01-01T00:00:00Z')").run(pid);
+  const reread = db.prepare("SELECT name FROM project_footage WHERE project_id = ? AND status = 'ready' AND highlights_status = 'done' AND skip_reason IS NULL ORDER BY name LIMIT 1").get(pid).name;
+  db.prepare("UPDATE project_footage SET highlights_status = 'waiting' WHERE project_id = ? AND name = ?").run(pid, reread);
+  const n = rankings();
+  d = await deliver();
+  assert.equal(rankings(), n, "new picks while footage is coming: not ordered again at once");
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  assert.deepEqual([r.data.ranking.status, r.data.ranking.due], ["waiting", false]);
+  db.prepare("UPDATE edit_projects SET highlights_rank_at = datetime('now', '-16 minutes') WHERE id = ?").run(pid);
+  d = await deliver();
+  assert.equal(rankings(), n + 1, "but again after a while");
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted: wanted + 2 });
+  d = await deliver();
+  assert.equal(rankings(), n + 2, "a new number never waits");
+  db.prepare("DELETE FROM project_footage WHERE project_id = ? AND name = 'LATE.MP4'").run(pid);
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted: null });
+  assert.equal(r.status, 200);
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.deepEqual([r.data.wanted, r.data.ranking], [null, null]);
+  assert.equal(r.data.highlights.length, r.data.counts.total - r.data.counts.dropped, "no number: best is everything not dropped");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM footage_highlights WHERE project_id = ? AND rank IS NOT NULL").get(pid).n, 0);
+  console.log("11h4 ok: while footage comes in the order waits a while, a person's number never; no number, no best");
+}
 
 // 10. Deleting the project deletes its footage, a batch at a time.
 const stmt = db.prepare("INSERT INTO project_footage (project_id, drive_file_id, name, folder) VALUES (?, ?, ?, 'Bulk')");

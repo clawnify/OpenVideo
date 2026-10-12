@@ -114,15 +114,30 @@ and the reason. They are read from the logs and transcripts in the background,
 a folder at a time, and clips logged later join by themselves.
 
 ```
-POST  /api/projects/{id}/highlights          { "brief"?: "…", "again"?: true }
+POST  /api/projects/{id}/highlights          { "brief"?: "…", "again"?: true, "wanted"?: 25 }
+PUT   /api/projects/{id}/highlights/wanted   { "wanted": 25 | null }   how many; nothing is read again
 POST  /api/projects/{id}/highlights/stop     stop reading; picks so far stay, asking again resumes
 GET   /api/projects/{id}/highlights          best first, 100 a page (limit up to 1000, offset)
       &kind=soundbite|broll  &min_score=2..5  &folder=Day 1/Cam B
-      &pick=open|keep|drop|not_dropped|all   &sort=score|clip  &skipped=1
+      &pick=best|open|keep|drop|not_dropped|all   &sort=score|clip  &skipped=1
 PATCH /api/projects/{id}/highlights/{hid}    { "pick"?: "keep"|"drop"|null, "start"?, "end"?, "speaker"?, "text"? }
 POST  /api/projects/{id}/highlights/items    { "clip": "<clipId>", "start"?, "end"?, "kind"?, "text"? }
-GET   /api/projects/{id}/highlights/export?format=csv|xml&pick=keep|not_dropped&root=&fps=
+GET   /api/projects/{id}/highlights/export?format=csv|xml&pick=best|keep|not_dropped&root=&fps=
 ```
+
+`wanted` is how many highlights the video wants (1 to 200; null, the default:
+every pick worth a look). Write the number there, never in the brief: each
+reading sees a dozen clips, so a count in the brief only holds for each dozen.
+With a number, every clip is still read, then one more model call goes over
+all the picks and puts them in order for the brief: the best set of that many
+first (the mix the brief asks for, one clip may give most of it, never the
+same moment twice), then stand-ins. `pick=best` lists that set: kept picks
+first (they count toward the number; when more are kept than wanted, the best
+of them), then the model's order. Dropping one brings in the next with no new
+call. A new number orders them again; picks from clips read later do too, at
+most every 15 minutes while footage is still coming in. The list says where it
+stands: `wanted`, `counts.best`, and `ranking: { status: waiting | running |
+done | failed, error, due }`.
 
 `again` reads every clip again; what a person kept or dropped stays as it is,
 and each reading learns from those calls (the latest 15 kept and 15 dropped)
@@ -213,7 +228,8 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | POST | `/api/projects/{id}/footage/folders` | `{ url, language? }` adds a Drive folder shared with the link |
 | POST | `/api/projects/{id}/footage/sync` | Takes in files added to the folders since → `{ added }` |
 | POST | `/api/projects/{id}/footage/retry` | Puts failed imports and logs back in line → `{ imports, logs }` |
-| POST | `/api/projects/{id}/highlights` | Find the footage's highlights `{ brief?, again? }` (in the background) |
+| POST | `/api/projects/{id}/highlights` | Find the footage's highlights `{ brief?, again?, wanted? }` (in the background) |
+| PUT  | `/api/projects/{id}/highlights/wanted` | How many highlights `{ wanted: 1..200 \| null }`: the best that many are chosen from all the picks |
 | POST | `/api/projects/{id}/highlights/stop` | Stop reading: clips in line go back, later clips wait until asked again |
 | GET  | `/api/projects/{id}/highlights` | The highlights, best first, filtered and paged → `{ clips, counts, highlights, next_offset, paused }` |
 | PATCH | `/api/projects/{id}/highlights/{hid}` | A person's call `{ pick?: keep\|drop\|null, start?, end?, speaker?, text? }` |

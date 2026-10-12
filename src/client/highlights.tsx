@@ -11,6 +11,7 @@ import {
   Check,
   ChevronRight,
   Download,
+  ListOrdered,
   Loader2,
   RotateCcw,
   Sparkles,
@@ -61,7 +62,11 @@ interface HighlightList {
   stopped: boolean;
   brief: string;
   clips: { logged: number; done: number; pending: number; failed: number; skipped: number; not_asked: number };
-  counts: { total: number; soundbites: number; broll: number; kept: number; dropped: number; open: number };
+  counts: { total: number; soundbites: number; broll: number; kept: number; dropped: number; open: number; best: number };
+  /** How many highlights the video wants; null: every pick worth a look. */
+  wanted: number | null;
+  /** Choosing the best `wanted`: `due`, it runs on the next step. */
+  ranking: { status: "waiting" | "running" | "done" | "failed" | null; error: string | null; due: boolean } | null;
   paused: string | null;
   highlights: Highlight[];
   next_offset: number | null;
@@ -71,12 +76,24 @@ interface HighlightList {
 interface Filters {
   kind: "" | Kind;
   min: number;
-  pick: "all" | "open" | "keep" | "drop";
+  pick: "best" | "all" | "open" | "keep" | "drop";
   folder: string;
   sort: "score" | "clip";
 }
 
 const PAGE = 200;
+/** The most highlights a project can ask for (MAX_WANTED on the server). */
+const MAX_WANTED = 200;
+
+/** A typed number of highlights: null for none, NaN when it isn't one. */
+function wantedValue(text: string): number | null {
+  if (!text.trim()) return null;
+  const n = Number(text);
+  return Number.isInteger(n) && n >= 1 && n <= MAX_WANTED ? n : Number.NaN;
+}
+
+/** Choosing the best is under way, or will be shortly. */
+const choosing = (l: HighlightList) => !!l.ranking && (l.ranking.status === "running" || (l.ranking.status === "waiting" && l.ranking.due));
 
 /** Seconds → "M:SS.s": a position in a clip. */
 function clock(t: number): string {
@@ -154,13 +171,23 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
     load(false).catch((e) => setErr(String(e.message || e)));
   }, [load]);
 
-  // While clips are still being read, new picks arrive: look again now and then.
-  const pending = list?.clips.pending ?? 0;
+  // A project that asked for a number of highlights opens on the best of them.
+  const opened = useRef(false);
   useEffect(() => {
-    if (!pending || list?.paused) return;
+    if (!list || opened.current) return;
+    opened.current = true;
+    if (list.wanted && filters.pick === "all") setFilters((f) => ({ ...f, pick: "best" }));
+  }, [list, filters.pick]);
+
+  // While clips are still being read, new picks arrive, and the best are
+  // chosen once they are: look again now and then.
+  const pending = list?.clips.pending ?? 0;
+  const busy = pending > 0 || (!!list && choosing(list));
+  useEffect(() => {
+    if (!busy || list?.paused) return;
     const t = setInterval(() => load(true).catch(() => {}), 8000);
     return () => clearInterval(t);
-  }, [pending, list?.paused, load]);
+  }, [busy, list?.paused, load]);
 
   const more = async () => {
     if (nextOffset === null) return;
@@ -177,6 +204,8 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
       try {
         const updated = await api.send<Highlight>("PATCH", `/api/projects/${id}/highlights/${h.id}`, { pick });
         setItems((prev) => prev.map((x) => (x.id === h.id ? updated : x)));
+        // Dropping one of the best brings in the next: show it.
+        if (filters.pick === "best") load(true).catch(() => {});
         setList((l) => {
           if (!l) return l;
           const counts = { ...l.counts };
@@ -194,7 +223,7 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
         setErr(String((e as Error).message || e));
       }
     },
-    [id],
+    [id, filters.pick, load],
   );
 
   // A person's correction: who says it, as they know it ("Name, Title").
@@ -274,7 +303,7 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
           <h1 className="text-heading-2 min-w-0 truncate">Highlights{name && <span className="text-muted font-normal"> · {name}</span>}</h1>
           {list.asked && list.counts.total > 0 && (
             <div className="ml-auto">
-              <ExportMenu projectId={id} counts={list.counts} filters={filters} />
+              <ExportMenu projectId={id} counts={list.counts} wanted={list.wanted} filters={filters} />
             </div>
           )}
         </div>
@@ -283,8 +312,18 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
           <AskPanel projectId={id} brief={list.brief} logged={list.clips.logged} onAsked={() => load(false)} />
         ) : (
           <>
-            <Progress list={list} projectId={id} onAgain={() => load(false)} />
-            <FilterBar filters={filters} setFilters={setFilters} folders={folders} counts={list.counts} />
+            <Progress
+              list={list}
+              projectId={id}
+              onAgain={() => load(false)}
+              onWanted={(wanted) => {
+                // A new number: show its best. No number: everything.
+                if (wanted && filters.pick !== "best") setFilters({ ...filters, pick: "best" });
+                else if (!wanted && filters.pick === "best") setFilters({ ...filters, pick: "all" });
+                else load(false).catch(() => {});
+              }}
+            />
+            <FilterBar filters={filters} setFilters={setFilters} folders={folders} counts={list.counts} wanted={list.wanted} />
             {err && <p className="mb-2 text-fine text-danger">{err}</p>}
             {items.length === 0 ? (
               <EmptyState
@@ -330,13 +369,15 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
 
 function AskPanel({ projectId, brief, logged, onAsked }: { projectId: string; brief: string; logged: number; onAsked: () => void }) {
   const [text, setText] = useState(brief);
+  const [count, setCount] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const wanted = wantedValue(count);
   const ask = async () => {
     setBusy(true);
     setErr("");
     try {
-      await api.send("POST", `/api/projects/${projectId}/highlights`, { brief: text });
+      await api.send("POST", `/api/projects/${projectId}/highlights`, { brief: text, ...(wanted ? { wanted } : {}) });
       onAsked();
     } catch (e) {
       setErr(String((e as Error).message || e));
@@ -363,15 +404,138 @@ function AskPanel({ projectId, brief, logged, onAsked }: { projectId: string; br
         placeholder="e.g. A 60 to 90 second sizzle of our presence at the event: soundbites from interviews and panels, b-roll of the booth, people and stage"
         className="field w-full mb-3"
       />
+      <WantedField id="hl-wanted" value={count} onChange={setCount} />
       {err && <p className="mb-2 text-fine text-danger">{err}</p>}
-      <button onClick={ask} disabled={busy} className={btnPrimary}>
+      <button onClick={ask} disabled={busy || Number.isNaN(wanted)} className={btnPrimary}>
         {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Find highlights
       </button>
     </div>
   );
 }
 
-function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId: string; onAgain: () => void }) {
+/** How many highlights the video wants: a number, or empty for every pick worth a look. */
+function WantedField({ id, value, onChange, autoFocus }: { id: string; value: string; onChange: (v: string) => void; autoFocus?: boolean }) {
+  const bad = Number.isNaN(wantedValue(value));
+  return (
+    <div className="mb-3">
+      <label className="block text-fine text-muted mb-1" htmlFor={id}>
+        How many highlights?
+      </label>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <input
+          id={id}
+          type="number"
+          inputMode="numeric"
+          min={1}
+          max={MAX_WANTED}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="All"
+          aria-invalid={bad}
+          aria-describedby={`${id}-help`}
+          autoFocus={autoFocus}
+          className="field w-24 tabular-nums"
+        />
+        <span id={`${id}-help`} className={`text-fine ${bad ? "text-danger" : "text-faint"}`}>
+          {bad
+            ? `A whole number from 1 to ${MAX_WANTED}, or empty.`
+            : "Empty: every pick worth a look. A number: every clip is still read, then the best that many are chosen from all the picks, for this brief."}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** The best the project asked for: where choosing them stands, and changing how many. */
+function BestLine({
+  list,
+  projectId,
+  onWanted,
+  editing,
+  setEditing,
+}: {
+  list: HighlightList;
+  projectId: string;
+  onWanted: (wanted: number | null) => void;
+  editing: boolean;
+  setEditing: (v: boolean) => void;
+}) {
+  const [count, setCount] = useState(list.wanted ? String(list.wanted) : "");
+  useEffect(() => {
+    if (editing) setCount(list.wanted ? String(list.wanted) : "");
+  }, [editing, list.wanted]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const wanted = wantedValue(count);
+  const save = async (value: number | null) => {
+    setBusy(true);
+    setErr("");
+    try {
+      await api.send("PUT", `/api/projects/${projectId}/highlights/wanted`, { wanted: value });
+      setEditing(false);
+      onWanted(value);
+    } catch (e) {
+      setErr(String((e as Error).message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const n = list.wanted;
+  const r = list.ranking;
+  return (
+    <>
+      {n && r && !editing && (
+        <p className="mt-1 tabular-nums">
+          {r.status === "failed" ? (
+            <span className="text-danger">
+              Couldn't choose the best {n}: {r.error}{" "}
+              <button onClick={() => save(n)} disabled={busy} className="underline">
+                Try again
+              </button>
+            </span>
+          ) : list.clips.pending > 0 ? (
+            `Best ${n}: chosen from all the picks once the clips are read.`
+          ) : choosing(list) ? (
+            <>
+              <Loader2 className="inline w-3.5 h-3.5 mr-1 animate-spin align-[-2px]" />
+              Choosing the best {n} of {plural(list.counts.total - list.counts.dropped, "pick", "picks")}…
+            </>
+          ) : r.status === "waiting" ? (
+            `Best ${n}: chosen again as more footage comes in.`
+          ) : (
+            `Best ${list.counts.best} chosen from ${plural(list.counts.total - list.counts.dropped, "pick", "picks")}, for the brief. Drop one and the next comes in.`
+          )}
+        </p>
+      )}
+      {editing && (
+        <div className={`${card} mt-2 p-3 max-w-2xl`}>
+          <WantedField id="hl-wanted-again" value={count} onChange={setCount} autoFocus />
+          {err && <p className="mb-2 text-fine text-danger">{err}</p>}
+          <div className="flex gap-2">
+            <button onClick={() => save(wanted)} disabled={busy || Number.isNaN(wanted)} className={btnPrimary}>
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Save
+            </button>
+            <button onClick={() => setEditing(false)} disabled={busy} className={btnGhost}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function Progress({
+  list,
+  projectId,
+  onAgain,
+  onWanted,
+}: {
+  list: HighlightList;
+  projectId: string;
+  onAgain: () => void;
+  onWanted: (wanted: number | null) => void;
+}) {
   const { clips, counts } = list;
   const [busy, setBusy] = useState(false);
   // Finding again is the moment to change what the picks are judged against.
@@ -397,6 +561,7 @@ function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId
     }
   };
   const read = clips.done + clips.failed;
+  const [editingWanted, setEditingWanted] = useState(false);
   return (
     <div className="mb-3 text-fine text-muted">
       <p className="tabular-nums">
@@ -415,6 +580,7 @@ function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId
       </p>
       {list.paused && <p className="mt-1 rounded-sm bg-warning-tint px-2 py-1.5 text-foreground">Paused: {list.paused}</p>}
       {list.brief && !editing && <p className="mt-1 text-faint line-clamp-2" title={list.brief}>For: {list.brief}</p>}
+      {!editing && <BestLine list={list} projectId={projectId} onWanted={onWanted} editing={editingWanted} setEditing={setEditingWanted} />}
       {editing && (
         <div className={`${card} mt-2 p-3 max-w-2xl`}>
           <label className="block text-fine text-muted mb-1" htmlFor="hl-again-brief">
@@ -460,6 +626,16 @@ function Progress({ list, projectId, onAgain }: { list: HighlightList; projectId
             {list.stopped
               ? `Read the ${plural(clips.not_asked, "clip", "clips")} not read`
               : `Read ${clips.not_asked} new ${clips.not_asked === 1 ? "clip" : "clips"}`}
+          </button>
+        )}
+        {!editing && !editingWanted && (
+          <button
+            onClick={() => setEditingWanted(true)}
+            disabled={busy}
+            className={btnGhost}
+            title="How many highlights the video wants. Nothing is read again: the best are chosen from the picks found."
+          >
+            <ListOrdered className="w-3.5 h-3.5" /> {list.wanted ? `How many: ${list.wanted}` : "Choose how many"}
           </button>
         )}
         {clips.pending === 0 && !editing && (
@@ -513,11 +689,13 @@ function FilterBar({
   setFilters,
   folders,
   counts,
+  wanted,
 }: {
   filters: Filters;
   setFilters: (f: Filters) => void;
   folders: string[];
   counts: HighlightList["counts"];
+  wanted: number | null;
 }) {
   const set = <K extends keyof Filters>(k: K, v: Filters[K]) => setFilters({ ...filters, [k]: v });
   const [open, setOpen] = useState(false);
@@ -549,6 +727,7 @@ function FilterBar({
         value={filters.pick}
         onChange={(v) => set("pick", v)}
         options={[
+          ...(wanted ? [{ value: "best" as const, label: `Best ${counts.best}` }] : []),
           { value: "all", label: "All" },
           { value: "open", label: `To review (${counts.open})` },
           { value: "keep", label: `Kept (${counts.kept})` },
@@ -832,12 +1011,24 @@ function SkippedClips({
   );
 }
 
-function ExportMenu({ projectId, counts, filters }: { projectId: string; counts: HighlightList["counts"]; filters: Filters }) {
-  const [which, setWhich] = useState<"keep" | "not_dropped">(counts.kept > 0 ? "keep" : "not_dropped");
+function ExportMenu({
+  projectId,
+  counts,
+  wanted,
+  filters,
+}: {
+  projectId: string;
+  counts: HighlightList["counts"];
+  wanted: number | null;
+  filters: Filters;
+}) {
+  const [which, setWhich] = useState<"best" | "keep" | "not_dropped">(wanted ? "best" : counts.kept > 0 ? "keep" : "not_dropped");
   const [scope, setScope] = useState<"all" | "filtered">("all");
-  const n = which === "keep" ? counts.kept : counts.kept + counts.open;
+  // The number taken away: the best go back to everything not dropped.
+  const pick = which === "best" && !wanted ? "not_dropped" : which;
+  const n = pick === "best" ? counts.best : pick === "keep" ? counts.kept : counts.kept + counts.open;
   const href = (format: "xml" | "csv") => {
-    const p = new URLSearchParams({ format, pick: which });
+    const p = new URLSearchParams({ format, pick });
     if (scope === "filtered") {
       if (filters.kind) p.set("kind", filters.kind);
       if (filters.min > 1) p.set("min_score", String(filters.min));
@@ -859,9 +1050,10 @@ function ExportMenu({ projectId, counts, filters }: { projectId: string; counts:
             <p className="text-fine text-muted mb-1">Which picks</p>
             <Segmented
               label="Which picks"
-              value={which}
+              value={pick}
               onChange={setWhich}
               options={[
+                ...(wanted ? [{ value: "best" as const, label: `Best ${counts.best}` }] : []),
                 { value: "keep", label: `Kept (${counts.kept})` },
                 { value: "not_dropped", label: `Kept and to review (${counts.kept + counts.open})` },
               ]}

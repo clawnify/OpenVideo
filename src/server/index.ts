@@ -35,7 +35,7 @@ import {
 } from "./drive";
 import { parseDriveLink, type FolderVideo } from "./drive-link";
 import { addFolderVideos, bookStep, readFolder, removeCopy, stepFootage, type DriveSource, type StepOutcome } from "./footage";
-import { HIGHLIGHTS_NO_KEY, highlightsPending, stepHighlights, type HighlightKind } from "./highlights";
+import { HIGHLIGHTS_NO_KEY, MAX_WANTED, highlightsPending, rankingDue, stepHighlights, type HighlightKind } from "./highlights";
 import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
@@ -677,17 +677,24 @@ app.put("/api/projects/:id", async (c) => {
  * operations rather than writing the document, and the whole instruction
  * lands as one edit, so the editor can undo it in one step.
  */
-/** The project's highlights for the AI editor: never a dropped one; kept first, then the best. */
+/**
+ * The project's highlights for the AI editor: never a dropped one; kept
+ * first, then the best, in the order the model put them when the project
+ * asked for a number of them (the first that many are marked best).
+ */
 async function instructHighlights(projectId: string): Promise<InstructHighlight[]> {
+  const project = await get<{ highlights_wanted: number | null }>("SELECT highlights_wanted FROM edit_projects WHERE id = ?", [projectId]);
+  const wanted = project?.highlights_wanted ?? 0;
   const rows = await query<{ id: string; asset_id: string; kind: HighlightKind; src_in: number; src_out: number; text: string; speaker: string; score: number; pick: string | null }>(
     `SELECT h.id, f.asset_id, h.kind, h.src_in, h.src_out, h.text, h.speaker, h.score, h.pick
        FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id
       WHERE h.project_id = ? AND f.status = 'ready' AND f.asset_id IS NOT NULL AND (h.pick IS NULL OR h.pick = 'keep')
-      ORDER BY h.pick IS NULL, h.score DESC, f.folder, f.name, h.src_in
+      ORDER BY h.pick IS NULL, COALESCE(h.rank, 1000000000), h.score DESC, f.folder, f.name, h.src_in
       LIMIT 120`,
     [projectId],
   );
-  return rows.map((r) => ({
+  return rows.map((r, i) => ({
+    best: i < wanted,
     id: r.id,
     src: `asset:${r.asset_id}`,
     kind: r.kind,
@@ -969,6 +976,11 @@ async function driveSource(env: Bindings): Promise<DriveSource | undefined> {
   };
 }
 
+/** Clips wait to be read, or the picks to be put in order: model work for a delivery. */
+async function highlightsWork(projectId: string): Promise<boolean> {
+  return (await highlightsPending(projectId)) > 0 || (await rankingDue(projectId));
+}
+
 /** Book the next background step while there is work a step can do. */
 async function keepFootageMoving(
   c: Context<{ Bindings: Bindings }>,
@@ -999,7 +1011,7 @@ async function advanceFootage(
   const highlightsMoving =
     after === "delivery"
       ? (await stepHighlights(mediaCfg(c.env), c.env.OPENROUTER_API_KEY, projectId)).moving
-      : !!c.env.OPENROUTER_API_KEY && (await highlightsPending(projectId)) > 0;
+      : !!c.env.OPENROUTER_API_KEY && (await highlightsWork(projectId));
   const nextStepAt =
     outcome.moving || highlightsMoving
       ? await keepFootageMoving(c, projectId, after)
@@ -1255,11 +1267,21 @@ function highlightOut(r: HighlightListRow) {
   };
 }
 
-const PICKS = ["open", "keep", "drop", "not_dropped", "all"] as const;
+const PICKS = ["open", "keep", "drop", "not_dropped", "all", "best"] as const;
 type PickFilter = (typeof PICKS)[number];
 
+/**
+ * The project's best `wanted` picks: the kept ones first, then the first in
+ * the order the model put them in (src/server/highlights.ts), then by score
+ * for any it hasn't placed yet. Dropping one brings in the next.
+ */
+const BEST_PICKS = `SELECT b.id FROM footage_highlights b JOIN project_footage bf ON bf.id = b.footage_id
+   WHERE b.project_id = ? AND bf.status != 'removed' AND (b.pick IS NULL OR b.pick = 'keep')
+   ORDER BY b.pick IS NULL, COALESCE(b.rank, 1000000000), b.score DESC, bf.folder, bf.name, b.src_in, b.id
+   LIMIT ?`;
+
 /** The WHERE for a project's highlights, narrowed by the list's and export's shared filters. */
-function highlightFilter(projectId: string, q: (k: string) => string | undefined, defaultPick: PickFilter) {
+function highlightFilter(projectId: string, q: (k: string) => string | undefined, defaultPick: PickFilter, wanted: number | null) {
   const where = ["h.project_id = ?", "f.status != 'removed'"];
   const params: unknown[] = [projectId];
   const kind = q("kind");
@@ -1272,11 +1294,17 @@ function highlightFilter(projectId: string, q: (k: string) => string | undefined
     where.push("h.score >= ?");
     params.push(min);
   }
-  const pick = (PICKS as readonly string[]).includes(q("pick") ?? "") ? (q("pick") as PickFilter) : defaultPick;
+  let pick = (PICKS as readonly string[]).includes(q("pick") ?? "") ? (q("pick") as PickFilter) : defaultPick;
+  // Without a number asked for, there is no best set: everything not dropped.
+  if (pick === "best" && !wanted) pick = "not_dropped";
   if (pick === "open") where.push("h.pick IS NULL");
   else if (pick === "keep") where.push("h.pick = 'keep'");
   else if (pick === "drop") where.push("h.pick = 'drop'");
   else if (pick === "not_dropped") where.push("(h.pick IS NULL OR h.pick = 'keep')");
+  else if (pick === "best") {
+    where.push(`h.id IN (${BEST_PICKS})`);
+    params.push(projectId, wanted);
+  }
   const folder = q("folder")?.replace(/\/+$/, "");
   if (folder) {
     where.push("(f.folder = ? OR substr(f.folder, 1, ?) = ?)");
@@ -1288,19 +1316,34 @@ function highlightFilter(projectId: string, q: (k: string) => string | undefined
 const HIGHLIGHT_COLUMNS = `h.id, h.footage_id, h.kind, h.src_in, h.src_out, h.text, h.speaker, h.score, h.reason, h.pick, h.origin,
        f.name, f.folder, f.drive_file_id, f.asset_id, f.fps, f.width, f.height, a.media_uid, a.duration`;
 
+/** `wanted` as a request gives it: a whole number of highlights, null for no number, undefined when left out. */
+function wantedOf(v: unknown): number | null | undefined | "invalid" {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  return Number.isInteger(v) && (v as number) >= 1 && (v as number) <= MAX_WANTED ? (v as number) : "invalid";
+}
+const WANTED_INVALID = `wanted is a whole number of highlights from 1 to ${MAX_WANTED}, or null for every pick worth a look`;
+
 // Ask for highlights, or ask again. Without `again`, only clips not yet read
 // (and ones that failed) are read; with it, every logged clip is read again,
 // and what a person kept or dropped stays as it is. `brief`, when given,
-// becomes the project's brief: what the video is for.
+// becomes the project's brief: what the video is for. `wanted`, when given,
+// is how many highlights the video wants (null: no number).
 app.post("/api/projects/:id/highlights", async (c) => {
   const id = c.req.param("id");
   if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
-  const b = await c.req.json<{ brief?: unknown; again?: unknown }>().catch(() => ({}) as { brief?: unknown; again?: unknown });
+  const b = await c.req
+    .json<{ brief?: unknown; again?: unknown; wanted?: unknown }>()
+    .catch(() => ({}) as { brief?: unknown; again?: unknown; wanted?: unknown });
   const brief = typeof b.brief === "string" ? b.brief.trim().slice(0, 2000) : null;
+  const wanted = wantedOf(b.wanted);
+  if (wanted === "invalid") return c.json({ error: "invalid_request", detail: WANTED_INVALID }, 400);
+  if (wanted !== undefined) await setWanted(id, wanted);
   await run(
     "UPDATE edit_projects SET highlights_at = COALESCE(highlights_at, datetime('now')), highlights_stopped_at = NULL, brief = COALESCE(?, brief) WHERE id = ?",
     [brief, id],
   );
+  // (Picks this reading finds put the best in order again, as they land.)
   await run(
     `UPDATE project_footage SET highlights_status = 'waiting', highlights_error = NULL
       WHERE project_id = ? AND status = 'ready' AND log_status = 'done'
@@ -1308,8 +1351,36 @@ app.post("/api/projects/:id/highlights", async (c) => {
     [id, b.again === true ? 1 : 0],
   );
   const pending = await highlightsPending(id);
-  const nextStepAt = pending > 0 && c.env.OPENROUTER_API_KEY ? await keepFootageMoving(c, id, "read") : null;
+  const nextStepAt = c.env.OPENROUTER_API_KEY && (await highlightsWork(id)) ? await keepFootageMoving(c, id, "read") : null;
   return c.json({ ok: true, pending, next_step_at: nextStepAt, paused: c.env.OPENROUTER_API_KEY ? null : HIGHLIGHTS_NO_KEY }, 202);
+});
+
+/** Set how many highlights a project wants; with a number, its picks wait to be put in order. */
+async function setWanted(projectId: string, wanted: number | null): Promise<void> {
+  // A person's number is put in order at once: no wait for footage still coming.
+  await run(
+    `UPDATE edit_projects SET highlights_wanted = ?, highlights_rank_error = NULL, highlights_rank_at = NULL,
+        highlights_rank_status = CASE WHEN ? IS NULL THEN NULL ELSE 'waiting' END
+      WHERE id = ?`,
+    [wanted, wanted, projectId],
+  );
+  // No number, no order: the AI editor goes back to kept first, then score.
+  if (wanted === null) await run("UPDATE footage_highlights SET rank = NULL WHERE project_id = ? AND rank IS NOT NULL", [projectId]);
+}
+
+// How many highlights the video wants, changed on its own: the picks found so
+// far are put in order again (one model call, in the background), and nothing
+// is read again. null: no number, every pick worth a look.
+app.put("/api/projects/:id/highlights/wanted", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const b = await c.req.json<{ wanted?: unknown }>().catch(() => ({}) as { wanted?: unknown });
+  const wanted = wantedOf(b.wanted);
+  if (wanted === "invalid" || wanted === undefined) return c.json({ error: "invalid_request", detail: WANTED_INVALID }, 400);
+  await setWanted(id, wanted);
+  const due = await rankingDue(id);
+  const nextStepAt = c.env.OPENROUTER_API_KEY && due ? await keepFootageMoving(c, id, "read") : null;
+  return c.json({ ok: true, wanted, next_step_at: nextStepAt, paused: due && !c.env.OPENROUTER_API_KEY ? HIGHLIGHTS_NO_KEY : null });
 });
 
 // Stop reading. Clips in line go back to how they were (read before: their
@@ -1330,21 +1401,34 @@ app.post("/api/projects/:id/highlights/stop", async (c) => {
 });
 
 // The highlights, best first by default. Filters: kind=soundbite|broll,
-// min_score=2..5, pick=open|keep|drop|not_dropped|all (default all),
+// min_score=2..5, pick=best|open|keep|drop|not_dropped|all (default all),
 // folder= (a folder and everything inside it), sort=score|clip. Pages of 100,
 // at most 1000. skipped=1 adds the clips judged not worth using, and why.
+// pick=best is the project's best `wanted`, in the order the model put them.
 app.get("/api/projects/:id/highlights", async (c) => {
   const id = c.req.param("id");
-  const project = await get<{ brief: string; highlights_at: string | null; highlights_stopped_at: string | null }>(
-    "SELECT brief, highlights_at, highlights_stopped_at FROM edit_projects WHERE id = ?",
+  const project = await get<{
+    brief: string;
+    highlights_at: string | null;
+    highlights_stopped_at: string | null;
+    highlights_wanted: number | null;
+    highlights_rank_status: string | null;
+    highlights_rank_error: string | null;
+  }>(
+    "SELECT brief, highlights_at, highlights_stopped_at, highlights_wanted, highlights_rank_status, highlights_rank_error FROM edit_projects WHERE id = ?",
     [id],
   );
   if (!project) return c.json({ error: "Not found" }, 404);
   const q = (k: string) => c.req.query(k);
-  const { where, params } = highlightFilter(id, q, "all");
+  const { where, params, pick } = highlightFilter(id, q, "all", project.highlights_wanted);
   const limit = intParam(q("limit"), 100, 1, 1000);
   const offset = intParam(q("offset"), 0, 0, 1_000_000);
-  const order = q("sort") === "clip" ? "f.folder, f.name, h.src_in" : "h.score DESC, f.folder, f.name, h.src_in";
+  const order =
+    q("sort") === "clip"
+      ? "f.folder, f.name, h.src_in"
+      : pick === "best"
+        ? "COALESCE(h.rank, 1000000000), h.score DESC, f.folder, f.name, h.src_in"
+        : "h.score DESC, f.folder, f.name, h.src_in";
   const rows = await query<HighlightListRow>(
     `SELECT ${HIGHLIGHT_COLUMNS}
        FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
@@ -1368,7 +1452,9 @@ app.get("/api/projects/:id/highlights", async (c) => {
   const pickCount = (pick: (r: { kind: string; pick: string | null }) => boolean) =>
     picks.filter(pick).reduce((sum, r) => sum + r.n, 0);
   const pending = clipCount((r) => r.highlights_status === "waiting" || r.highlights_status === "running");
-  const nextStepAt = pending > 0 && c.env.OPENROUTER_API_KEY ? await keepFootageMoving(c, id, "read") : null;
+  const rankDue = await rankingDue(id);
+  const nextStepAt = (pending > 0 || rankDue) && c.env.OPENROUTER_API_KEY ? await keepFootageMoving(c, id, "read") : null;
+  const wanted = project.highlights_wanted;
   const skipped =
     q("skipped") === "1"
       ? await query<{ id: string; name: string; folder: string; skip_reason: string; asset_id: string | null; media_uid: string | null; duration: number | null }>(
@@ -1398,8 +1484,16 @@ app.get("/api/projects/:id/highlights", async (c) => {
       kept: pickCount((r) => r.pick === "keep"),
       dropped: pickCount((r) => r.pick === "drop"),
       open: pickCount((r) => r.pick === null),
+      best: wanted ? Math.min(wanted, pickCount((r) => r.pick !== "drop")) : 0,
     },
-    paused: project.highlights_at && pending > 0 && !c.env.OPENROUTER_API_KEY ? HIGHLIGHTS_NO_KEY : null,
+    // How many the video wants (null: every pick worth a look), and where
+    // putting them in order stands: `due`, it runs on the next step; waiting
+    // and not due, footage is still coming in and it runs again shortly.
+    wanted,
+    ranking: wanted
+      ? { status: project.highlights_rank_status, error: project.highlights_rank_error, due: rankDue }
+      : null,
+    paused: project.highlights_at && (pending > 0 || rankDue) && !c.env.OPENROUTER_API_KEY ? HIGHLIGHTS_NO_KEY : null,
     next_step_at: nextStepAt,
     highlights: rows.map(highlightOut),
     next_offset: rows.length === limit ? offset + limit : null,
@@ -1487,13 +1581,14 @@ app.post("/api/projects/:id/highlights/items", async (c) => {
 
 // The highlights as a file for an editor's own software. format=csv (a sheet)
 // or xml (a Premiere Pro / DaVinci Resolve timeline). Same filters as the
-// list; by default everything not dropped.
+// list (pick=best: the project's best `wanted`); by default everything not
+// dropped.
 app.get("/api/projects/:id/highlights/export", async (c) => {
   const id = c.req.param("id");
-  const project = await get<{ name: string }>("SELECT name FROM edit_projects WHERE id = ?", [id]);
+  const project = await get<{ name: string; highlights_wanted: number | null }>("SELECT name, highlights_wanted FROM edit_projects WHERE id = ?", [id]);
   if (!project) return c.json({ error: "Not found" }, 404);
   const q = (k: string) => c.req.query(k);
-  const { where, params } = highlightFilter(id, q, "not_dropped");
+  const { where, params } = highlightFilter(id, q, "not_dropped", project.highlights_wanted);
   const rows = await query<HighlightListRow>(
     `SELECT ${HIGHLIGHT_COLUMNS}
        FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
