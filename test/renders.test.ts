@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderKey } from "../src/shared/renders";
+import { posterKeyOf, renderKey } from "../src/shared/renders";
 
 describe("renderKey", () => {
   it("recovers the storage key the export route encodes", () => {
@@ -32,5 +32,11 @@ describe("renderKey", () => {
 
   it("returns null on malformed encoding instead of throwing", () => {
     expect(renderKey("/api/uploads/%E0%A4%A")).toBeNull();
+  });
+});
+
+describe("posterKeyOf", () => {
+  it("keeps the poster beside its render, under the same prefix", () => {
+    expect(posterKeyOf("renders/edit-42-a1b2c3d4.mp4")).toBe("renders/edit-42-a1b2c3d4.jpg");
   });
 });

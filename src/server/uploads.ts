@@ -119,6 +119,10 @@ export async function serveUpload(
   });
 }
 
+export async function hasUpload(key: string): Promise<boolean> {
+  return (await _bucket.head(key)) !== null;
+}
+
 export async function getUploadBytes(key: string): Promise<ArrayBuffer | null> {
   const obj = await _bucket.get(key);
   if (!obj) return null;
