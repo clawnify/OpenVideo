@@ -86,6 +86,17 @@ const transition = z
   })
   .strict();
 
+/** A colour adjustment, each field -1..1 (0 leaves the picture alone). The
+ *  maths is in shared/adjust.ts, the same as the edit service renders. */
+const adjust = z
+  .object({
+    brightness: z.number().finite().min(-1).max(1).optional(),
+    contrast: z.number().finite().min(-1).max(1).optional(),
+    saturation: z.number().finite().min(-1).max(1).optional(),
+    temperature: z.number().finite().min(-1).max(1).optional(),
+  })
+  .strict();
+
 const mainVideo = z
   .object({
     ...clipBase,
@@ -100,6 +111,7 @@ const mainVideo = z
     fit: fit.optional(),
     anchor: anchor.optional(),
     crop: crop.optional(),
+    adjust: adjust.optional(),
     /** Seconds to fade up from black, and down to black before the clip
      *  ends; a video clip's own sound fades with it. shared/fade.ts */
     fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
@@ -116,6 +128,7 @@ const mainImage = z
     fit: fit.optional(),
     anchor: anchor.optional(),
     crop: crop.optional(),
+    adjust: adjust.optional(),
     /** Seconds to fade up from black, and down to black before the clip
      *  ends; a video clip's own sound fades with it. shared/fade.ts */
     fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
@@ -147,6 +160,7 @@ const overlayMedia = z
     /** Fraction of canvas width; height keeps the (cropped) source aspect. */
     width: z.number().finite().min(0.01).max(1),
     crop: crop.optional(),
+    adjust: adjust.optional(),
   })
   .strict();
 

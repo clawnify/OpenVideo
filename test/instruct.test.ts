@@ -80,6 +80,37 @@ describe("Ask operations", () => {
     expect(apply(d, "fade", { clip: 0 })).toHaveProperty("error");
   });
 
+  it("adjusts the colour of a clip, of every clip, and of an overlay", () => {
+    const d = edl();
+    d.overlays = [
+      {
+        id: "o",
+        elements: [
+          { id: "t", type: "text", text: "Hi", fontSize: 40, startTime: 0, duration: 2, x: 0.5, y: 0.5 },
+          { id: "l", type: "image", src: "asset:logo", startTime: 0, duration: 2, x: 0, y: 0, width: 0.2 },
+        ],
+      },
+    ];
+    expect(apply(d, "adjust_color", { clip: 0, contrast: 30, saturation: 250 })).toMatchObject({
+      said: "Set the colour of clip 0: contrast +30, saturation +100",
+    });
+    expect(d.main.elements[0].adjust).toEqual({ contrast: 0.3, saturation: 1 });
+    // Values left out stay; every clip gets the ones given.
+    expect(apply(d, "adjust_color", { every: true, temperature: -20 })).toHaveProperty("said");
+    expect(d.main.elements.map((e) => e.adjust)).toEqual([
+      { contrast: 0.3, saturation: 1, temperature: -0.2 },
+      { temperature: -0.2 },
+    ]);
+    // Back to 0 is back as shot: the field goes.
+    expect(apply(d, "adjust_color", { clip: 1, temperature: 0 })).toMatchObject({ said: "Put the colour of clip 1 back as shot" });
+    expect("adjust" in d.main.elements[1]).toBe(false);
+    expect(apply(d, "adjust_color", { track: 0, index: 1, brightness: -10 })).toHaveProperty("said");
+    expect(d.overlays[0].elements[1]).toMatchObject({ adjust: { brightness: -0.1 } });
+    expect(apply(d, "adjust_color", { track: 0, index: 0, brightness: 10 })).toHaveProperty("error");
+    expect(apply(d, "adjust_color", { clip: 0 })).toHaveProperty("error");
+    expect(apply(d, "adjust_color", { clip: 9, contrast: 10 })).toHaveProperty("error");
+  });
+
   it("joins one cut, or every cut, with a transition, and removes it with none", () => {
     const d = edl();
     d.main.elements.push({ id: "c", type: "image", src: "asset:three", duration: 3 });
