@@ -12,7 +12,8 @@ vi.mock("../src/server/db", () => ({
 }));
 
 import { DEFAULT_CAPTION_STYLE } from "../src/shared/captions";
-import { expandCaptions, resolveEdlSources } from "../src/server/export";
+import { duckLevel, envelopeGain } from "../src/shared/duck";
+import { expandSpeech, resolveEdlSources } from "../src/server/export";
 import type { Edl } from "../src/server/edl";
 
 const cfg = { servicesUrl: "https://svc.test", token: "clw_x" };
@@ -30,10 +31,30 @@ describe("exporting transitions", () => {
       },
       captions: { enabled: true, lang: "en", style: DEFAULT_CAPTION_STYLE },
     };
-    const out = await expandCaptions(edl);
+    const out = await expandSpeech(edl);
     const starts = out.overlays!.at(-1)!.elements.map((el) => el.startTime);
     // b still starts at 4 s, with the dissolve centred on that cut; its cue 0.5 s in
     expect(starts).toEqual([0.5, 4.5]);
+  });
+
+  it("dips music under speech where the preview places it: a transition moves no clip", async () => {
+    const edl: Edl = {
+      version: 1,
+      output: { width: 1280, height: 720, fps: 30 },
+      main: {
+        elements: [
+          { id: "a", type: "video", src: "asset:one", duration: 4 },
+          { id: "b", type: "video", src: "asset:two", duration: 4, transition: { type: "dissolve", duration: 1 } },
+        ],
+      },
+      audio: [{ id: "m", elements: [{ id: "song", src: "asset:song", startTime: 0, duck: 12 }] }],
+    };
+    const out = await expandSpeech(edl);
+    const points = out.audio![0].elements[0].envelope!;
+    // speech at 0.5-1.5 s (a) and 4.5-5.5 s (b, still at 4 s): low there, full between
+    expect(envelopeGain(points, 1)).toBeCloseTo(duckLevel(12));
+    expect(envelopeGain(points, 5)).toBeCloseTo(duckLevel(12));
+    expect(envelopeGain(points, 3)).toBe(1);
   });
 
   it("leaves a transition off the first clip, where there is nothing to come in from", async () => {

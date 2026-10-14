@@ -14,6 +14,8 @@ import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { drawnStroke } from "../shared/outline";
 import { captionText, captionTimeline, type PlacedClip } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
+import { duckEnvelope, speechSpans } from "../shared/duck";
+import { heardFor } from "../shared/fade";
 import { layOut } from "../shared/transition";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
@@ -137,7 +139,7 @@ export async function resolveEdlSources(
   edl: Edl,
   cfg: ExportConfig,
 ): Promise<{ edl: Edl } | { failure: ExportFailure }> {
-  edl = await expandCaptions(edl);
+  edl = await expandSpeech(edl);
   const staged = new Map<string, string>();
   // Several at a time: one after another, a cut of twenty clips spent most of
   // an export's request here, long enough for a phone to lock and drop it.
@@ -171,16 +173,21 @@ function dropLeadTransition(edl: Edl): Edl {
 }
 
 /**
- * Turn project captions into ordinary text on their own track, and drop the
- * `captions` block the render service does not know. Captions are worked out
- * from each clip's stored transcript and the part of it the clip plays, the
- * same way the preview works them out.
+ * Work out what comes from the clips' transcripts: captions become ordinary
+ * text on their own track, and a ducked audio clip gets a volume envelope
+ * that dips under speech. Then drop the two settings the render service does
+ * not know. Both are worked out from each clip's stored transcript and the
+ * part of it the clip plays, the same way the preview works them out.
  */
-export async function expandCaptions(edl: Edl): Promise<Edl> {
+export async function expandSpeech(edl: Edl): Promise<Edl> {
   const { captions, ...rest } = edl;
-  if (!captions?.enabled) return rest as Edl;
+  const ducked = (edl.audio ?? []).some((t) => t.elements.some((el) => el.duck));
+  if (!captions?.enabled && !ducked) return rest as Edl;
+  const lang = captions?.lang ?? "en";
 
   const placed: PlacedClip[] = [];
+  /** The clips whose own sound is in the mix: only their speech ducks the music. */
+  const heard: PlacedClip[] = [];
   const cues = new Map<string, Cue[]>();
   const lengths: number[] = [];
   for (const el of edl.main.elements) {
@@ -192,27 +199,56 @@ export async function expandCaptions(edl: Edl): Promise<Edl> {
     lengths.push(Math.max(0, plays ?? 0));
   }
   // Where each clip sits, in the whole frames the preview and the render use.
-  const { placed: at } = layOut(lengths, edl.main.elements.map((el) => el.transition), edl.output.fps);
+  const { placed: at, total } = layOut(lengths, edl.main.elements.map((el) => el.transition), edl.output.fps);
   for (const [i, el] of edl.main.elements.entries()) {
     if (el.type === "video" && el.src.startsWith("asset:")) {
-      placed.push({ src: el.src, start: at[i].start, dur: at[i].dur, trimStart: el.trimStart ?? 0 });
+      const clip = { src: el.src, start: at[i].start, dur: at[i].dur, trimStart: el.trimStart ?? 0 };
+      placed.push(clip);
+      if (el.sourceAudio !== false && (el.volume ?? 1) > 0) heard.push(clip);
       if (!cues.has(el.src)) {
         const row = await get<{ transcript: string | null; transcript_lang: string | null }>(
           "SELECT transcript, transcript_lang FROM assets WHERE id = ?",
           [el.src.slice(6)],
         );
-        if (row?.transcript && row.transcript_lang === captions.lang) cues.set(el.src, parseVtt(row.transcript));
+        if (row?.transcript && row.transcript_lang === lang) cues.set(el.src, parseVtt(row.transcript));
       }
     }
   }
 
+  let out = rest as Edl;
+  if (ducked) out = await duckAudio(out, speechSpans(heard, cues), total);
+  if (!captions?.enabled) return out;
   const lines = captionTimeline(placed, cues, captions.style.maxChars);
-  if (lines.length === 0) return rest as Edl;
+  if (lines.length === 0) return out;
   const track = {
     id: "captions",
     elements: lines.map((line, n) => captionText(line, captions.style, edl.output, `caption-${n}`)),
   };
-  return { ...rest, overlays: [...(rest.overlays ?? []), track] } as Edl;
+  return { ...out, overlays: [...(out.overlays ?? []), track] };
+}
+
+/** Swap each audio clip's `duck` for the envelope that dips it under `spans`. */
+async function duckAudio(edl: Edl, spans: ReturnType<typeof speechSpans>, total: number): Promise<Edl> {
+  const audio = [];
+  for (const track of edl.audio ?? []) {
+    const elements = [];
+    for (const { duck, ...el } of track.elements) {
+      if (!duck || spans.length === 0) {
+        elements.push(el);
+        continue;
+      }
+      let dur = el.duration;
+      if (dur === undefined && el.src.startsWith("asset:")) {
+        const row = await get<{ duration: number | null }>("SELECT duration FROM assets WHERE id = ?", [el.src.slice(6)]);
+        dur = row?.duration ? row.duration - (el.trimStart ?? 0) - (el.trimEnd ?? 0) : undefined;
+      }
+      // An unknown length is heard to the end of the cut, at most.
+      const envelope = duckEnvelope(spans, { startTime: el.startTime, heard: heardFor(el.startTime, dur ?? total, total) }, duck);
+      elements.push(envelope.length ? { ...el, envelope } : el);
+    }
+    audio.push({ ...track, elements });
+  }
+  return { ...edl, audio } as Edl;
 }
 
 /**
