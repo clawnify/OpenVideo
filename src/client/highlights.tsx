@@ -15,6 +15,7 @@ import {
   Loader2,
   Plus,
   RotateCcw,
+  Pencil,
   Sparkles,
   Square,
   Star,
@@ -728,10 +729,10 @@ function Progress({
               setEditing(true);
             }}
             disabled={busy}
-            className={btnGhost}
-            title="Change the brief if you like, then read every clip again. What you kept or dropped stays as it is."
+            className={btnSecondary}
+            title="Edit the prompt before finding highlights again. What you kept or dropped stays as it is."
           >
-            <RotateCcw className="w-3.5 h-3.5" /> Find again
+            <Pencil className="w-3.5 h-3.5" /> Edit prompt
           </button>
         )}
       </div>
