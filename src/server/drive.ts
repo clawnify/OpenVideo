@@ -9,7 +9,17 @@
 // token, and the code is the same whoever holds the credential. A file comes
 // back as a short-lived link to its bytes, at most 250 MB in one answer.
 
-import { connect, describe, type ConnectionsEnv } from "@clawnify/connections";
+import { accounts, connect, describe, type ConnectionsEnv } from "@clawnify/connections";
+
+/** Bound our wait even when the credentials RPC cannot accept an AbortSignal.
+ * The remote staging call is read-only and size-bounded; a late answer is ignored. */
+export async function driveDeadline<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let abort!: () => void;
+  const timeout = new Promise<never>((_, reject) => { abort = () => reject(new Error("Drive request timed out")); signal.addEventListener("abort", abort, { once: true }); });
+  try { return await Promise.race([work, timeout]); }
+  finally { signal.removeEventListener("abort", abort); }
+}
 
 // Google Drive comes first: it is the connection a studio makes for its files.
 const SERVICES = ["googledrive", "googlesuper"] as const;
@@ -97,6 +107,42 @@ async function requireDriveService(env: ConnectionsEnv): Promise<Service> {
 export async function driveStatus(env: ConnectionsEnv): Promise<{ connected: boolean; service: Service | null }> {
   const service = await driveService(env);
   return { connected: service !== null, service };
+}
+
+export interface DriveImportSource {
+  service: DriveService;
+  account: string | null;
+  fileId: string;
+  version: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  duration: number | null;
+  canDownload: boolean;
+}
+
+/** Snapshot the connection and monotonic file version. A changed source is
+ * rejected before publishing, so resumed pieces can never mix file versions. */
+export async function driveImportSource(
+  env: ConnectionsEnv, fileId: string, selected?: Pick<DriveImportSource, "service" | "account">,
+): Promise<DriveImportSource> {
+  const service = selected?.service ?? await requireDriveService(env);
+  const account = selected ? selected.account : (await accounts(service, env)).find((a) => a.isDefault)?.account ?? null;
+  const meta = await driveDeadline(connect(service, env, { account: account ?? undefined }).rawRequest({
+    method: "GET", endpoint: `${DRIVE_API[service]}/files/${encodeURIComponent(fileId)}`,
+    parameters: [
+      { name: "fields", value: "name,mimeType,size,version,capabilities(canDownload),videoMediaMetadata(durationMillis)", in: "query" },
+      { name: "supportsAllDrives", value: "true", in: "query" },
+    ],
+  }), AbortSignal.timeout(20_000)) as {
+    name?: string; mimeType?: string; size?: string; version?: string;
+    capabilities?: { canDownload?: boolean }; videoMediaMetadata?: { durationMillis?: string };
+  };
+  const duration = Number(meta.videoMediaMetadata?.durationMillis) / 1000;
+  return { service, account, fileId, version: meta.version ?? "", name: meta.name ?? fileId,
+    mimeType: meta.mimeType ?? "application/octet-stream", size: Number(meta.size),
+    duration: Number.isFinite(duration) && duration > 0 ? duration : null,
+    canDownload: meta.capabilities?.canDownload === true };
 }
 
 /**
@@ -286,10 +332,11 @@ export async function driveFilePiece(
   start: number,
   end: number,
   signal: AbortSignal,
+  account?: string | null,
 ): Promise<Response | null> {
   let file;
   try {
-    file = await connect(service, env).rawFile({
+    file = await driveDeadline(connect(service, env, { account: account ?? undefined }).rawFile({
       method: "GET",
       endpoint: `${DRIVE_API[service]}/files/${encodeURIComponent(fileId)}`,
       parameters: [
@@ -297,7 +344,7 @@ export async function driveFilePiece(
         { name: "supportsAllDrives", value: "true", in: "query" },
         { name: "Range", value: `bytes=${start}-${end}`, in: "header" },
       ],
-    });
+    }), signal);
   } catch (e) {
     const status = /^\w+ (\d{3}):/.exec(e instanceof Error ? e.message : String(e))?.[1];
     return status ? new Response(null, { status: Number(status) }) : null;

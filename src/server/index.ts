@@ -30,9 +30,11 @@ import {
   driveRemove,
   driveFolderName,
   driveStatus,
+  driveImportSource,
   listDriveFiles,
   withinFolder,
 } from "./drive";
+import { createImport, listImports, readImport, importView, cancelImport, retryImport, stepImport, ImportError } from "./drive-imports";
 import { parseDriveLink, type FolderVideo } from "./drive-link";
 import { addFolderVideos, bookStep, readFolder, removeCopy, stepFootage, type DriveSource, type StepOutcome } from "./footage";
 import { HIGHLIGHTS_NO_KEY, MAX_WANTED, highlightsPending, rankingDue, stepHighlights, type HighlightKind } from "./highlights";
@@ -178,7 +180,9 @@ const UPLOAD_EXPIRED_HOURS = 7;
  */
 async function sweepUploads(env: Bindings): Promise<void> {
   const stale = await query<MediaUpload>(
-    `SELECT * FROM media_uploads WHERE created_at < datetime('now', ?) ORDER BY created_at LIMIT 5`,
+    `SELECT * FROM media_uploads u WHERE created_at < datetime('now', ?)
+     AND NOT EXISTS (SELECT 1 FROM drive_imports j WHERE j.upload_uid=u.uid)
+     ORDER BY created_at LIMIT 5`,
     [`-${UPLOAD_SETTLE_MINUTES} minutes`],
   );
   for (const up of stale) {
@@ -228,6 +232,7 @@ app.post("/api/assets/uploads", async (c) => {
 app.post("/api/assets/media", async (c) => {
   const b = await c.req.json<{ uid?: string }>().catch(() => ({}) as { uid?: string });
   if (!b.uid || !MEDIA_UID.test(b.uid)) return c.json({ error: "invalid_request", detail: "uid is required" }, 400);
+  if (await get("SELECT 1 FROM drive_imports WHERE upload_uid=?", [b.uid])) return c.json({ error: "This upload belongs to a Drive import." }, 409);
   const asset = await promoteUpload(b.uid);
   if (!asset) return c.json({ error: "not_found", detail: "no upload with that id was opened here" }, 404);
   return c.json(asset, 201);
@@ -238,6 +243,7 @@ app.post("/api/assets/media", async (c) => {
 // DELETE /api/assets/:id, which checks the projects first.
 app.delete("/api/assets/uploads/:uid", async (c) => {
   const uid = c.req.param("uid");
+  if (await get("SELECT 1 FROM drive_imports WHERE upload_uid=?", [uid])) return c.json({ error: "Cancel this upload from its Drive import." }, 409);
   if (!MEDIA_UID.test(uid) || !(await get<MediaUpload>("SELECT uid FROM media_uploads WHERE uid = ?", [uid]))) {
     return c.json({ error: "not_found", detail: "no open upload with that id" }, 404);
   }
@@ -317,6 +323,17 @@ app.post("/api/drive/import", async (c) => {
     return c.json({ error: `that file is outside ${limit.name}` }, 403);
   }
 
+  try {
+    const source = await driveImportSource(c.env, b.fileId);
+    if (source.mimeType.startsWith("video/")) {
+      return c.json({ import: await createImport(c.env, new URL(c.req.url).origin, source) }, 202);
+    }
+  } catch (e) {
+    if (e instanceof ImportError) return c.json({ error: e.code, detail: e.message }, e.code === "queue_unavailable" ? 503 : 422);
+    return c.json({ error: "import_unavailable", detail: "Could not start the import. Check your Drive connection and try again." }, 503);
+  }
+
+  // Images and audio keep the existing synchronous import contract.
   // Through the connection's Drive API. A file over what one answer carries
   // (250 MB) takes the broker's download action instead: nothing here reads
   // a library import in pieces.
@@ -349,6 +366,36 @@ app.post("/api/drive/import", async (c) => {
   );
   const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
   return c.json(row, 201);
+});
+
+app.get("/api/drive/imports", async (c) => c.json({ imports: await listImports(c.env, new URL(c.req.url).origin) }));
+app.get("/api/drive/imports/:id", async (c) => {
+  const row = await readImport(c.req.param("id"));
+  return row ? c.json(importView(row)) : c.json({ error: "not_found" }, 404);
+});
+app.post("/api/drive/imports/:id/cancel", async (c) => {
+  const row = await cancelImport(c.env, new URL(c.req.url).origin, c.req.param("id"));
+  return row ? c.json(row) : c.json({ error: "not_found" }, 404);
+});
+app.post("/api/drive/imports/:id/retry", async (c) => {
+  try {
+    const row = await retryImport(c.env, new URL(c.req.url).origin, c.req.param("id"));
+    return row ? c.json(row) : c.json({ error: "not_found" }, 404);
+  } catch (e) {
+    return c.json({ error: e instanceof ImportError ? e.code : "retry_unavailable", detail: e instanceof ImportError ? e.message : "The previous upload is still being cleaned up. Try again shortly." }, 409);
+  }
+});
+// Public only at the perimeter. No transfer or state access without a valid
+// queue signature; the signature covers the whole body and expires in minutes.
+app.post("/api/drive/imports/step", async (c) => {
+  const raw = await c.req.text();
+  if (!(await verifyDelivery(raw, { signature: c.req.header("X-Queue-Signature"), timestamp: c.req.header("X-Queue-Timestamp"), keyId: c.req.header("X-Queue-Key-Id") }))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const body = JSON.parse(raw) as { import_id?: unknown };
+  if (typeof body.import_id !== "string") return c.json({ error: "invalid_request" }, 400);
+  await stepImport(c.env, new URL(c.req.url).origin, body.import_id);
+  return c.json({ ok: true });
 });
 
 /**

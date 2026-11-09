@@ -17,6 +17,8 @@ const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 export interface MediaConfig {
   servicesUrl?: string;
   token?: string;
+  /** Background steps must not keep a lease alive on an unbounded HTTP call. */
+  timeoutMs?: number;
 }
 
 export interface MediaFailure {
@@ -67,6 +69,7 @@ async function call<T>(
   }
   const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/media${path}`, {
     ...init,
+    signal: init.signal ?? (cfg.timeoutMs ? AbortSignal.timeout(cfg.timeoutMs) : undefined),
     headers: {
       Authorization: `Bearer ${cfg.token}`,
       ...(init.body ? { "Content-Type": "application/json" } : {}),

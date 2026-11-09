@@ -189,13 +189,15 @@ export async function relayPieces(
   readers: PieceReader[],
   until: number,
   progress: (received: number) => Promise<void>,
+  maxPieces = Number.POSITIVE_INFINITY,
 ): Promise<RelayResult> {
   let at = await uploadOffset(upload.url);
   if (at === "gone") return { state: "gone" };
   if (at === null) return { state: "moving" };
   let contentType = "video/mp4";
   let first = 0;
-  while (at < upload.size && Date.now() < until) {
+  let pieces = 0;
+  while (at < upload.size && Date.now() < until && pieces++ < maxPieces) {
     const piece = nextPiece(at, upload.size)!;
     // One signal cuts both ends of the piece: the read from Drive and the send.
     const cut = new AbortController();

@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "deploy": "clawnify deploy",
     "test": "vitest run",
-    "test:e2e": "esbuild src/server/index.ts --bundle --format=esm --platform=node --outfile=test/e2e/.server.mjs --log-level=warning && node --no-warnings test/e2e/run.mjs ./.server.mjs schema.sql"
+    "test:e2e": "esbuild src/server/index.ts --bundle --format=esm --platform=node --outfile=test/e2e/.server.mjs --log-level=warning && node --no-warnings test/e2e/run.mjs ./.server.mjs schema.sql && node --no-warnings test/e2e/drive-imports.mjs"
   },
   "dependencies": {
     "@clawnify/app": "^0.2.1",

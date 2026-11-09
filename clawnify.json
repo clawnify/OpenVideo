@@ -19,6 +19,7 @@
   },
   "api": {
     "public_routes": [
+      { "path": "/api/drive/imports/step", "methods": ["POST"] },
       { "path": "/s/**", "methods": ["GET", "HEAD"] },
       { "path": "/api/footage/step", "methods": ["POST"] }
     ],

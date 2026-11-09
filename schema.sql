@@ -243,3 +243,35 @@ ALTER TABLE edit_projects ADD COLUMN highlights_rank_at TEXT;
 -- A pick's place in that order, 1 the best. The best are the kept picks,
 -- then the first in this order; NULL: not placed yet.
 ALTER TABLE footage_highlights ADD COLUMN rank INTEGER;
+
+-- Standalone library imports. Upload URLs are private capabilities, never API output.
+CREATE TABLE IF NOT EXISTS drive_imports (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL,
+  service TEXT NOT NULL,
+  account TEXT,
+  source_version TEXT NOT NULL,
+  name TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  duration REAL,
+  state TEXT NOT NULL DEFAULT 'queued',
+  received INTEGER NOT NULL DEFAULT 0,
+  upload_uid TEXT,
+  upload_url TEXT,
+  upload_expires_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0,
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  cleanup_pending INTEGER NOT NULL DEFAULT 0,
+  error_code TEXT,
+  asset_id TEXT,
+  next_step_at INTEGER NOT NULL DEFAULT 0,
+  lease_token TEXT,
+  lease_until INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS drive_imports_active_file ON drive_imports(file_id)
+  WHERE state IN ('queued', 'uploading', 'processing', 'cancelling');
+CREATE INDEX IF NOT EXISTS drive_imports_due ON drive_imports(state, next_step_at);

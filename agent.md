@@ -213,7 +213,11 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
 | GET  | `/api/drive` | Whether Google Drive is connected: `{ connected }` |
 | GET  | `/api/drive/files?kind=media\|audio&q=&page=` | Search the org's Drive, newest first → `{ files, nextPageToken }` |
-| POST | `/api/drive/import` | `{ fileId, duration? }` brings a Drive file into the library → the asset |
+| POST | `/api/drive/import` | `{ fileId, duration? }`: videos return HTTP 202 `{ import }`; images/audio return the asset. Poll the job until ready, then use its `asset_id` |
+| GET | `/api/drive/imports` | Active imports first, then recent history (at most 40); reopening repairs missed scheduling without transferring bytes |
+| GET | `/api/drive/imports/{id}` | One import: state, byte progress, safe error and result `asset_id`; never an upload URL |
+| POST | `/api/drive/imports/{id}/cancel` | Stop an unfinished import and clean up its upload in the background |
+| POST | `/api/drive/imports/{id}/retry` | Retry a failed import after cleanup, retaining its job ID; a changed Drive file needs a new import |
 | GET  | `/api/assets/{id}/source` | The asset's bytes, wherever they live (a redirect) |
 | GET  | `/api/assets/{id}/playback` | For long footage: `{ ready, hls, thumbnail, duration }` |
 | GET  | `/api/assets/{id}/frame?t=` | One frame of long footage, as an image |
@@ -523,3 +527,15 @@ link gets a new address.
 4. Adjust with read → transform → `PUT`, fixing anything validation points at.
 5. Export `draft` to review, then `high` for the final. To send it to someone
    outside the workspace, turn on the share link and give them its `url`.
+
+### Importing library videos from Drive
+
+Use the picker/import API, never a whole-file download action or a public sharing
+change. Video imports keep running after the tab closes; poll their status and
+wait for `ready` before putting `asset_id` on a timeline. Repeated clicks reuse
+an active import. Up to four imports can be queued per app, two transferring at
+once. The original must remain accessible and unchanged until import completes.
+Limits: 30 GB and four hours. Transfer and processing consume the workspace's
+video storage; this path does not request footage analysis or spend AI credits.
+An import in `failed` keeps cleanup work until its upload is deleted. Retry once
+cleanup completes; for `source_changed`, start a new import of the updated file.

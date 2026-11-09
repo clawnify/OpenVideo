@@ -190,3 +190,23 @@ describe("a piece through the connection", () => {
     expect(await driveFilePiece(c.env, "googledrive", "clip_id_0000", 0, 15, signal)).toBeNull();
   });
 });
+
+describe("durable import source and deadlines", () => {
+  it("captures the source version and download capability through the selected connection", async () => {
+    const { driveImportSource } = await import("../src/server/drive");
+    const c = connection("googlesuper", () => ok({ name: "talk.mp4", mimeType: "video/mp4", size: "9452386420", version: "16", capabilities: { canDownload: true }, videoMediaMetadata: { durationMillis: "1506160" } }));
+    const source = await driveImportSource(c.env, "private_video_123", { service: "googlesuper", account: "selected-account" });
+    expect(source).toMatchObject({ service: "googlesuper", account: "selected-account", version: "16", size: 9452386420, canDownload: true, duration: 1506.16 });
+    expect(c.sent[0].endpoint).toBe("/drive/v3/files/private_video_123");
+    expect(param(c.sent[0], "fields")).toContain("capabilities(canDownload)");
+  });
+  it("stops awaiting a hung staging RPC when the piece deadline expires", async () => {
+    const c = connection("googledrive", () => ok({}));
+    c.env.CREDENTIALS.proxyRequest = () => new Promise(() => {});
+    const controller = new AbortController();
+    const fetching = vi.fn(); vi.stubGlobal("fetch", fetching);
+    const piece = driveFilePiece(c.env, "googledrive", "private_video_123", 0, 1023, controller.signal);
+    controller.abort();
+    expect(await piece).toBeNull(); expect(fetching).not.toHaveBeenCalled();
+  });
+});
