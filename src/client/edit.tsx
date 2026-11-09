@@ -1901,7 +1901,7 @@ function LeftPanel({
             {driveOpen && (
               <DriveDialog
                 kind={tab === "audio" ? "audio" : "media"}
-                onImported={(a) => setAssets((prev) => [a, ...prev])}
+                onImported={(a) => setAssets((prev) => [a, ...prev.filter((item) => item.id !== a.id)])}
                 onClose={closeDrive}
               />
             )}
@@ -2744,6 +2744,18 @@ function CaptionsPanel({
   );
 }
 
+interface DriveImportJob {
+  id: string; file_id: string; name: string;
+  state: "queued" | "uploading" | "processing" | "ready" | "failed" | "cancelling" | "cancelled";
+  received: number; size: number; asset_id: string | null;
+  error: { code: string; message: string } | null;
+}
+const IMPORT_LABEL: Record<DriveImportJob["state"], string> = {
+  queued: "Queued", uploading: "Importing", processing: "Processing video", ready: "In your library",
+  failed: "Import failed", cancelling: "Cancelling", cancelled: "Cancelled",
+};
+const importActive = (j: DriveImportJob) => ["queued", "uploading", "processing", "cancelling"].includes(j.state);
+
 /** Search the org's Google Drive and copy picked files into the library. */
 function DriveDialog({
   kind,
@@ -2765,6 +2777,32 @@ function DriveDialog({
   const [picked, setPicked] = useState<DriveFile | null>(null);
   const [importing, setImporting] = useState<string | null>(null);
   const [imported, setImported] = useState<Set<string>>(new Set());
+  const [imports, setImports] = useState<DriveImportJob[]>([]);
+  const delivered = useRef(new Set<string>());
+  const onAsset = useRef(onImported);
+  onAsset.current = onImported;
+  const refreshImports = useCallback(async () => {
+    const r = await api.get<{ imports: DriveImportJob[] }>("/api/drive/imports");
+    setImports(r.imports);
+    const ready = r.imports.filter((j) => j.state === "ready" && j.asset_id && !delivered.current.has(j.id));
+    if (ready.length) {
+      const assets = await api.get<Asset[]>("/api/assets");
+      for (const j of ready) {
+        const asset = assets.find((a) => a.id === j.asset_id);
+        if (asset) { onAsset.current(asset); delivered.current.add(j.id); setImported((cur) => new Set(cur).add(j.file_id)); }
+      }
+    }
+  }, []);
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try { await refreshImports(); } catch { /* a transient poll failure does not stop the import */ }
+      if (!stopped) timer = setTimeout(poll, 5000);
+    };
+    void poll();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [refreshImports]);
   const [savingFolder, setSavingFolder] = useState(false);
   const [err, setErr] = useState("");
 
@@ -2843,17 +2881,29 @@ function DriveDialog({
     setImporting(f.id);
     setErr("");
     try {
-      const asset = await api.send<Asset>("POST", "/api/drive/import", {
+      const result = await api.send<Asset | { import: DriveImportJob }>("POST", "/api/drive/import", {
         fileId: f.id,
         ...(f.duration ? { duration: f.duration } : {}),
       });
-      onImported(asset);
-      setImported((cur) => new Set(cur).add(f.id));
+      if ("import" in result) {
+        setImports((cur) => [result.import, ...cur.filter((j) => j.id !== result.import.id)]);
+      } else {
+        onImported(result);
+        setImported((cur) => new Set(cur).add(f.id));
+      }
     } catch (e) {
       setErr(`${f.name}: ${String((e as Error).message)}`);
     } finally {
       setImporting(null);
     }
+  };
+
+  const actOnImport = async (job: DriveImportJob, action: "cancel" | "retry") => {
+    setErr("");
+    try {
+      await api.send("POST", `/api/drive/imports/${job.id}/${action}`);
+      await refreshImports();
+    } catch (e) { setErr(String((e as Error).message)); }
   };
 
   const kindIcon = (t: string) =>
@@ -2889,6 +2939,31 @@ function DriveDialog({
         </p>
       ) : (
         <div className="mt-4">
+          {imports.length > 0 && (
+            <section aria-label="Drive imports" className="mb-3 space-y-2">
+              <p className="text-fine text-muted">Imports continue when you close this window.</p>
+              {imports.filter((j) => j.state !== "cancelled").slice(0, 8).map((job) => (
+                <div key={job.id} className="rounded-sm bg-surface-sunken p-2 space-y-1">
+                  <div className="flex items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-fine break-words">{job.name}</div>
+                      <div className={job.state === "failed" ? "text-fine text-danger" : "text-fine text-muted"}>
+                        {IMPORT_LABEL[job.state]}{job.state === "uploading" ? ` · ${fmtBytes(job.received)} of ${fmtBytes(job.size)}` : ""}
+                      </div>
+                    </div>
+                    {importActive(job) && job.state !== "cancelling" && (
+                      <button className={btnGhost} onClick={() => actOnImport(job, "cancel")} aria-label={`Cancel import of ${job.name}`}>Cancel</button>
+                    )}
+                    {job.state === "failed" && (
+                      <button className={btnGhost} onClick={() => actOnImport(job, "retry")} aria-label={`Retry import of ${job.name}`}>Retry</button>
+                    )}
+                  </div>
+                  {job.state === "uploading" && <progress className="w-full h-1" value={job.received} max={job.size} aria-label={`Import progress for ${job.name}`} />}
+                  {job.error && <p className="text-fine text-danger break-words">{job.error.message}</p>}
+                </div>
+              ))}
+            </section>
+          )}
           {/* Where you are, and the org's one folder rule. */}
           <div className="flex items-center gap-2 mb-2 min-h-7">
             <nav className="flex items-center gap-1 min-w-0 flex-1 text-fine text-muted">
@@ -3036,7 +3111,7 @@ function DriveDialog({
                   ) : (
                     <button
                       onClick={() => importFile(picked)}
-                      disabled={importing !== null}
+                      disabled={importing !== null || imports.some((j) => j.file_id === picked.id && importActive(j))}
                       className={`${btnPrimary} ${stretch}`}
                     >
                       {importing === picked.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
@@ -3044,7 +3119,7 @@ function DriveDialog({
                     </button>
                   )}
                   {importing === picked.id && (
-                    <div className="text-fine text-muted">Copying from Drive, this takes a moment for long videos…</div>
+                    <div className="text-fine text-muted">Starting the import…</div>
                   )}
                 </div>
               </>
