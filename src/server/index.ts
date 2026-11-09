@@ -1,3 +1,4 @@
+import { reframing } from "./reframe";
 import { backfillHighlights, libraryHighlights } from "./library-highlights";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { initDB, query, get, run } from "./db";
@@ -72,6 +73,7 @@ const init: MiddlewareHandler<{ Bindings: Bindings }> = async (c, next) => {
 app.use("/api/*", init);
 app.use("/s/*", init);
 app.route("/api/highlights", libraryHighlights);
+app.route("/api/reframe", reframing);
 
 app.onError((err, c) => {
   if (err.message.includes("source_unavailable")) return c.json({ error: "source_unavailable", detail: "A video in this edit was removed or is being deleted. Refresh the library before saving." }, 409);

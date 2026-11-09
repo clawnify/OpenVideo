@@ -362,3 +362,21 @@ BEGIN
     FROM edit_projects WHERE creation_batch = NEW.creation_batch
   ) WHERE request_id = NEW.creation_batch AND result IS NULL;
 END;
+
+-- Shared advice is source-time data; chosen framing stays on each editable clip.
+CREATE TABLE IF NOT EXISTS video_reframes (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  source_start REAL NOT NULL,
+  source_end REAL NOT NULL,
+  status TEXT NOT NULL,
+  attempt TEXT NOT NULL,
+  job_id TEXT,
+  result TEXT,
+  error TEXT,
+  width INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(asset_id, revision, source_start, source_end)
+);

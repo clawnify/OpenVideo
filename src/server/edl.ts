@@ -100,6 +100,7 @@ const mainVideo = z
     fit: fit.optional(),
     anchor: anchor.optional(),
     crop: crop.optional(),
+    split: z.object({ top: crop, bottom: crop }).strict().optional(),
     /** Seconds to fade up from black, and down to black before the clip
      *  ends; a video clip's own sound fades with it. shared/fade.ts */
     fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),

@@ -1,3 +1,4 @@
+import { ReframeDialog } from "./reframe";
 // Footage edit projects — the timeline editor over EDL documents.
 //
 // Layout (the classic four-region editor grid): left rail (Media / Audio /
@@ -197,6 +198,7 @@ interface MainVideo {
   anchor?: Anchor;
   /** The part of the source kept, cut out before fitting (shared/crop.ts). */
   crop?: Crop;
+  split?: { top: Crop; bottom: Crop };
   /** Seconds to fade from and to black (shared/fade.ts). */
   fadeIn?: number;
   fadeOut?: number;
@@ -1100,6 +1102,7 @@ export function EditEditor({
   const [playing, setPlaying] = useState(false);
   const [playhead, setPlayhead] = useState(0);
   const [autocutOpen, setAutocutOpen] = useState(false);
+  const [reframeOpen, setReframeOpen] = useState(false);
   const [askOpen, setAskOpen] = useState(false);
   const playheadRef = useRef(0);
   // While a video is playing it IS the clock: the wall clock only fills in
@@ -1483,6 +1486,7 @@ export function EditEditor({
         >
           <Sparkles className="w-4 h-4" /> <span className="hidden sm:inline">Auto-cut</span>
         </button>
+        <span className="hidden lg:contents"><button className={btnSecondary} disabled={!edl.main.elements.some(e=>e.type==="video")} onClick={()=>{setPlaying(false);setReframeOpen(true);}}><Sparkles className="w-4 h-4" /> AI reframe</button></span>
         <ShareControl projectId={initial.id} />
         <ExportControls projectId={initial.id} disabled={dirty.current || edl.main.elements.length === 0} />
       </div>
@@ -1509,8 +1513,10 @@ export function EditEditor({
             </button>
           ))}
         </div>
+        <button className={`${btnSecondary} ml-auto`} disabled={!edl.main.elements.some(e=>e.type==="video")} onClick={()=>{setPlaying(false);setReframeOpen(true);}}>AI reframe</button>
       </div>
 
+      {reframeOpen && <ReframeDialog edl={edl} assets={assets} selected={sel?.area==="main" && edl.main.elements[sel.i]?.type==="video" ? sel.i : edl.main.elements.findIndex(e=>e.type==="video")} onClose={()=>setReframeOpen(false)} onApply={next=>{commit(next);setSel(null);}} />}
       {askOpen && (
         <AskDialog
           projectId={initial.id}
@@ -3246,7 +3252,7 @@ function Player({
   // A cropped clip is placed from its source's own size (shared/crop.ts).
   const cropped: Asset[] = [];
   for (const el of [...edl.main.elements, ...(edl.overlays ?? []).flatMap((t) => t.elements)]) {
-    const a = el.type !== "text" && el.crop ? resolveAsset(el.src) : undefined;
+    const a = el.type !== "text" && (el.crop || ("split" in el && el.split)) ? resolveAsset(el.src) : undefined;
     if (a) cropped.push(a);
   }
   const shapes = useShapes(cropped);
@@ -3300,7 +3306,7 @@ function Player({
   const dueRef = useRef<() => HTMLMediaElement[]>(() => []);
   dueRef.current = () => {
     const out: (HTMLMediaElement | undefined)[] = [];
-    for (const seg of segments) if (seg.el.type === "video" && live(seg)) out.push(videoRefs.current.get(seg.el.id));
+    for (const seg of segments) if (seg.el.type === "video" && live(seg)) { out.push(videoRefs.current.get(seg.el.id)); if(seg.el.split) out.push(videoRefs.current.get(`${seg.el.id}:bottom`)); }
     for (const track of edl.overlays ?? []) {
       if (track.hidden) continue;
       for (const el of track.elements) {
@@ -3330,7 +3336,8 @@ function Player({
     // Waiting for media to load, everything holds where it is, together.
     const going = playing && !waiting;
     for (const seg of segments) {
-      const v = videoRefs.current.get(seg.el.id);
+      for (const view of seg.el.type === "video" && seg.el.split ? [seg.el.id, `${seg.el.id}:bottom`] : [seg.el.id]) {
+      const v = videoRefs.current.get(view);
       if (!v || seg.el.type !== "video") continue;
       if (live(seg)) {
         // In a transition a clip plays past its trims. Where its source has
@@ -3343,7 +3350,7 @@ function Player({
         // Playing, the video leads and needs no correction; only a real jump
         // (a scrub, or a cut to another clip) is worth a seek, because each
         // one empties the buffer. Paused, follow the playhead closely.
-        if (seg === active) {
+        if (seg === active && view === seg.el.id) {
           // The clip the clock follows needs no correction while it plays.
           const jumped = Math.abs(v.currentTime - wanted) > (going && !hold ? 0.75 : 0.05);
           if (jumped && !v.seeking) v.currentTime = wanted;
@@ -3351,7 +3358,7 @@ function Player({
           follow(v, wanted, going && !hold);
         }
         v.volume = Math.min(1, Math.min(1, seg.el.volume ?? 1) * fadeGain(seg.el, seg.dur, t - seg.start) * crossGain(seg));
-        v.muted = seg.el.sourceAudio === false;
+        v.muted = view !== seg.el.id || seg.el.sourceAudio === false;
         if (going && !hold && v.paused) v.play().catch(() => {});
         if ((!going || hold) && !v.paused) v.pause();
       } else {
@@ -3364,6 +3371,7 @@ function Player({
         // montage of one-second shots has several cuts inside the look-ahead.
         const first = Math.max(0, (seg.el.trimStart ?? 0) - seg.before);
         if (seg.start > t && !v.seeking && Math.abs(v.currentTime - first) > 0.05) v.currentTime = first;
+      }
       }
     }
     // Cutaways and other video laid over the cut: they play, in step, as in
@@ -3444,7 +3452,7 @@ function Player({
   // editor; pressing on a filled clip and dragging also reframes it, in the
   // same gesture. Titles stop the event themselves, so they keep their drag.
   const onScreen = active && active.dur > 0 ? active.el : undefined;
-  const reframable = onScreen?.fit === "cover";
+  const reframable = onScreen?.fit === "cover" && !("split" in onScreen && onScreen.split);
 
   const stagePointerDown = (e: React.PointerEvent) => {
     if (!onScreen) return setSel(null);
@@ -3521,20 +3529,8 @@ function Player({
             const gain = visible ? fadeGain(seg.el, seg.dur, playhead - seg.start) : 1;
             const fit = seg.el.fit ?? "contain";
             const at = fit === "cover" ? (seg.el.anchor ?? CENTRE) : CENTRE;
-            const shape = seg.el.crop ? shapeFor(a) : undefined;
-            // A cropped clip: the box is the kept part, placed as the export
-            // places it, and the whole source is drawn inside it and clipped.
-            const place = shape ? placeClip(shape, seg.el.crop, edl.output, fit, seg.el.anchor) : undefined;
-            const common = {
-              className: place ? "absolute max-w-none" : "absolute inset-0 w-full h-full",
-              style: (place
-                ? { ...pct(place.source), objectFit: "fill" }
-                : // object-position is the export's crop offset, so both frame it alike.
-                  { objectFit: fit, objectPosition: `${at.x * 100}% ${at.y * 100}%` }) as React.CSSProperties,
-              "data-clip": seg.el.id,
-              onLoadedMetadata: noteSize(a.id),
-              onLoad: noteSize(a.id),
-            };
+            const shape = shapeFor(a);
+            const views = seg.el.type === "video" && seg.el.split ? [seg.el.split.top, seg.el.split.bottom] : [seg.el.crop];
             return (
               <div
                 key={seg.el.id}
@@ -3549,35 +3545,23 @@ function Player({
                   filter: effect,
                 }}
               >
-              {/* The same wrapper either way, so cropping never reloads the video. */}
-              <div className={`absolute ${place ? "overflow-hidden" : "inset-0"}`} style={place ? pct(place.box) : undefined}>
-                {seg.el.type === "video" ? (
-                  a.media_uid ? (
-                    <MediaVideo
-                      key={seg.el.id}
-                      asset={a}
-                      elementRef={keep(videoRefs.current, seg.el.id)}
-                      startAt={Math.max(0, (seg.el.trimStart ?? 0) - seg.before)}
-                      // Its first frame, on screen before the stream has one.
-                      poster={frameUrl(a, seg.el.trimStart ?? 0)}
-                      preload="auto"
-                      playsInline
-                      {...common}
-                    />
-                  ) : (
-                    <video
-                      key={seg.el.id}
-                      ref={keep(videoRefs.current, seg.el.id)}
-                      src={assetUrl(a)}
-                      preload="auto"
-                      playsInline
-                      {...common}
-                    />
-                  )
-                ) : (
-                  <img key={seg.el.id} src={assetUrl(a)} {...common} />
-                )}
-              </div>
+              {views.map((crop, view) => {
+                const topHeight = 2 * Math.floor(edl.output.height / 4);
+                const height = views.length === 2 ? (view ? edl.output.height-topHeight : topHeight) : edl.output.height;
+                const localFit = views.length === 2 ? "cover" : fit;
+                const place = shape ? placeClip(shape,crop,{width:edl.output.width,height},localFit,views.length===2?undefined:seg.el.anchor) : undefined;
+                const key = view ? `${seg.el.id}:bottom` : seg.el.id;
+                const common = {
+                  className: place ? "absolute max-w-none" : "absolute inset-0 w-full h-full",
+                  style: (place ? {...pct(place.source),objectFit:"fill"} : {objectFit:localFit,objectPosition:`${at.x*100}% ${at.y*100}%`}) as React.CSSProperties,
+                  "data-clip":seg.el.id,onLoadedMetadata:noteSize(a.id),onLoad:noteSize(a.id),
+                };
+                return <div key={key} className="absolute w-full overflow-hidden" style={{top:view ? `${topHeight/edl.output.height*100}%` : 0,height:`${height/edl.output.height*100}%`}}>
+                  <div className={`absolute ${place ? "overflow-hidden" : "inset-0"}`} style={place ? pct(place.box) : undefined}>
+                    {seg.el.type === "video" ? (a.media_uid ? <MediaVideo asset={a} elementRef={keep(videoRefs.current,key)} startAt={Math.max(0,(seg.el.trimStart??0)-seg.before)} poster={frameUrl(a,seg.el.trimStart??0)} preload="auto" playsInline {...common}/> : <video ref={keep(videoRefs.current,key)} src={assetUrl(a)} preload="auto" playsInline {...common}/>) : <img src={assetUrl(a)} {...common}/>}
+                  </div>
+                </div>;
+              })}
               {/* its fade to black, over the clip and under everything laid on it */}
               {gain < 1 && (
                 // The export's fade colour, whatever the project's background.
@@ -4760,6 +4744,7 @@ function Inspector({
               ) : (
                 <NumberRow label="Trim end (s)" value={el.trimEnd ?? 0} min={0} onChange={(n) => set((e) => ((e as MainVideo).trimEnd = Math.max(0, n)))} />
               )}
+              {el.split ? <div className="space-y-2 mb-3"><p className="text-body-sm text-muted">Two stacked views. Open AI reframe to adjust each region.</p><button className={btnSecondary} onClick={()=>set(x=>{delete (x as MainVideo).split;x.fit="contain";})}>Use whole shot</button></div> : <>
               <ClipFit value={el.fit} onChange={(fit) => set((x) => ((x as MainVideo).fit = fit))} />
               {el.fit === "cover" && (
                 <ClipFraming
@@ -4770,6 +4755,7 @@ function Inspector({
                 />
               )}
               {mainCrop(el)}
+              </>}
               <Row label="Clip audio">
                 <button
                   className={`${inputCls} text-left`}
