@@ -6,10 +6,13 @@ export type Shot = { from: number; to: number; layout: Layout; reason: string; r
   subjects: { label: string; region: Crop }[]; top?: Crop; bottom?: Crop };
 export type SplitFrame = { top: Crop; bottom: Crop };
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+/** A clock as the model writes it: H:MM:SS.mmm, M:SS.mmm, or plain seconds. */
 export function sourceTime(value: unknown): number | null {
   if (typeof value !== "string") return null;
-  const m = /^(\d{1,3}):([0-5]\d):([0-5]\d(?:\.\d{1,3})?)$/.exec(value);
-  return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : null;
+  const v = value.trim();
+  if (/^\d+(?:\.\d+)?$/.test(v)) return Number(v);
+  const m = /^(?:(\d{1,3}):)?([0-5]?\d):([0-5]\d(?:\.\d{1,3})?)$/.exec(v);
+  return m ? Number(m[1] ?? 0) * 3600 + Number(m[2]) * 60 + Number(m[3]) : null;
 }
 export function validCrop(c: any): c is Crop {
   return !!c && [c.x,c.y,c.width,c.height].every(Number.isFinite) && c.x >= 0 && c.y >= 0 &&
@@ -29,9 +32,15 @@ export function normalizeShots(value: unknown, start: number, end: number, shape
   const raw = (value as any)?.shots;
   if (!Array.isArray(raw) || raw.length > 40) return [fallback(start,end,"Framing needs manual review.")];
   const out: Shot[] = []; let at = start;
-  const sorted = raw.map(s=>({s,from:sourceTime(s?.from),to:sourceTime(s?.to)}))
-    .filter(v=>v.from !== null && v.to !== null && v.to > v.from && v.from >= start-.1 && v.to <= end+.1)
-    .sort((a,b)=>a.from!-b.from!);
+  const parsed = raw.map(s=>({s,from:sourceTime(s?.from),to:sourceTime(s?.to)}))
+    .filter(v=>v.from !== null && v.to !== null && v.to > v.from);
+  const inside = (v:{from:number|null;to:number|null}) => v.from! >= start-.1 && v.to! <= end+.1;
+  // An answer counted from the start of the stretch, not the whole video (asked for, not
+  // always given): every shot outside the stretch but inside its length. A mixed answer
+  // is not shifted; its stray shots are dropped like any other.
+  const relative = start > .1 && parsed.length > 0 && !parsed.some(inside) && parsed.every(v=>v.to! <= end-start+.1);
+  const sorted = parsed.map(v=>relative ? {...v,from:v.from!+start,to:v.to!+start} : v)
+    .filter(inside).sort((a,b)=>a.from!-b.from!);
   for (const {s,from,to} of sorted) {
     const lo = Math.max(at,from!), hi = Math.min(end,to!);
     if (hi-lo < .1) continue;
