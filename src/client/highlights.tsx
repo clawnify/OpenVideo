@@ -13,6 +13,7 @@ import {
   Download,
   ListOrdered,
   Loader2,
+  Plus,
   RotateCcw,
   Sparkles,
   Square,
@@ -61,7 +62,7 @@ interface HighlightList {
   asked: boolean;
   stopped: boolean;
   brief: string;
-  clips: { logged: number; done: number; pending: number; failed: number; skipped: number; not_asked: number };
+  clips: { total: number; preparing: number; preparation_failed: number; logged: number; done: number; pending: number; failed: number; skipped: number; not_asked: number };
   counts: { total: number; soundbites: number; broll: number; kept: number; dropped: number; open: number; best: number };
   /** How many highlights the video wants; null: every pick worth a look. */
   wanted: number | null;
@@ -182,9 +183,9 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
   // While clips are still being read, new picks arrive, and the best are
   // chosen once they are: look again now and then.
   const pending = list?.clips.pending ?? 0;
-  const busy = pending > 0 || (!!list && choosing(list));
+  const busy = pending > 0 || (list?.clips.preparing ?? 0) > 0 || (!!list && choosing(list));
   useEffect(() => {
-    if (!busy || list?.paused) return;
+    if (!busy) return;
     const t = setInterval(() => load(true).catch(() => {}), 8000);
     return () => clearInterval(t);
   }, [busy, list?.paused, load]);
@@ -308,8 +309,19 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
           )}
         </div>
 
+        <LibrarySources projectId={id} onChanged={() => load(false)} />
+        {(list.clips.preparing ?? 0) > 0 && (
+          <p className="mb-3 text-body-sm text-muted" role="status"><Loader2 className="inline w-4 h-4 animate-spin mr-1" />
+            Preparing and analysing {plural(list.clips.preparing, "video", "videos")}. You can leave this page while it runs.
+          </p>
+        )}
+        {(list.clips.preparation_failed ?? 0) > 0 && (
+          <p className="mb-3 text-body-sm text-danger">
+            {plural(list.clips.preparation_failed, "video needs", "videos need")} attention. Open the editor’s “This project” panel to see the error or retry.
+          </p>
+        )}
         {!list.asked ? (
-          <AskPanel projectId={id} brief={list.brief} logged={list.clips.logged} onAsked={() => load(false)} />
+          <AskPanel projectId={id} brief={list.brief} logged={list.clips.logged} total={list.clips.total} onAsked={() => load(false)} />
         ) : (
           <>
             <Progress
@@ -328,10 +340,10 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
             {items.length === 0 ? (
               <EmptyState
                 icon={<Sparkles className="w-8 h-8" />}
-                title={pending ? "Reading the clips" : "No picks here"}
+                title={busy ? "Reading the clips" : "No picks here"}
                 body={
-                  pending
-                    ? "Picks appear here as each folder of clips is read. You can leave this page: it carries on without you."
+                  busy
+                    ? "Picks appear here as each video is read. You can leave this page: it carries on without you."
                     : "Nothing matches these filters. Widen them to see more."
                 }
               />
@@ -367,7 +379,78 @@ export function HighlightsRoute({ id, navigate }: { id: string; navigate: (to: s
   );
 }
 
-function AskPanel({ projectId, brief, logged, onAsked }: { projectId: string; brief: string; logged: number; onAsked: () => void }) {
+interface LibraryVideo { id: string; name: string; duration: number | null; attached: boolean; supported: boolean; unavailable_reason: string | null }
+
+function LibrarySources({ projectId, onChanged }: { projectId: string; onChanged: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [offset, setOffset] = useState(0);
+  const [items, setItems] = useState<LibraryVideo[]>([]);
+  const [next, setNext] = useState<number | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const [revision, setRevision] = useState(0);
+  const [removing, setRemoving] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let current = true;
+    setLoading(true);
+    const timer = setTimeout(() => {
+      api.get<{ items: LibraryVideo[]; next_offset: number | null }>(`/api/projects/${projectId}/library-videos?${new URLSearchParams({ search, offset: String(offset) })}`)
+        .then((r) => { if (current) { setItems(r.items); setNext(r.next_offset); setError(""); } })
+        .catch((e) => { if (current) setError(String(e.message || e)); })
+        .finally(() => { if (current) setLoading(false); });
+    }, 200);
+    return () => { current = false; clearTimeout(timer); };
+  }, [open, projectId, search, offset, revision]);
+  const change = async (video: LibraryVideo) => {
+    setBusy(video.id); setError("");
+    try {
+      if (video.attached) await api.send("DELETE", `/api/projects/${projectId}/footage/assets/${encodeURIComponent(video.id)}`);
+      else await api.send("POST", `/api/projects/${projectId}/footage/assets`, { asset_id: video.id });
+      setRemoving(null);
+      setRevision((r) => r + 1);
+      onChanged();
+    } catch (e) { setError(String((e as Error).message || e)); }
+    finally { setBusy(null); }
+  };
+  return <div className="mb-4">
+    <button className={btnSecondary} onClick={() => setOpen(!open)} aria-expanded={open}>
+      <Plus className="w-4 h-4" /> {open ? "Close library" : "Choose library videos"}
+    </button>
+    {open && <div className={`${card} p-4 mt-2 max-w-2xl`}>
+      <p className="text-body-sm text-muted mb-3">Add an existing video for analysis. No upload is needed. Its highlights and your selections belong to this project.</p>
+      <input className="field w-full mb-3" aria-label="Search library videos" placeholder="Search videos, e.g. talk 1" value={search}
+        onChange={(e) => { setSearch(e.target.value); setOffset(0); setRemoving(null); }} />
+      {error && <p className="text-fine text-danger mb-2" role="alert">{error}</p>}
+      {loading ? <p className="text-fine text-muted" role="status">Loading videos…</p> : <>
+        {items.length === 0 && <p className="text-body-sm text-muted">No library videos match. Upload a video in the editor’s Media panel first.</p>}
+        <ul className="space-y-2">
+          {items.map((v) => <li key={v.id} className="flex flex-wrap items-center gap-2">
+            <div className="flex-1 min-w-0"><p className="text-body-sm truncate">{v.name}</p>
+              <p className="text-fine text-muted">{v.attached ? "In this project" : !v.supported ? v.unavailable_reason : v.duration ? clock(v.duration) : "Library video"}</p>
+            </div>
+            {removing === v.id ? <div className="w-full text-fine text-muted">
+              Remove this video’s analysis and highlights from this project? The library video and timeline stay.
+              <div className="flex gap-2 mt-1"><button className={btnSecondary} disabled={busy !== null} onClick={() => change(v)}>Remove from Highlights</button>
+              <button className={btnGhost} onClick={() => setRemoving(null)}>Cancel</button></div>
+            </div> : <button className={btnSecondary} disabled={busy !== null || !v.supported} onClick={() => v.attached ? setRemoving(v.id) : change(v)}
+              aria-label={`${v.attached ? "Remove" : "Analyse"} ${v.name}`}>
+              {busy === v.id && <Loader2 className="w-3.5 h-3.5 animate-spin" />}{v.attached ? "Remove" : "Add for analysis"}
+            </button>}
+          </li>)}
+        </ul>
+        <div className="flex gap-2 mt-3">
+          {offset > 0 && <button className={btnGhost} onClick={() => setOffset(Math.max(0, offset - 50))}>Previous</button>}
+          {next !== null && <button className={btnGhost} onClick={() => setOffset(next)}>Next</button>}
+        </div>
+      </>}
+    </div>}
+  </div>;
+}
+
+function AskPanel({ projectId, brief, logged, total, onAsked }: { projectId: string; brief: string; logged: number; total: number; onAsked: () => void }) {
   const [text, setText] = useState(brief);
   const [count, setCount] = useState("");
   const [busy, setBusy] = useState(false);
@@ -391,7 +474,7 @@ function AskPanel({ projectId, brief, logged, onAsked }: { projectId: string; br
       <p className="text-body-sm text-muted mb-4">
         Every logged clip is read, with its transcript, against what this video is for. You get the soundbites and the b-roll worth an
         editor's look, each scored with the reason why, and the clips not worth anyone's time are set aside with theirs.{" "}
-        {logged > 0 ? `${logged} clips are logged.` : "No clip is logged yet: they are read as soon as they are."}
+        {logged > 0 ? `${logged} clips are logged.` : total > 0 ? "Your videos are being analysed first." : "Add a video from your library to get started."}
       </p>
       <label className="block text-fine text-muted mb-1" htmlFor="hl-brief">
         What is the video for?
@@ -406,7 +489,7 @@ function AskPanel({ projectId, brief, logged, onAsked }: { projectId: string; br
       />
       <WantedField id="hl-wanted" value={count} onChange={setCount} />
       {err && <p className="mb-2 text-fine text-danger">{err}</p>}
-      <button onClick={ask} disabled={busy || Number.isNaN(wanted)} className={btnPrimary}>
+      <button onClick={ask} disabled={busy || total === 0 || Number.isNaN(wanted)} className={btnPrimary}>
         {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Find highlights
       </button>
     </div>

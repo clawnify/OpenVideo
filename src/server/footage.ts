@@ -1,4 +1,4 @@
-// A project's footage from Google Drive folders, and the log the platform's
+// A project's footage from library videos and Google Drive folders, and the log the platform's
 // video analysis writes about each clip.
 //
 // A shoot arrives as a shared folder: a folder per camera, a few hundred clips
@@ -320,7 +320,9 @@ export async function addFolderVideos(
 interface WorkRow {
   id: string;
   status: FootageStatus;
+  /** Legacy source key: Drive ID or asset:<id>; source_kind controls behavior. */
   drive_file_id: string;
+  source_kind: "drive" | "library";
   name: string;
   folder: string;
   language: string;
@@ -421,11 +423,11 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
   if (opts.drive) {
     await run(
       `UPDATE project_footage SET retry_at = NULL, error = NULL
-        WHERE project_id = ? AND status = 'waiting' AND retry_at IS NOT NULL AND link_only = 0`,
+        WHERE project_id = ? AND source_kind = 'drive' AND status = 'waiting' AND retry_at IS NOT NULL AND link_only = 0`,
       [projectId],
     );
     const done = await query<{ id: string; copy_id: string }>(
-      "SELECT id, copy_id FROM project_footage WHERE project_id = ? AND copy_id IS NOT NULL AND status IN ('ready', 'failed', 'removed')",
+      "SELECT id, copy_id FROM project_footage WHERE project_id = ? AND source_kind = 'drive' AND copy_id IS NOT NULL AND status IN ('ready', 'failed', 'removed')",
       [projectId],
     );
     for (const d of done) {
@@ -433,12 +435,12 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
     }
   }
   const rows = await query<WorkRow>(
-    `SELECT f.id, f.status, f.drive_file_id, f.name, f.folder, f.language, f.asset_id, f.log_status, f.log_job,
+    `SELECT f.id, f.status, f.source_kind, f.drive_file_id, f.name, f.folder, f.language, f.asset_id, f.log_status, f.log_job,
             f.updated_at, f.retry_at, f.drive_tries, f.link_only, f.copy_id, f.transcode, f.transcode_job,
             f.upload_uid, f.upload_url, f.upload_expires, f.upload_size, a.media_uid, a.duration
        FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
       WHERE f.project_id = ?
-        AND (f.status IN ('waiting', 'importing')
+        AND ((f.source_kind = 'drive' AND f.status IN ('waiting', 'importing'))
              OR (f.status = 'ready' AND (f.log_status IS NULL OR f.log_status IN ('preparing', 'running'))))
       ORDER BY f.folder, f.name`,
     [projectId],
@@ -452,7 +454,7 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
   }
 
   // 1. Imports that finished, or never will.
-  const importing = rows.filter((r) => r.status === "importing");
+  const importing = rows.filter((r) => r.status === "importing" && r.source_kind === "drive");
   const relaying: WorkRow[] = [];
   await Promise.all(
     importing.map(async (r) => {
@@ -526,12 +528,12 @@ export async function stepFootage(cfg: MediaConfig, projectId: string, opts: Ste
 
   // 2. Start imports while there is room, together. A refusal that is about
   //    the org (storage full) puts its clip back in line and starts no more.
-  const room = opts.startImports === false ? 0 : STEP_LIMITS.importing - importing.filter((r) => r.status === "importing").length;
+  const room = opts.startImports === false ? 0 : STEP_LIMITS.importing - importing.filter((r) => r.status === "importing" && r.source_kind === "drive").length;
   const claimed: WorkRow[] = [];
   const now = new Date().toISOString();
   for (const r of rows) {
     if (claimed.length >= room) break;
-    if (r.status !== "waiting" || (r.retry_at && r.retry_at > now)) continue;
+    if (r.source_kind !== "drive" || r.status !== "waiting" || (r.retry_at && r.retry_at > now)) continue;
     if (await setRow(r.id, { status: "importing", error: null, retry_at: null }, " AND status = 'waiting'")) claimed.push(r);
   }
   await Promise.all(

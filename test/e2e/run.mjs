@@ -18,6 +18,9 @@ function storage() {
     db,
     binding: {
       async query(sql, params = []) {
+        if (sql.includes('INSERT INTO footage_highlights') && sql.includes("'person'") && world.beforePersonPick) {
+          const before = world.beforePersonPick; world.beforePersonPick = null; await before();
+        }
         const st = db.prepare(sql);
         const p = params.map((v) => (typeof v === "boolean" ? Number(v) : v === undefined ? null : v));
         if (/^\s*(select|pragma|with)/i.test(sql) || /\breturning\b/i.test(sql)) return { rows: st.all(...p) };
@@ -191,6 +194,7 @@ globalThis.fetch = async (input, init = {}) => {
     }
     let m = /^\/media\/([0-9a-f]{32})$/.exec(u.pathname);
     if (m && method === "DELETE") {
+      if (world.beforeMediaDelete) { const before = world.beforeMediaDelete; world.beforeMediaDelete = null; await before(); }
       if (world.refuseMediaDeletes > 0) {
         world.refuseMediaDeletes--;
         (world.refusedDeletes ??= []).push(m[1]);
@@ -258,6 +262,7 @@ globalThis.fetch = async (input, init = {}) => {
     const body = JSON.parse(init.body);
     const prompt = body.messages[0].content;
     world.prompts.push(prompt);
+    if (world.beforeModel) { const before = world.beforeModel; world.beforeModel = null; await before(); }
     if (world.modelRefusal) return new Response(world.modelRefusal.body, { status: world.modelRefusal.status });
     // Choosing the best: the b-roll, last listed first, then the soundbites as
     // stand-ins. By score alone the soundbites (5) would come first.
@@ -290,6 +295,7 @@ globalThis.fetch = async (input, init = {}) => {
     return json(200, { choices: [{ message: { content } }] });
   }
   if (u.hostname === "queue.test") {
+    if (world.failNextEnqueue) { world.failNextEnqueue = false; return json(503, { error: "busy" }); }
     const body = JSON.parse(init.body);
     world.lastEnqueue = body;
     return json(201, { id: `qjob_${world.calls.length}`, job_id: `qjob_${world.calls.length}`, status: "pending", run_at: body.run_at });
@@ -1177,3 +1183,117 @@ assert.equal(row3().status, "ready", JSON.stringify(row3()));
 assert.equal(row3().transcode_job, null);
 console.log("13 ok: a clip over the bitrate cap is re-encoded on the way in and imports");
 console.log("ALL OK");
+
+// 14. Library footage: an existing upload can be analysed by any project,
+// without gaining ownership of the media, or inheriting another project's picks.
+{
+  const uid = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+  const assetId = 'library-talk';
+  world.media.set(uid, { name: 'talk 1.mp4', polls: 2, deleted: false });
+  db.prepare("INSERT INTO assets (id, key, name, content_type, size, duration, media_uid) VALUES (?, ?, ?, 'video/mp4', ?, ?, ?)")
+    .run(assetId, `media/${uid}`, 'talk 1.mp4', 9452386420, 1506.16, uid);
+  const projectA = (await call('POST', '/api/projects', { name: 'Library A' })).data.id;
+  const projectB = (await call('POST', '/api/projects', { name: 'Library B' })).data.id;
+  const attach = (p, a = assetId) => call('POST', `/api/projects/${p}/footage/assets`, { asset_id: a });
+  const row = (p) => db.prepare("SELECT * FROM project_footage WHERE project_id = ? AND source_kind = 'library'").get(p);
+  const delivery = async (p) => {
+    const body = JSON.stringify({ project_id: p });
+    const response = await app.request('https://open-video.apps.clawnify.com/api/footage/step', { method: 'POST', headers: { 'content-type': 'application/json', ...(await signed(body)) }, body }, env, ctx);
+    assert.equal(response.status, 200, await response.text());
+  };
+  const externalBefore = world.calls.length;
+  world.failNextEnqueue = true;
+  let x = await attach(projectA);
+  assert.equal(x.status, 201, JSON.stringify(x));
+  assert.equal(db.prepare('SELECT footage_step_at FROM edit_projects WHERE id = ?').get(projectA).footage_step_at, null, 'first queue booking failed');
+  const keyBeforeRecovery = env.OPENROUTER_API_KEY;
+  delete env.OPENROUTER_API_KEY;
+  assert.ok((await call('GET', `/api/projects/${projectA}/highlights`)).data.next_step_at, 'reading preparation progress recovers a failed queue booking without a model key');
+  env.OPENROUTER_API_KEY = keyBeforeRecovery;
+  assert.equal(row(projectA).source_kind, 'library');
+  assert.equal(row(projectA).drive_file_id, `asset:${assetId}`);
+  assert.equal(row(projectA).status, 'ready');
+  assert.equal((await attach(projectA)).data.added, false, 'duplicate attach returns the same reference');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM project_footage WHERE project_id = ?").get(projectA).n, 1);
+  assert.equal((await call('GET', `/api/projects/${projectA}/highlights`)).data.clips.preparing, 1, 'logging progress is visible before highlights begin');
+  assert.ok((await call('GET', '/api/assets')).data.some(a => a.id === assetId), 'reference remains in shared library');
+  assert.ok((await call('GET', `/api/assets?project=${projectB}`)).data.some(a => a.id === assetId), 'available to another project');
+  assert.equal((await call('DELETE', `/api/assets/${assetId}`)).status, 409, 'active reference protects permanent asset deletion');
+  await call('POST', `/api/projects/${projectA}/highlights`, { brief: 'Best moments from this talk' });
+  for (let i = 0; i < 10 && row(projectA).highlights_status !== 'done'; i++) await delivery(projectA);
+  assert.equal(row(projectA).log_status, 'done');
+  assert.equal(row(projectA).highlights_status, 'done');
+  x = await call('GET', `/api/projects/${projectA}/highlights`);
+  assert.ok(x.data.highlights.length, JSON.stringify(x));
+  const picked = x.data.highlights[0];
+  await call('PATCH', `/api/projects/${projectA}/highlights/${picked.id}`, { pick: 'keep' });
+  const jobsBeforeReuse = world.jobs.size;
+  assert.equal((await attach(projectB)).status, 201);
+  assert.equal(row(projectB).log_status, 'done', 'completed analysis reused by another project');
+  assert.equal(row(projectB).highlights_status, null, 'highlight choices are not copied');
+  await call('POST', `/api/projects/${projectB}/highlights`, { brief: 'Different purpose' });
+  await delivery(projectB);
+  assert.equal(world.jobs.size, jobsBeforeReuse, 'no repeated video analysis after completed log reuse');
+  const picksB = (await call('GET', `/api/projects/${projectB}/highlights`)).data.highlights;
+  assert.ok(picksB.length && picksB.every(h => h.pick === null && h.id !== picked.id));
+  const csv = await call('GET', `/api/projects/${projectB}/highlights/export?format=csv`);
+  assert.ok(!csv.data.includes('drive.google.com'), 'a library source never gets a fake Drive URL');
+  const since = world.calls.slice(externalBefore);
+  assert.ok(!since.some(c => /POST .*\/media\/(import|uploads)/.test(c) || /drive\.google|drive\.usercontent/.test(c)), 'library analysis never transfers or fetches Drive footage');
+  // Unsupported and still-processing assets fail clearly without entering work.
+  db.prepare("INSERT INTO assets (id, key, name, content_type) VALUES ('old', 'old.mp4', 'old.mp4', 'video/mp4')").run();
+  assert.equal((await attach(projectA, 'old')).status, 422);
+  assert.equal((await attach(projectA, 'missing')).status, 404);
+  assert.equal((await call('POST', `/api/projects/${projectA}/footage/assets`, [])).status, 400);
+  const ownerAsset = db.prepare("SELECT asset_id FROM project_footage WHERE source_kind = 'drive' AND asset_id IS NOT NULL LIMIT 1").get();
+  assert.equal((await attach(projectA, ownerAsset.asset_id)).status, 404, 'cannot borrow a Drive-owned asset with different deletion rules');
+  // Picker is bounded and literal-searchable, and marks attached assets.
+  for (let i = 0; i < 51; i++) db.prepare("INSERT INTO assets (id,key,name,content_type,media_uid) VALUES (?,?,?,'video/mp4',?)").run(`picker${i}`, `picker/${i}`, `Picker ${i}`, uid);
+  x = await call('GET', `/api/projects/${projectA}/library-videos?search=Picker`);
+  assert.equal(x.data.items.length, 50); assert.equal(x.data.next_offset, 50);
+  assert.equal((await call('GET', `/api/projects/${projectA}/library-videos?search=Picker&offset=50`)).data.items.length, 1);
+  x = await call('GET', `/api/projects/${projectA}/library-videos?search=talk%201`);
+  assert.equal(x.data.items[0].attached, true);
+  assert.equal((await call('GET', `/api/projects/${projectA}/library-videos?search=%25`)).data.items.length, 0, 'percent is a literal search');
+  // Detaching while a model request is in flight cannot resurrect its picks.
+  const removedDuringManual = row(projectB).id;
+  world.beforePersonPick = async () => { await call('DELETE', `/api/projects/${projectB}/footage/assets/${assetId}`); };
+  assert.equal((await call('POST', `/api/projects/${projectB}/highlights/items`, { clip: removedDuringManual, start: 1, end: 4 })).status, 404);
+  assert.equal(world.beforePersonPick, null, 'manual-pick detach interleaving ran');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM footage_highlights WHERE footage_id = ?').get(removedDuringManual).n, 0);
+  await attach(projectB); await delivery(projectB);
+  const removedDuringModel = row(projectB).id;
+  await call('POST', `/api/projects/${projectB}/highlights`, { again: true });
+  world.beforeModel = async () => {
+    assert.equal((await call('DELETE', `/api/projects/${projectB}/footage/assets/${assetId}`)).status, 200);
+  };
+  await delivery(projectB);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM footage_highlights WHERE footage_id = ?').get(removedDuringModel).n, 0, 'late result cannot recreate deleted highlights');
+  assert.equal((await attach(projectB)).status, 201);
+  await delivery(projectB);
+  assert.equal((await call('DELETE', `/api/projects/${projectA}`)).status, 200);
+  assert.ok(db.prepare('SELECT 1 FROM assets WHERE id = ?').get(assetId));
+  assert.equal(world.media.get(uid).deleted, false, 'project deletion preserves the shared media');
+  assert.ok((await call('GET', `/api/projects/${projectB}/highlights`)).data.highlights.length, 'other project selections survive');
+  const oldReference = row(projectB).id;
+  assert.equal((await call('DELETE', `/api/projects/${projectB}/footage/assets/${assetId}`)).status, 200);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM footage_highlights WHERE footage_id = ?').get(oldReference).n, 0);
+  assert.equal(world.media.get(uid).deleted, false, 'detaching also preserves media');
+  assert.equal((await attach(projectB)).status, 201, 'can attach again after removing reference');
+  assert.notEqual(row(projectB).id, oldReference, 'old analysis deliveries cannot touch the new reference');
+  assert.equal((await call('DELETE', `/api/projects/${projectB}`)).status, 200);
+  world.beforeMediaDelete = async () => {
+    const attempt = await attach((await call('POST', '/api/projects', { name: 'Deletion race' })).data.id);
+    assert.equal(attempt.status, 404, 'a deletion claim refuses attachments while external cleanup waits');
+  };
+  assert.equal((await call('DELETE', `/api/assets/${assetId}`)).status, 200);
+  assert.equal(world.beforeMediaDelete, null, 'the interleaving actually ran');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM project_footage WHERE asset_id = ?').get(assetId).n, 0);
+  const waitingProject = (await call('POST', '/api/projects', { name: 'Drive backoff check' })).data.id;
+  const tomorrow = new Date(Date.now() + 86400000).toISOString();
+  db.prepare("INSERT INTO project_footage(project_id,drive_file_id,name,retry_at) VALUES (?, 'backoff-drive', 'deferred.mp4', ?)").run(waitingProject, tomorrow);
+  db.prepare('UPDATE edit_projects SET footage_step_at = ? WHERE id = ?').run(tomorrow, waitingProject);
+  await call('GET', `/api/projects/${waitingProject}/highlights`);
+  assert.equal(db.prepare('SELECT footage_step_at FROM edit_projects WHERE id = ?').get(waitingProject).footage_step_at, tomorrow, 'Highlights polling preserves Drive retry backoff');
+  console.log('14 ok: library video reused without import; isolated highlights, cached logs, bounded picker, guarded deletion and detach/re-add');
+}
