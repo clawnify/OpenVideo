@@ -141,6 +141,7 @@ export interface Asset {
 
 /** A clip from one of the project's Drive folders. The log here is its short form. */
 interface FootageItem {
+  source_kind?: "drive" | "library";
   id: string;
   name: string;
   /** Where it sits, the shared folder's own name first: "Day 1/Cam B". */
@@ -959,7 +960,7 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
             title={`Delete “${confirmDel.name}”?`}
             body={
               confirmDel.footage
-                ? `The project, its export history and its ${confirmDel.footage} clips from Drive go with it. The originals in Google Drive are not touched, and footage from your media library stays there.`
+                ? "The project, its highlights, export history and Drive-folder copies are deleted. Videos in the shared media library and originals in Google Drive are kept."
                 : "The project and its export history go with it. Your footage stays in the media library."
             }
             onConfirm={() => remove(confirmDel)}
@@ -1022,7 +1023,7 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
         setProject(p);
         // The project's own clips from Drive sit beside the library's, so
         // the timeline can play them.
-        setAssets([...a, ...readyFootage(f)]);
+        setAssets([...new Map([...a, ...readyFootage(f)].map((asset) => [asset.id, asset])).values()]);
         setFootage(f);
       })
       .catch((e) => current && setErr(String(e.message || e)));
@@ -1741,10 +1742,10 @@ function LeftPanel({
   // of a shoot's hundreds of clips one by one is what this avoids.
   const footage = useFootage(projectId, initialFootage, setAssets);
   const footageIds = useMemo(
-    () => new Set(footage.list.items.flatMap((i) => (i.asset ? [i.asset.id] : []))),
+    () => new Set(footage.list.items.flatMap((i) => (i.asset && i.source_kind !== "library" ? [i.asset.id] : []))),
     [footage.list],
   );
-  const hasFootage = footage.list.sources.length > 0;
+  const hasFootage = footage.list.counts.total > 0;
   const [view, setView] = useState<"project" | "library">(hasFootage ? "project" : "library");
   const library = useMemo(() => assets.filter((a) => !footageIds.has(a.id)), [assets, footageIds]);
   const { ready: mediaReady, ingesting: mediaIngesting, failed: mediaFailed } = useMediaReady(library);
@@ -1816,6 +1817,11 @@ function LeftPanel({
           </button>
         ) : (
           <>
+            {tab === "media" && onOpenHighlights && (
+              <button onClick={onOpenHighlights} className={`${btnSecondary} w-full justify-center mb-3`}>
+                <Sparkles className="w-4 h-4" /> Highlights
+              </button>
+            )}
             {tab === "media" && hasFootage && (
               <div className="grid grid-cols-2 gap-0.5 p-0.5 mb-3 rounded-sm bg-surface shadow-edge">
                 {(
@@ -1872,9 +1878,8 @@ function LeftPanel({
                 projectId={projectId}
                 footage={footage}
                 onAdd={onAdd}
-                onDelete={setDeleting}
+                onDelete={(a) => { if (footageIds.has(a.id)) setDeleting(a); }}
                 onAddFolder={() => setFolderOpen(true)}
-                onOpenHighlights={onOpenHighlights}
               />
             ) : (
           <>
@@ -2005,7 +2010,7 @@ function useFootage(
   const refresh = useCallback(() => setTick((t) => t + 1), []);
 
   useEffect(() => {
-    if (tick === 0 && initial.sources.length === 0) return;
+    if (tick === 0 && initial.counts.total === 0) return;
     let dead = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const read = async () => {
@@ -2073,14 +2078,12 @@ function FootagePanel({
   onAdd,
   onDelete,
   onAddFolder,
-  onOpenHighlights,
 }: {
   projectId: string;
   footage: { list: FootageList; refresh: () => void };
   onAdd: (a: Asset) => void;
   onDelete: (a: Asset) => void;
   onAddFolder: () => void;
-  onOpenHighlights?: () => void;
 }) {
   const { list, refresh } = footage;
   const c = list.counts;
@@ -2092,7 +2095,7 @@ function FootagePanel({
     const single = list.sources.length === 1 ? `${list.sources[0].name}/` : null;
     const by = new Map<string, FootageItem[]>();
     for (const i of list.items) {
-      const k = (single && i.folder.startsWith(single) ? i.folder.slice(single.length) : i.folder) || list.sources[0]?.name || "Drive folder";
+      const k = i.source_kind === "library" ? "From your library" : (single && i.folder.startsWith(single) ? i.folder.slice(single.length) : i.folder) || list.sources[0]?.name || "Drive folder";
       by.set(k, [...(by.get(k) ?? []), i]);
     }
     return [...by].map(([folder, items]) => ({ folder, items, prefix: sharedPrefix(items.map((i) => i.name)) }));
@@ -2122,10 +2125,10 @@ function FootagePanel({
     <div>
       <div className="mb-2 text-fine text-muted">
         <div className="text-foreground truncate" title={list.sources.map((s) => s.name).join(", ")}>
-          {list.sources.map((s) => s.name).join(", ")} · {c.total} {c.total === 1 ? "clip" : "clips"}
+          {list.sources.map((s) => s.name).join(", ") || "This project"} · {c.total} {c.total === 1 ? "clip" : "clips"}
         </div>
         <div className="tabular-nums">
-          {coming > 0 ? `${c.ready} of ${c.total} imported` : "All imported"}
+          {coming > 0 ? `${c.ready} of ${c.total} imported` : "Ready to edit"}
           {c.ready > 0 && ` · ${c.logged} logged`}
         </div>
       </div>
@@ -2141,9 +2144,9 @@ function FootagePanel({
         </div>
       )}
       <div className="flex flex-wrap gap-x-1 gap-y-0.5 mb-3 -ml-1.5">
-        <button onClick={() => act("sync")} disabled={busy !== null} className={railAction} title="Look in the folders again for files added since">
+        {list.sources.length > 0 && <button onClick={() => act("sync")} disabled={busy !== null} className={railAction} title="Look in the folders again for files added since">
           {busy === "sync" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} Check for new files
-        </button>
+        </button>}
         {failed > 0 && (
           <button onClick={() => act("retry")} disabled={busy !== null} className={railAction}>
             {busy === "retry" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Redo2 className="w-3.5 h-3.5" />} Retry {failed} failed
@@ -2153,19 +2156,6 @@ function FootagePanel({
           <Plus className="w-3.5 h-3.5" /> Add folder
         </button>
       </div>
-      {onOpenHighlights && c.logged > 0 && (
-        <button
-          onClick={onOpenHighlights}
-          className="w-full mb-3 p-2 rounded-sm bg-surface shadow-raised hover:bg-surface-sunken text-left flex items-start gap-2"
-        >
-          <Sparkles className="w-4 h-4 mt-0.5 shrink-0 text-muted" />
-          <span className="min-w-0">
-            <span className="block text-body-sm text-foreground">Highlights</span>
-            <span className="block text-fine text-muted">The soundbites and b-roll worth a look in every clip, and why</span>
-          </span>
-          <ChevronRight className="w-4 h-4 mt-0.5 ml-auto shrink-0 text-faint" />
-        </button>
-      )}
       {note && <p className="text-fine text-muted mb-2">{note}</p>}
       {groups.map(({ folder, items, prefix }) => (
         <details key={folder} open className="group/folder mb-2">
@@ -2233,7 +2223,7 @@ function FootageRow({
           {line}
         </div>
       </button>
-      {asset && (
+      {asset && item.source_kind !== "library" && (
         // On the thumbnail, so it takes no width from the name beside it.
         <button
           onClick={() => onDelete(asset)}

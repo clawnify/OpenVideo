@@ -119,9 +119,9 @@ CREATE TABLE IF NOT EXISTS footage_sources (
   PRIMARY KEY (project_id, folder_id)
 );
 
--- One row per video in those folders and every folder inside them. The video
--- belongs to its project: the media library lists it with that project only,
--- and deleting the project deletes it. It moves on by itself (see
+-- One row per source video in a project. Drive-folder copies belong to the
+-- project and are deleted with it; library references (source_kind below)
+-- never own the video and do not hide it from the library. Work advances (see
 -- src/server/footage.ts):
 --   status:     waiting | importing | ready | failed | removed
 --   log_status: NULL (not started) | preparing | running | done | failed
@@ -275,3 +275,14 @@ CREATE TABLE IF NOT EXISTS drive_imports (
 CREATE UNIQUE INDEX IF NOT EXISTS drive_imports_active_file ON drive_imports(file_id)
   WHERE state IN ('queued', 'uploading', 'processing', 'cancelling');
 CREATE INDEX IF NOT EXISTS drive_imports_due ON drive_imports(state, next_step_at);
+
+-- Project footage can reference an existing library video without owning it.
+-- drive_file_id retains its legacy name: a real Drive ID for drive sources,
+-- or the stable asset:<id> source key for library references. source_kind,
+-- never the key's spelling, determines ownership and import behavior.
+ALTER TABLE project_footage ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'drive';
+CREATE INDEX IF NOT EXISTS idx_project_footage_source ON project_footage(project_id, source_kind, status);
+
+-- Durable deletion intent: an asset being removed cannot gain new analysis
+-- references while its media deletion is in flight. A failed cleanup can be retried.
+ALTER TABLE assets ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0;

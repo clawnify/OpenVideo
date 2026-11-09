@@ -18,6 +18,7 @@ export interface NleHighlight {
   name: string;
   folder: string;
   drive_file_id: string;
+  source_kind?: "drive" | "library";
 }
 
 const KIND = { soundbite: "Soundbite", broll: "B-roll" } as const;
@@ -58,7 +59,7 @@ export function highlightsCsv(rows: NleHighlight[]): string {
       r.text,
       r.speaker,
       r.reason,
-      `https://drive.google.com/file/d/${r.drive_file_id}/view`,
+      r.source_kind === "library" ? "" : `https://drive.google.com/file/d/${r.drive_file_id}/view`,
     ]
       .map(field)
       .join(","),

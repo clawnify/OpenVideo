@@ -40,6 +40,24 @@ Drive folder and its subfolders, and a file outside it is refused. Pass
 `folder=<id>` to `GET /api/drive/files` to list one folder (its subfolders come
 back as `folders`); a search looks inside that folder only, never the subtree.
 
+## Highlights from existing library videos
+
+1. Reuse uploaded videos; never ask someone to upload the same video again.
+   Open Highlights from any project's Media panel, then Choose library videos.
+   The API's bounded picker is `GET /api/projects/{id}/library-videos` (`search`, `offset`).
+2. Add a video with `POST /api/projects/{id}/footage/assets { "asset_id": "…", "language"?: "en" }`.
+   This starts analysis, reusing a completed log in the same language when one
+   exists. It references the original video, without copying or moving it.
+   Only ready videos uploaded through the editor or imported from Drive are
+   supported; older storage-only videos remain editable on the timeline.
+3. Ask for highlights against the project's brief as below. Preparation and
+   analysis run in the background; selections are separate in each project.
+4. To stop using a library video for Highlights, delete its reference with
+   `DELETE /api/projects/{id}/footage/assets/{assetId}`. This removes that
+   project's analysis and picks, leaving the library video and timeline intact.
+   Deleting a project also preserves library videos. Permanent asset deletion
+   is refused while a timeline or library analysis reference still uses it.
+
 ## Footage from a Drive folder
 
 A shoot usually arrives as a Google Drive folder shared with "anyone with the

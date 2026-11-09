@@ -756,13 +756,13 @@ async function setClip(id: string, fields: Record<string, unknown>, where = ""):
 /** Replace a clip's unreviewed picks with a new verdict's. */
 export async function saveVerdict(projectId: string, v: ClipVerdict): Promise<void> {
   await run("DELETE FROM footage_highlights WHERE footage_id = ? AND pick IS NULL", [v.id]);
-  // Ten values a row, under D1's hundred bound parameters a statement.
+  // Eleven values a row, under D1's hundred bound parameters a statement.
   for (let i = 0; i < v.highlights.length; i += 8) {
     const chunk = v.highlights.slice(i, i + 8);
     await run(
       `INSERT INTO footage_highlights (project_id, footage_id, kind, src_in, src_out, text, speaker, score, reason, origin)
-       VALUES ${chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai')").join(", ")}`,
-      chunk.flatMap((h) => [projectId, v.id, h.kind, h.start, h.end, h.text, h.speaker, h.score, h.reason]),
+       ${chunk.map(() => "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai' WHERE EXISTS (SELECT 1 FROM project_footage WHERE id = ? AND project_id = ? AND status = 'ready')").join(" UNION ALL ")}`,
+      chunk.flatMap((h) => [projectId, v.id, h.kind, h.start, h.end, h.text, h.speaker, h.score, h.reason, v.id, projectId]),
     );
   }
   await setClip(v.id, { highlights_status: "done", highlights_error: null, skip_reason: v.skip });
