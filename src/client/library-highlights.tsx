@@ -67,13 +67,13 @@ export function SharedHighlights({ onAdd, navigate }: {
     <input id={onAdd ? "source-highlights-search" : "shared-highlights-search"} className="field w-full mb-3" value={search} onChange={e => setSearch(e.target.value)} placeholder="Words, speaker or video" />
     {!onAdd && <div className="flex flex-wrap items-center gap-3 mb-4">
       <button disabled={!selected.size || creating} onClick={() => void create()} className={btnPrimary}>
-        {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Film className="w-4 h-4" />} Create portrait clips{selected.size ? ` (${selected.size})` : ""}
+        {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Film className="w-4 h-4" />} Start projects{selected.size ? ` (${selected.size})` : ""}
       </button>
-      <span className="text-fine text-muted">Choose up to 12. Each opens as a separate editable 9:16 project.</span>
+      <span className="text-fine text-muted">Choose up to 12. Each becomes its own project, with a 16:9 and a 9:16 version of the same cut.</span>
     </div>}
     {error && <p role="alert" className="text-body-sm text-danger mb-3">{error} <button className={btnGhost} onClick={() => void load()}>Retry</button></p>}
     {created.length > 0 && <div className="mb-4 space-y-2" role="status">
-      <p className="text-body-sm">{created.length} portrait {created.length === 1 ? "clip" : "clips"} created.</p>
+      <p className="text-body-sm">{created.length} {created.length === 1 ? "project" : "projects"} started.</p>
       {created.map(p => <button key={p.id} className={btnSecondary} onClick={() => navigate?.(`/edits/${p.id}`)}>{p.name}</button>)}
     </div>}
     {!loading && !error && !items.length && <p className="text-body-sm text-muted py-6">{search ? "No matching highlights." : "Highlights found in your projects appear here, ready to reuse in any edit."}</p>}
@@ -109,7 +109,7 @@ export function SharedHighlightsRoute({ navigate }: { navigate: (to: string) => 
   return <main className="flex-1 overflow-y-auto p-4 sm:p-6">
     <div className="max-w-6xl mx-auto">
       <div className="flex items-center gap-3 mb-3"><button className={btnGhost} onClick={() => navigate("/")}><ArrowLeft className="w-4 h-4" /> Projects</button><h1 className="text-heading-2">Highlights</h1></div>
-      <p className="text-body-sm text-muted mb-5">Shared moments from your videos. Reuse them in any project or create portrait clips.</p>
+      <p className="text-body-sm text-muted mb-5">Shared moments from your videos. Add them to any project, or start a project from each one.</p>
       <SharedHighlights navigate={navigate} />
     </div>
   </main>;

@@ -56,11 +56,13 @@ detaching footage or deleting a project does not remove shared selections or
 videos they retain. Existing installations publish their old selections on first
 catalog access or before a destructive operation.
 
-`POST /api/highlights/projects { ids: ["…"], request_id: "<UUID>" }` creates
-1–12 separate editable 1080×1920 projects. Retry with the SAME request_id and
-selection after a network error; the response returns the same projects. Use a
-new request_id for an intentional new set. Initial framing preserves the whole
-shot; portrait format by itself does not imply AI reframing.
+`POST /api/highlights/projects { ids: ["…"], request_id: "<UUID>" }` starts
+1–12 projects, one per highlight, each a 1920×1080 cut with a 9:16 format (see
+"More formats of the same cut"). Retry with the SAME request_id and selection
+after a network error; the response returns the same projects. Use a new
+request_id for an intentional new set. Every shot starts whole in 9:16; nothing
+is framed until a person, or AI reframe, frames it. Only start projects when
+someone asks for them.
 
 `DELETE /api/highlights/{id}` removes a shared selection for everyone. Existing
 timelines keep their clips. A tombstone prevents regeneration from silently
@@ -288,7 +290,7 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
 | POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied }` |
 | DELETE | `/api/projects/{id}` | Delete a project, its export history and its footage from Drive; `202 { remaining }` means call again |
-| POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job, `status: "exporting"` |
+| POST | `/api/projects/{id}/export` | Export `{ quality?, format? }` → returns the job, `status: "exporting"` |
 | GET  | `/api/exports/{id}` | One export; read it until it is no longer `exporting` |
 | GET  | `/api/exports?project_id={id}` | Export history |
 | GET  | `/api/projects/{id}/share` | The project's share link → `{ url, export_id, newer_export, comments }` (`url: null` when off) |
@@ -415,6 +417,41 @@ and keeps each logo's size on screen and the side of the frame it sits on.
 Clips keep their `fit`; set `"cover"` on each to fill the new frame instead of
 showing bars.
 
+**Two stacked views.** A main-track video can show two parts of its source at
+once, one above the other: `split: { "top": <crop>, "bottom": <crop> }`, each a
+`crop` as above, each filling its half of the frame. It suits two people seated
+side by side or facing each other in one shot, stacked in a tall format. Both
+views play the same moment with one sound, and `fit`, `anchor` and `crop` are
+ignored while `split` is set. Give each crop its half's shape (for 1080x1920,
+1080x960) so nothing more is cut off.
+
+**More formats of the same cut.** One project can deliver the same cut in
+several shapes: `output` is the main format, and `formats: [{ "id": "9:16",
+"width": 1080, "height": 1920 }]` lists the others (at most 4; `id` is the
+shape's ratio; size them at the main format's short side, as `/instruct`'s
+`add_format` and the editor do). Timing, words and sound are shared: a trim,
+split, title text or caption change reaches every format. What differs is
+framing, set per format:
+
+- a main-track clip's `framing: { "9:16": { "fit", "anchor", "crop", "split" } }`
+  replaces those four fields in that format. Without an entry the clip shows
+  its whole shot there, letterboxed: nothing is guessed.
+- an overlay's `placement: { "9:16": { "x", "y", "width" } }` (media) or
+  `{ "x", "y", "fontSize" }` (text) places it in that format. Without one it
+  sits where a format change would move it.
+
+Every key of `framing` and `placement` must be one of `formats`. Removing a
+format means removing its entries too. Example: a 16:9 interview clip whose two
+guests are stacked in the vertical version:
+
+```json
+{ "id": "c1", "type": "video", "src": "asset:…", "trimStart": 510, "duration": 14,
+  "fit": "cover",
+  "framing": { "9:16": { "split": {
+    "top":    { "x": 0.06, "y": 0.12, "width": 0.40, "height": 0.63 },
+    "bottom": { "x": 0.54, "y": 0.12, "width": 0.40, "height": 0.63 } } } } }
+```
+
 **Captions** are a project setting, not overlays: an optional `captions` block,
 `{ "enabled": true, "lang": "en", "style": { "size": 0.055, "position":
 "bottom", "margin": 0.08, "background": true, "outline": false, "color":
@@ -537,8 +574,10 @@ if the proposal misses the brief.
 ### Exporting
 
 `POST /api/projects/{id}/export` with optional
-`{ "quality": "draft" | "standard" | "high" }` (draft is fast — use it for
-review cuts, then export `high` for the final). The call returns once the
+`{ "quality": "draft" | "standard" | "high", "format": "9:16" }` (draft is fast — use it for
+review cuts, then export `high` for the final). `format` picks one of the
+project's `formats`; leave it out for the main one. Each export renders one
+format, and the job says which in `format` (null for the main one). The call returns once the
 render is submitted, with the job at `status: "exporting"`. The render runs in
 the background, so read `GET /api/exports/{id}` every few seconds until the
 status changes: `"completed"` with `output_url`, `duration` and `size`, or

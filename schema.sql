@@ -363,6 +363,28 @@ BEGIN
   ) WHERE request_id = NEW.creation_batch AND result IS NULL;
 END;
 
+-- Shared advice is source-time data; chosen framing stays on each editable clip.
+CREATE TABLE IF NOT EXISTS video_reframes (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  source_start REAL NOT NULL,
+  source_end REAL NOT NULL,
+  status TEXT NOT NULL,
+  attempt TEXT NOT NULL,
+  job_id TEXT,
+  result TEXT,
+  error TEXT,
+  width INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(asset_id, revision, source_start, source_end)
+);
+
+-- Which of the project's formats an export renders (src/shared/formats.ts):
+-- a ratio such as '9:16', or NULL for the project's main format.
+ALTER TABLE export_jobs ADD COLUMN format TEXT;
+
 -- Whether people watching the share link can leave comments: 0 (watch only)
 -- until someone on the team turns it on for that link.
 ALTER TABLE share_links ADD COLUMN comments INTEGER NOT NULL DEFAULT 0;

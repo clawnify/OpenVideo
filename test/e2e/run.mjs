@@ -231,6 +231,7 @@ globalThis.fetch = async (input, init = {}) => {
       return json(200, { id: m[1], state: "ready", ready: true, duration: 60, download: { status: "ready", percent: 100 }, analysis: v.prepares >= 2 ? "ready" : "preparing" });
     }
     if (u.pathname === "/video/edit" && method === "POST") {
+      world.lastEdit = JSON.parse(init.body);
       if (world.editRefusal) return json(422, world.editRefusal);
       world.renders = (world.renders ?? 0) + 1;
       return json(202, { job_id: `render${world.renders}`, status: "running" });
@@ -674,6 +675,41 @@ assert.match(db.prepare("SELECT error FROM export_jobs WHERE id = ?").get(r.data
 world.editRefusal = null;
 ctx.waitUntil = () => {};
 console.log("8b ok: export handover held past the response; refusals recorded with their pointer");
+
+// 8c. One cut, two formats: the 9:16 export renders that format's framing and
+// frame, the main export is untouched by it, and the render service never
+// sees this app's format fields.
+{
+  const top = { x: 0, y: 0.1, width: 0.5, height: 0.79 };
+  const bottom = { x: 0.5, y: 0.1, width: 0.5, height: 0.79 };
+  const two = {
+    ...doc([{ id: "a", type: "video", src: `asset:${clipAsset}`, duration: 2, fit: "cover", framing: { "9:16": { fit: "contain", split: { top, bottom } } } }]),
+    formats: [{ id: "9:16", width: 720, height: 1280 }],
+  };
+  r = await call("PUT", `/api/projects/${pid}`, { edl: two });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  r = await call("POST", `/api/projects/${pid}/export`, { quality: "draft", format: "9:16" });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.format, "9:16");
+  const tall = world.lastEdit.edl;
+  assert.deepEqual([tall.output.width, tall.output.height], [720, 1280]);
+  assert.deepEqual(tall.main.elements[0].split, { top, bottom });
+  assert.doesNotMatch(JSON.stringify(world.lastEdit), /framing|placement|formats/);
+  assert.match(world.lastEdit.filename, /9x16/);
+  r = await call("POST", `/api/projects/${pid}/export`, { quality: "draft" });
+  assert.equal(r.data.format, null);
+  const wide = world.lastEdit.edl;
+  assert.deepEqual([wide.output.width, wide.output.height], [1280, 720]);
+  assert.equal(wide.main.elements[0].fit, "cover");
+  assert.equal(wide.main.elements[0].split, undefined);
+  r = await call("POST", `/api/projects/${pid}/export`, { format: "1:1" });
+  assert.equal(r.status, 422);
+  assert.equal(r.data.error, "format_unknown");
+  r = await call("PUT", `/api/projects/${pid}`, { edl: { ...two, formats: [] } });
+  assert.equal(r.status, 422, "framing for a format the project does not have is refused");
+  assert.equal(r.data.path, "/main/elements/0/framing/9:16");
+  console.log("8c ok: each format exports its own frame and framing; unknown formats refused");
+}
 
 // 9. The queue's call must be signed.
 r = await call("POST", "/api/footage/step", { project_id: pid });
@@ -1417,7 +1453,9 @@ console.log("ALL OK");
   assert.equal((await call('POST','/api/highlights/projects',{...body,ids:[ids[0]]})).status,409,'request reuse cannot change its selection');
   for (const p of created.data.projects) {
     const edl = (await call('GET',`/api/projects/${p.id}`)).data.edl;
-    assert.deepEqual([edl.output.width,edl.output.height],[1080,1920]);
+    assert.deepEqual([edl.output.width,edl.output.height],[1920,1080]);
+    assert.deepEqual(edl.formats,[{id:'9:16',width:1080,height:1920}],'each started project carries a 9:16 version');
+    assert.equal(edl.main.elements[0].framing,undefined,'nothing is framed until someone frames it');
     const h = list.data.items.find(h => h.id === p.highlight_id);
     assert.deepEqual([edl.main.elements[0].src,edl.main.elements[0].trimStart,edl.main.elements[0].duration],[`asset:${asset}`,h.src_in,h.src_out-h.src_in]);
   }
@@ -1447,5 +1485,5 @@ console.log("ALL OK");
   assert.equal((await call('DELETE',`/api/assets/${asset}`)).status,200);
   assert.equal(world.beforeMediaDelete,null);
   assert.equal((await call('POST','/api/highlights/projects',{ids,request_id:crypto.randomUUID()})).status,409);
-  console.log('15 ok: shared catalog migration, range deduplication, independent portrait edits, retry identity and source lifetime');
+  console.log('15 ok: shared catalog migration, range deduplication, two-format projects started on request, retry identity and source lifetime');
 }
