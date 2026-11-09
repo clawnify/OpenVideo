@@ -20,6 +20,14 @@ describe("source-time framing",()=>{
     expect(shots.map(s=>[s.from,s.to,s.layout])).toEqual([[120,130,"whole"],[130,140,"speaker"]]);
     expect(shots[0].review).toBe(true);
   });
+  it("reads clocks written short and answers counted from the start of the stretch",()=>{
+    expect([sourceTime("8:30.5"),sourceTime("510"),sourceTime("0:08:30.000")]).toEqual([510.5,510,510]);
+    // Asked for 8:30-8:44 of the talk, answered 0:00-0:14: the same shots, moved onto the talk's clock.
+    const shots=normalizeShots({shots:[raw("0:00:00","0:00:06"),raw("0:00:06","0:00:14")]},510,524,shape);
+    expect(shots.map(s=>[s.from,s.to,s.layout])).toEqual([[510,516,"speaker"],[516,524,"speaker"]]);
+    // Times on the whole video's clock are used as given.
+    expect(normalizeShots({shots:[raw("0:08:30","0:08:44")]},510,524,shape).map(s=>[s.from,s.to])).toEqual([[510,524]]);
+  });
   it("keeps the whole shot for low confidence or invalid boxes",()=>{
     expect(normalizeShots({shots:[raw("0:00:00","0:00:10","speaker","low")]},0,10,shape)[0].layout).toBe("whole");
     const r=raw("0:00:00","0:00:10");r.subjects=[{label:"bad",region:{...region,x:.95}}];

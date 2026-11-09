@@ -25,6 +25,7 @@ describe("shared framing jobs",()=>{
     const started=await req(input);
     const schema=vi.mocked(startVideoAnalysis).mock.calls[0][1].schema as any;
     expect(schema.properties.shots.maxItems).toBeUndefined();
+    expect(vi.mocked(startVideoAnalysis).mock.calls[0][1].prompt).toContain("from 0:02:00.000 to 0:02:20.000 of the whole video");
     vi.mocked(getVideoAnalysis).mockResolvedValueOnce({job_id:"job",status:"failed",error:"analyze_failed",detail:"the analysis failed — try again"});
     const after=await read(started.body.id);
     expect(after).toMatchObject({status:"failed",job_id:"job"});
@@ -53,7 +54,9 @@ describe("shared framing jobs",()=>{
   it("caches validated advice and reuses it after re-trimming",async()=>{
     const {body}=await req(input);
     vi.mocked(getVideoAnalysis).mockResolvedValue({job_id:"job",status:"done",result:{shots:[]}});
-    expect((await read(body.id)).status).toBe("done");
+    const done=await read(body.id);
+    expect(done.status).toBe("done");
+    expect(JSON.parse(done.answer)).toEqual({shots:[]});
     const again=await req({...input,start:125,end:135});expect(again.body.id).toBe(body.id);expect(again.body.shots[0].layout).toBe("whole");expect(startVideoAnalysis).toHaveBeenCalledTimes(1);
   });
   it("does not automatically submit another job after a submission failure",async()=>{

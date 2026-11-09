@@ -405,3 +405,7 @@ CREATE TABLE IF NOT EXISTS review_comments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_comments_project ON review_comments(project_id, created_at);
+
+-- The model's own reply to a framing analysis, kept so a suggestion that fell
+-- back to the whole shot can be traced (src/server/reframe.ts).
+ALTER TABLE video_reframes ADD COLUMN answer TEXT;
