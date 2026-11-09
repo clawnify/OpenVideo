@@ -1,3 +1,4 @@
+import { ReframeDialog } from "./reframe";
 // Footage edit projects — the timeline editor over EDL documents.
 //
 // Layout (the classic four-region editor grid): left rail (Media / Audio /
@@ -46,6 +47,8 @@ import {
   moveCrop,
   placeClip,
   resizeCrop,
+  sideBySide,
+  stackHalves,
   tidyCrop,
   type Crop,
   type Handle,
@@ -63,6 +66,7 @@ import {
   sizeFor,
   type Anchor,
 } from "../shared/format";
+import { MAX_FORMATS, addFormat, findFormat, formatView, liftView, removeFormat, wholeShotClips, type Format } from "../shared/formats";
 import {
   Captions as CaptionsIcon,
   AlignCenterHorizontal,
@@ -99,6 +103,8 @@ import {
   EyeOff,
   Volume2,
   VolumeX,
+  ArrowUpDown,
+  Rows2,
 } from "lucide-react";
 import {
   ConfirmDialog,
@@ -197,12 +203,20 @@ interface MainVideo {
   anchor?: Anchor;
   /** The part of the source kept, cut out before fitting (shared/crop.ts). */
   crop?: Crop;
+  /** Two views of the source stacked top and bottom, each filling its half. */
+  split?: { top: Crop; bottom: Crop };
+  /** This clip's framing in each of the project's other formats (shared/formats.ts). */
+  framing?: Record<string, Framing>;
   /** Seconds to fade from and to black (shared/fade.ts). */
   fadeIn?: number;
   fadeOut?: number;
   /** How it comes in from the clip before it (shared/transition.ts). */
   transition?: Transition;
 }
+/** How a main clip sits in one format's frame. */
+type Framing = Pick<MainVideo, "fit" | "anchor" | "crop" | "split">;
+/** Where an overlay sits in one format's frame. */
+type Placement = { x: number; y: number; width?: number; fontSize?: number };
 interface MainImage {
   id: string;
   type: "image";
@@ -211,6 +225,7 @@ interface MainImage {
   fit?: "contain" | "cover";
   anchor?: Anchor;
   crop?: Crop;
+  framing?: Record<string, Framing>;
   /** Seconds to fade from and to black (shared/fade.ts). */
   fadeIn?: number;
   fadeOut?: number;
@@ -231,6 +246,7 @@ interface OverlayMedia {
   trimStart?: number;
   trimEnd?: number;
   crop?: Crop;
+  placement?: Record<string, Placement>;
   /** Seconds to fade from and to transparent, the out ending where it is last seen. */
   fadeIn?: number;
   fadeOut?: number;
@@ -251,6 +267,7 @@ interface OverlayText {
   /** Outline around the letters, `width` px at output resolution. */
   stroke?: { color: string; width: number };
   align?: "left" | "center" | "right";
+  placement?: Record<string, Placement>;
   /** Seconds to fade from and to transparent, the out ending where it is last seen. */
   fadeIn?: number;
   fadeOut?: number;
@@ -284,6 +301,8 @@ interface AudioTrack {
 export interface Edl {
   version: 1;
   output: { width: number; height: number; fps: 24 | 30 | 60; background?: string };
+  /** More shapes of the same cut, each framed on its own (shared/formats.ts). */
+  formats?: Format[];
   main: { elements: MainElement[] };
   overlays?: OverlayTrack[];
   audio?: AudioTrack[];
@@ -308,6 +327,8 @@ interface ExportJob {
   output_url: string | null;
   error: string | null;
   duration: number | null;
+  /** The format it renders; null for the main one. */
+  format?: string | null;
   created_at: string;
 }
 
@@ -1100,7 +1121,17 @@ export function EditEditor({
   const [playing, setPlaying] = useState(false);
   const [playhead, setPlayhead] = useState(0);
   const [autocutOpen, setAutocutOpen] = useState(false);
+  const [reframeOpen, setReframeOpen] = useState(false);
   const [askOpen, setAskOpen] = useState(false);
+  // The format on screen: null is the main one. Every control edits the cut
+  // as this format sees it (shared/formats.ts). One removed (or undone away)
+  // falls back to the main format.
+  const [formatPick, setFormatPick] = useState<string | null>(null);
+  const format = findFormat(edl, formatPick) ? formatPick : null;
+  const formatRef = useRef(format);
+  formatRef.current = format;
+  // The main format's view is the document itself; another's is worked out once per change.
+  const view = useMemo(() => (format ? formatView(edl, format) : edl), [edl, format]);
   const playheadRef = useRef(0);
   // While a video is playing it IS the clock: the wall clock only fills in
   // for stretches with no video (stills, text). Driving the wall clock and
@@ -1176,11 +1207,23 @@ export function EditEditor({
     bumpHistory((n) => n + 1);
   }, []);
 
+  /** Edit the cut as the format on screen sees it; framing lands on that format, the rest on the cut. */
   const update = useCallback(
     (fn: (draft: Edl) => void, coalesce = false) => {
+      const doc = edlRef.current;
+      const draft = formatView(doc, formatRef.current);
+      fn(draft);
+      commit(liftView(doc, draft, formatRef.current), coalesce);
+    },
+    [commit],
+  );
+
+  /** Edit the document itself, whatever format is on screen: the formats themselves, the main one's shape. */
+  const updateDoc = useCallback(
+    (fn: (draft: Edl) => void) => {
       const draft = structuredClone(edlRef.current);
       fn(draft);
-      commit(draft, coalesce);
+      commit(draft);
     },
     [commit],
   );
@@ -1220,7 +1263,7 @@ export function EditEditor({
   }, [undo, redo]);
 
   // ── derived timeline ──────────────────────────────────────────────────────
-  const segments = useMemo(() => mainSegments(edl, srcDur), [edl, srcDur]);
+  const segments = useMemo(() => mainSegments(view, srcDur), [view, srcDur]);
   const total = cutEnd(segments);
 
   // Captions: the transcripts of the videos on the timeline, and the caption
@@ -1473,18 +1516,25 @@ export function EditEditor({
           onClick={() => setAskOpen(true)}
           className={btnSecondary}
           title="Change the cut by describing it"
+          aria-label="Ask"
         >
-          <Wand2 className="w-4 h-4" /> <span className="hidden sm:inline">Ask</span>
+          <Wand2 className="w-4 h-4" /> <span className="hidden md:inline">Ask</span>
         </button>
         <button
           onClick={() => setAutocutOpen(true)}
           className={btnSecondary}
           title="Assemble a cut from several clips with AI"
+          aria-label="Auto-cut"
         >
-          <Sparkles className="w-4 h-4" /> <span className="hidden sm:inline">Auto-cut</span>
+          <Sparkles className="w-4 h-4" /> <span className="hidden md:inline">Auto-cut</span>
         </button>
+        <span className="hidden lg:contents"><button className={btnSecondary} disabled={!edl.main.elements.some(e=>e.type==="video")} onClick={()=>{setPlaying(false);setReframeOpen(true);}}><Sparkles className="w-4 h-4" /> AI reframe</button></span>
         <ShareControl projectId={initial.id} />
-        <ExportControls projectId={initial.id} disabled={dirty.current || edl.main.elements.length === 0} />
+        <ExportControls
+          projectId={initial.id}
+          format={format}
+          disabled={dirty.current || edl.main.elements.length === 0}
+        />
       </div>
 
       {/* Row 2, small screens only: which pane is on screen. */}
@@ -1509,8 +1559,22 @@ export function EditEditor({
             </button>
           ))}
         </div>
+        <button className={`${btnSecondary} ml-auto`} disabled={!edl.main.elements.some(e=>e.type==="video")} onClick={()=>{setPlaying(false);setReframeOpen(true);}}>AI reframe</button>
       </div>
 
+      {reframeOpen && (
+        <ReframeDialog
+          edl={edl}
+          assets={assets}
+          selected={sel?.area === "main" && edl.main.elements[sel.i]?.type === "video" ? sel.i : edl.main.elements.findIndex((e) => e.type === "video")}
+          onClose={() => setReframeOpen(false)}
+          onApply={(next, shown) => {
+            commit(next);
+            setFormatPick(shown);
+            setSel(null);
+          }}
+        />
+      )}
       {askOpen && (
         <AskDialog
           projectId={initial.id}
@@ -1553,13 +1617,29 @@ export function EditEditor({
           setAssets={setAssets}
           onAdd={addAssetToTimeline}
           onAddText={addText}
-          edl={edl}
+          edl={view}
           update={update}
           transcripts={transcripts}
         />
+        <div className={`${pane === "canvas" ? "flex" : "hidden"} lg:flex flex-1 flex-col min-w-0 min-h-0`}>
+        <FormatBar
+          edl={edl}
+          active={format}
+          onPick={setFormatPick}
+          onAdd={(ratio) => {
+            const next = addFormat(edlRef.current, ratio);
+            if (next === edlRef.current) return;
+            commit(next);
+            setFormatPick(ratio);
+          }}
+          onRemove={(id) => {
+            commit(removeFormat(edlRef.current, id));
+            setFormatPick(null);
+          }}
+        />
         <Player
           pane={pane}
-          edl={edl}
+          edl={view}
           segments={segments}
           total={total}
           playhead={playhead}
@@ -1574,9 +1654,12 @@ export function EditEditor({
           setSel={setSel}
           update={update}
         />
+        </div>
         <Inspector
           pane={pane}
-          edl={edl}
+          edl={view}
+          doc={edl}
+          updateDoc={updateDoc}
           sel={sel}
           update={update}
           srcDur={srcDur}
@@ -1592,7 +1675,7 @@ export function EditEditor({
       {/* timeline */}
       <TimelinePanel
         pane={pane}
-        edl={edl}
+        edl={view}
         segments={segments}
         total={total}
         playhead={playhead}
@@ -3246,7 +3329,7 @@ function Player({
   // A cropped clip is placed from its source's own size (shared/crop.ts).
   const cropped: Asset[] = [];
   for (const el of [...edl.main.elements, ...(edl.overlays ?? []).flatMap((t) => t.elements)]) {
-    const a = el.type !== "text" && el.crop ? resolveAsset(el.src) : undefined;
+    const a = el.type !== "text" && (el.crop || ("split" in el && el.split)) ? resolveAsset(el.src) : undefined;
     if (a) cropped.push(a);
   }
   const shapes = useShapes(cropped);
@@ -3300,7 +3383,7 @@ function Player({
   const dueRef = useRef<() => HTMLMediaElement[]>(() => []);
   dueRef.current = () => {
     const out: (HTMLMediaElement | undefined)[] = [];
-    for (const seg of segments) if (seg.el.type === "video" && live(seg)) out.push(videoRefs.current.get(seg.el.id));
+    for (const seg of segments) if (seg.el.type === "video" && live(seg)) { out.push(videoRefs.current.get(seg.el.id)); if(seg.el.split) out.push(videoRefs.current.get(`${seg.el.id}:bottom`)); }
     for (const track of edl.overlays ?? []) {
       if (track.hidden) continue;
       for (const el of track.elements) {
@@ -3330,7 +3413,8 @@ function Player({
     // Waiting for media to load, everything holds where it is, together.
     const going = playing && !waiting;
     for (const seg of segments) {
-      const v = videoRefs.current.get(seg.el.id);
+      for (const view of seg.el.type === "video" && seg.el.split ? [seg.el.id, `${seg.el.id}:bottom`] : [seg.el.id]) {
+      const v = videoRefs.current.get(view);
       if (!v || seg.el.type !== "video") continue;
       if (live(seg)) {
         // In a transition a clip plays past its trims. Where its source has
@@ -3343,7 +3427,7 @@ function Player({
         // Playing, the video leads and needs no correction; only a real jump
         // (a scrub, or a cut to another clip) is worth a seek, because each
         // one empties the buffer. Paused, follow the playhead closely.
-        if (seg === active) {
+        if (seg === active && view === seg.el.id) {
           // The clip the clock follows needs no correction while it plays.
           const jumped = Math.abs(v.currentTime - wanted) > (going && !hold ? 0.75 : 0.05);
           if (jumped && !v.seeking) v.currentTime = wanted;
@@ -3351,7 +3435,7 @@ function Player({
           follow(v, wanted, going && !hold);
         }
         v.volume = Math.min(1, Math.min(1, seg.el.volume ?? 1) * fadeGain(seg.el, seg.dur, t - seg.start) * crossGain(seg));
-        v.muted = seg.el.sourceAudio === false;
+        v.muted = view !== seg.el.id || seg.el.sourceAudio === false;
         if (going && !hold && v.paused) v.play().catch(() => {});
         if ((!going || hold) && !v.paused) v.pause();
       } else {
@@ -3364,6 +3448,7 @@ function Player({
         // montage of one-second shots has several cuts inside the look-ahead.
         const first = Math.max(0, (seg.el.trimStart ?? 0) - seg.before);
         if (seg.start > t && !v.seeking && Math.abs(v.currentTime - first) > 0.05) v.currentTime = first;
+      }
       }
     }
     // Cutaways and other video laid over the cut: they play, in step, as in
@@ -3444,7 +3529,7 @@ function Player({
   // editor; pressing on a filled clip and dragging also reframes it, in the
   // same gesture. Titles stop the event themselves, so they keep their drag.
   const onScreen = active && active.dur > 0 ? active.el : undefined;
-  const reframable = onScreen?.fit === "cover";
+  const reframable = onScreen?.fit === "cover" && !("split" in onScreen && onScreen.split);
 
   const stagePointerDown = (e: React.PointerEvent) => {
     if (!onScreen) return setSel(null);
@@ -3521,20 +3606,8 @@ function Player({
             const gain = visible ? fadeGain(seg.el, seg.dur, playhead - seg.start) : 1;
             const fit = seg.el.fit ?? "contain";
             const at = fit === "cover" ? (seg.el.anchor ?? CENTRE) : CENTRE;
-            const shape = seg.el.crop ? shapeFor(a) : undefined;
-            // A cropped clip: the box is the kept part, placed as the export
-            // places it, and the whole source is drawn inside it and clipped.
-            const place = shape ? placeClip(shape, seg.el.crop, edl.output, fit, seg.el.anchor) : undefined;
-            const common = {
-              className: place ? "absolute max-w-none" : "absolute inset-0 w-full h-full",
-              style: (place
-                ? { ...pct(place.source), objectFit: "fill" }
-                : // object-position is the export's crop offset, so both frame it alike.
-                  { objectFit: fit, objectPosition: `${at.x * 100}% ${at.y * 100}%` }) as React.CSSProperties,
-              "data-clip": seg.el.id,
-              onLoadedMetadata: noteSize(a.id),
-              onLoad: noteSize(a.id),
-            };
+            const shape = shapeFor(a);
+            const views = seg.el.type === "video" && seg.el.split ? [seg.el.split.top, seg.el.split.bottom] : [seg.el.crop];
             return (
               <div
                 key={seg.el.id}
@@ -3549,35 +3622,23 @@ function Player({
                   filter: effect,
                 }}
               >
-              {/* The same wrapper either way, so cropping never reloads the video. */}
-              <div className={`absolute ${place ? "overflow-hidden" : "inset-0"}`} style={place ? pct(place.box) : undefined}>
-                {seg.el.type === "video" ? (
-                  a.media_uid ? (
-                    <MediaVideo
-                      key={seg.el.id}
-                      asset={a}
-                      elementRef={keep(videoRefs.current, seg.el.id)}
-                      startAt={Math.max(0, (seg.el.trimStart ?? 0) - seg.before)}
-                      // Its first frame, on screen before the stream has one.
-                      poster={frameUrl(a, seg.el.trimStart ?? 0)}
-                      preload="auto"
-                      playsInline
-                      {...common}
-                    />
-                  ) : (
-                    <video
-                      key={seg.el.id}
-                      ref={keep(videoRefs.current, seg.el.id)}
-                      src={assetUrl(a)}
-                      preload="auto"
-                      playsInline
-                      {...common}
-                    />
-                  )
-                ) : (
-                  <img key={seg.el.id} src={assetUrl(a)} {...common} />
-                )}
-              </div>
+              {views.map((crop, view) => {
+                const topHeight = 2 * Math.floor(edl.output.height / 4);
+                const height = views.length === 2 ? (view ? edl.output.height-topHeight : topHeight) : edl.output.height;
+                const localFit = views.length === 2 ? "cover" : fit;
+                const place = shape ? placeClip(shape,crop,{width:edl.output.width,height},localFit,views.length===2?undefined:seg.el.anchor) : undefined;
+                const key = view ? `${seg.el.id}:bottom` : seg.el.id;
+                const common = {
+                  className: place ? "absolute max-w-none" : "absolute inset-0 w-full h-full",
+                  style: (place ? {...pct(place.source),objectFit:"fill"} : {objectFit:localFit,objectPosition:`${at.x*100}% ${at.y*100}%`}) as React.CSSProperties,
+                  "data-clip":seg.el.id,onLoadedMetadata:noteSize(a.id),onLoad:noteSize(a.id),
+                };
+                return <div key={key} className="absolute w-full overflow-hidden" style={{top:view ? `${topHeight/edl.output.height*100}%` : 0,height:`${height/edl.output.height*100}%`}}>
+                  <div className={`absolute ${place ? "overflow-hidden" : "inset-0"}`} style={place ? pct(place.box) : undefined}>
+                    {seg.el.type === "video" ? (a.media_uid ? <MediaVideo asset={a} elementRef={keep(videoRefs.current,key)} startAt={Math.max(0,(seg.el.trimStart??0)-seg.before)} poster={frameUrl(a,seg.el.trimStart??0)} preload="auto" playsInline {...common}/> : <video ref={keep(videoRefs.current,key)} src={assetUrl(a)} preload="auto" playsInline {...common}/>) : <img src={assetUrl(a)} {...common}/>}
+                  </div>
+                </div>;
+              })}
               {/* its fade to black, over the clip and under everything laid on it */}
               {gain < 1 && (
                 // The export's fade colour, whatever the project's background.
@@ -3815,6 +3876,113 @@ function useShapes(assets: Asset[]): Map<string, Shape> {
   return shapes;
 }
 
+/**
+ * The shapes this cut is delivered in, and the one on screen. Every control
+ * edits the cut as that one sees it. An added format starts with every shot
+ * whole; removing one drops what was framed for it (undo brings it back).
+ */
+function FormatBar({
+  edl,
+  active,
+  onPick,
+  onAdd,
+  onRemove,
+}: {
+  edl: Edl;
+  active: string | null;
+  onPick: (id: string | null) => void;
+  onAdd: (ratio: string) => void;
+  onRemove: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const all: { id: string | null; width: number; height: number }[] = [
+    { id: null, width: edl.output.width, height: edl.output.height },
+    ...(edl.formats ?? []),
+  ];
+  const missing = FORMAT_PRESETS.filter((p) => {
+    const r = parseRatio(p.ratio)!;
+    return !all.some((f) => sameShape(f, { width: r.w, height: r.h }));
+  });
+  const whole = wholeShotClips(edl, active);
+  return (
+    <div className="flex items-center gap-2 px-3 h-11 shrink-0 border-b border-border bg-surface overflow-x-auto">
+      <div role="tablist" aria-label="Formats" className="inline-flex items-center gap-0.5 rounded-full bg-surface-sunken p-0.5 shrink-0">
+        {all.map((f) => {
+          const on = f.id === active;
+          const label = f.id ?? ratioLabel(f.width, f.height);
+          const name = presetFor(f.width, f.height)?.name;
+          return (
+            <div key={label} className={`inline-flex items-center rounded-full ${on ? "bg-surface shadow-raised" : ""}`}>
+              <button
+                role="tab"
+                aria-selected={on}
+                onClick={() => onPick(f.id)}
+                className={`h-7 pl-2.5 ${f.id ? "pr-1" : "pr-3"} inline-flex items-center gap-1.5 text-button ${on ? "text-foreground" : "text-muted hover:text-foreground"}`}
+              >
+                <ShapeGlyph width={f.width} height={f.height} />
+                <span className="tabular-nums">{label}</span>
+                {name && <span className="max-sm:hidden text-faint">{name}</span>}
+              </button>
+              {f.id && (
+                <button
+                  aria-label={`Remove the ${label} version`}
+                  title={`Remove the ${label} version`}
+                  onClick={() => onRemove(f.id!)}
+                  className="grid place-items-center w-6 h-6 mr-0.5 rounded-full text-faint hover:text-foreground hover:bg-surface-sunken"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {missing.length > 0 && (edl.formats?.length ?? 0) < MAX_FORMATS && (
+        <Popover open={open} onOpenChange={setOpen}>
+          <PopoverTrigger asChild>
+            <button className={`${btnGhost} shrink-0`} title="Deliver the same cut in another shape too">
+              <Plus className="w-4 h-4" /> Format
+            </button>
+          </PopoverTrigger>
+          <PopoverContent>
+            <Command label="Add a format">
+              {missing.map((p) => {
+                const r = parseRatio(p.ratio)!;
+                return (
+                  <CommandItem
+                    key={p.ratio}
+                    value={p.ratio}
+                    onSelect={() => {
+                      setOpen(false);
+                      onAdd(p.ratio);
+                    }}
+                  >
+                    <ShapeGlyph width={r.w} height={r.h} />
+                    <span className="flex-1 min-w-0">
+                      <span className="block truncate">{p.name}</span>
+                      <span className="block truncate text-fine text-faint">{p.hint}</span>
+                    </span>
+                    <span className="text-fine text-muted tabular-nums">{p.ratio}</span>
+                  </CommandItem>
+                );
+              })}
+            </Command>
+          </PopoverContent>
+        </Popover>
+      )}
+      {whole > 0 && (
+        // Gives way to the tabs: it shortens rather than making the bar scroll.
+        <span
+          className="ml-auto pl-2 min-w-0 truncate text-fine text-muted max-md:hidden"
+          title={`${whole === 1 ? "1 shot shows" : `${whole} shots show`} the whole picture in ${active}. Select one to frame it.`}
+        >
+          {whole === 1 ? "1 shot shows" : `${whole} shots show`} the whole picture. Select one to frame it.
+        </span>
+      )}
+    </div>
+  );
+}
+
 /** A shape drawn to scale in a fixed square, so shapes compare at a glance. */
 function ShapeGlyph({ width, height }: Shape) {
   return (
@@ -3881,7 +4049,9 @@ function FormatPicker({
       ? `original ${chosenOriginal.clip.id}`
       : undefined;
 
-  const item = (value: string, shape: Shape, name: string, detail: string) => (
+  // A shape the project already delivers as another format is chosen there, not here.
+  const taken = (shape: Shape) => (edl.formats ?? []).some((f) => sameShape(f, shape));
+  const item = (value: string, shape: Shape, name: string, detail: string) => taken(shape) ? null : (
     <CommandItem key={value} value={value} chosen={value === chosenKey} onSelect={() => choose(shape)}>
       <ShapeGlyph {...shape} />
       <span className="flex-1 min-w-0">
@@ -3893,7 +4063,7 @@ function FormatPicker({
   );
 
   return (
-    <Row label="Format">
+    <Row label={edl.formats?.length ? "Main format" : "Format"}>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <SelectTrigger kind="field">
@@ -4235,10 +4405,6 @@ function CropDialog({
   };
 
   const video = isVideoAsset(asset);
-  const media = {
-    className: "absolute inset-0 w-full h-full pointer-events-none",
-    style: { objectFit: "fill" } as React.CSSProperties,
-  };
   const kept = shape && croppedShape(shape, crop);
   // "Video 9:16" already says 9:16: don't offer it twice.
   const isFrameShape = (key: CropRatio) => {
@@ -4296,37 +4462,7 @@ function CropDialog({
           >
             {/* The picture and its dimming are clipped; the handles are not, so a corner on the edge stays whole. */}
             <div className="absolute inset-0 overflow-hidden">
-              {video ? (
-                asset.media_uid ? (
-                  <MediaVideo
-                    asset={asset}
-                    elementRef={(v) => (videoRef.current = v as HTMLVideoElement | null)}
-                    onLoadedMetadata={(e) => {
-                      e.currentTarget.currentTime = t;
-                      noteSize(e);
-                    }}
-                    muted
-                    playsInline
-                    preload="auto"
-                    {...media}
-                  />
-                ) : (
-                  <video
-                    ref={videoRef}
-                    src={assetUrl(asset)}
-                    onLoadedMetadata={(e) => {
-                      e.currentTarget.currentTime = t;
-                      noteSize(e);
-                    }}
-                    muted
-                    playsInline
-                    preload="auto"
-                    {...media}
-                  />
-                )
-              ) : (
-                <img src={assetUrl(asset)} alt="" onLoad={noteSize} {...media} />
-              )}
+              <FrameMedia asset={asset} t={t} videoRef={videoRef} onSize={noteSize} />
               <div
                 className="absolute pointer-events-none"
                 style={{ ...pct({ left: crop.x, top: crop.y, width: crop.width, height: crop.height }), boxShadow: "0 0 0 9999px rgb(0 0 0 / 0.55)" }}
@@ -4381,6 +4517,298 @@ function CropDialog({
           </span>
         )}
       </div>
+    </Dialog>
+  );
+}
+
+/** The source picture a framing dialog draws on: the video, seeked to `t` once it loads, or the still. */
+function FrameMedia({
+  asset,
+  t,
+  videoRef,
+  onSize,
+}: {
+  asset: Asset;
+  t: number;
+  videoRef: React.MutableRefObject<HTMLVideoElement | null>;
+  onSize: (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => void;
+}) {
+  const media = {
+    className: "absolute inset-0 w-full h-full pointer-events-none",
+    style: { objectFit: "fill" } as React.CSSProperties,
+  };
+  if (!isVideoAsset(asset)) return <img src={assetUrl(asset)} alt="" onLoad={onSize} {...media} />;
+  const loaded = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+    e.currentTarget.currentTime = t;
+    onSize(e);
+  };
+  return asset.media_uid ? (
+    <MediaVideo
+      asset={asset}
+      elementRef={(v) => (videoRef.current = v as HTMLVideoElement | null)}
+      onLoadedMetadata={loaded}
+      muted
+      playsInline
+      preload="auto"
+      {...media}
+    />
+  ) : (
+    <video ref={videoRef} src={assetUrl(asset)} onLoadedMetadata={loaded} muted playsInline preload="auto" {...media} />
+  );
+}
+
+type Stack = { top: Crop; bottom: Crop };
+
+/** How each stacked view is told apart on the source frame and in the result. */
+const VIEW_TONES = [
+  { name: "Top", box: "outline-accent bg-accent/15", tag: "bg-accent" },
+  { name: "Bottom", box: "outline-info-solid bg-info-solid/15", tag: "bg-info-solid" },
+] as const;
+
+/**
+ * Two views of one shot stacked top and bottom: two people seated side by
+ * side or facing each other, one above the other in a tall frame. Off: a
+ * button that starts from the shot's left and right halves.
+ */
+function StackField({
+  asset,
+  split,
+  frame,
+  window,
+  startAt,
+  onChange,
+}: {
+  asset: Asset | undefined;
+  split: Stack | undefined;
+  frame: Edl["output"];
+  window?: { from: number; to: number };
+  startAt: () => number;
+  onChange: (split: Stack | undefined) => void;
+}) {
+  const shape = useShapes(asset ? [asset] : []).get(asset?.id ?? "");
+  const [open, setOpen] = useState<number | null>(null);
+  if (!asset || !isVideoAsset(asset)) return null;
+  if (!split) {
+    return (
+      <Field label="Two people in the shot">
+        <button className={btnSecondary} disabled={!shape} onClick={() => shape && onChange(sideBySide(shape, frame))}>
+          <Rows2 className="w-4 h-4" /> Stack two views
+        </button>
+        <p className="text-fine text-muted mt-1.5">Shows two parts of the shot one above the other, both at the same moment.</p>
+      </Field>
+    );
+  }
+  return (
+    <Field label="Two stacked views">
+      <div className="flex flex-wrap items-center gap-2">
+        <button className={btnSecondary} onClick={() => setOpen(startAt())}>
+          <CropIcon className="w-4 h-4" /> Adjust views
+        </button>
+        <button className={btnGhost} onClick={() => onChange({ top: split.bottom, bottom: split.top })} title="Swap top and bottom">
+          <ArrowUpDown className="w-4 h-4" /> Swap
+        </button>
+        <button className={btnGhost} onClick={() => onChange(undefined)}>
+          One view
+        </button>
+      </div>
+      {open !== null && (
+        <StackDialog
+          asset={asset}
+          initial={split}
+          frame={frame}
+          window={window}
+          startAt={open}
+          onClose={() => setOpen(null)}
+          onApply={(next) => {
+            onChange(next);
+            setOpen(null);
+          }}
+        />
+      )}
+    </Field>
+  );
+}
+
+/**
+ * Both stacked views drawn on the source frame at once, each in its own
+ * colour, so it is clear where the top and the bottom come from. Each box
+ * keeps the shape of its half of the frame: what it holds is exactly what
+ * that half shows.
+ */
+function StackDialog({
+  asset,
+  initial,
+  frame,
+  window: span,
+  startAt,
+  onClose,
+  onApply,
+}: {
+  asset: Asset;
+  initial: Stack;
+  frame: Edl["output"];
+  window?: { from: number; to: number };
+  startAt: number;
+  onClose: () => void;
+  onApply: (split: Stack) => void;
+}) {
+  const [decoded, setDecoded] = useState<Shape | null>(null);
+  const reported = useShapes([asset]).get(asset.id);
+  const shape = decoded ?? reported;
+  const noteSize = (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => {
+    const m = e.currentTarget;
+    const width = m instanceof HTMLVideoElement ? m.videoWidth : m.naturalWidth;
+    const height = m instanceof HTMLVideoElement ? m.videoHeight : m.naturalHeight;
+    if (width && height && (decoded?.width !== width || decoded?.height !== height)) setDecoded({ width, height });
+  };
+  const [views, setViews] = useState<[Crop, Crop]>([initial.top, initial.bottom]);
+  const [t, setT] = useState(span ? Math.min(span.to, Math.max(span.from, startAt)) : 0);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const halves = stackHalves(frame);
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (v && v.readyState > 0 && Math.abs(v.currentTime - t) > 0.01) v.currentTime = t;
+  }, [t]);
+
+  const set = (k: number, crop: Crop) => setViews((v) => (k ? [v[0], crop] : [crop, v[1]]));
+
+  const drag = (k: number, handle: Handle | "move") => (e: React.PointerEvent) => {
+    if (!shape) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = boxRef.current!.getBoundingClientRect();
+    const from = views[k];
+    const ratio = halves[k].width / halves[k].height;
+    const sx = e.clientX;
+    const sy = e.clientY;
+    const move = (ev: PointerEvent) => {
+      const dx = (ev.clientX - sx) / rect.width;
+      const dy = (ev.clientY - sy) / rect.height;
+      set(k, handle === "move" ? moveCrop(from, dx, dy) : resizeCrop(from, handle, dx, dy, shape, ratio));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  // Arrow keys move the focused view; Shift moves it further.
+  const onKey = (k: number) => (e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? 0.1 : 0.01;
+    const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
+    if (!d) return;
+    e.preventDefault();
+    set(k, moveCrop(views[k], d[0], d[1]));
+  };
+
+  return (
+    <Dialog
+      title="Two stacked views"
+      icon={<Rows2 className="w-4 h-4 text-muted" />}
+      description="Drag each box over what that half of the frame should show. Both play the same moment, with one sound."
+      size="lg"
+      onClose={onClose}
+      footer={
+        <>
+          <button className={`${btnGhost} mr-auto`} disabled={!shape} onClick={() => shape && setViews(Object.values(sideBySide(shape, frame)) as [Crop, Crop])}>
+            Reset
+          </button>
+          <button className={btnGhost} onClick={() => setViews(([a, b]) => [b, a])}>
+            <ArrowUpDown className="w-4 h-4" /> Swap
+          </button>
+          <button onClick={onClose} className={btnGhost}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button onClick={() => onApply({ top: views[0], bottom: views[1] })} className={btnPrimary} disabled={!shape} data-autofocus>
+            <Check className="w-4 h-4" /> Done
+          </button>
+        </>
+      }
+    >
+      <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] items-start">
+        <div className="grid place-items-center rounded-md bg-surface-sunken p-3 min-w-0">
+          {shape ? (
+            <div
+              ref={boxRef}
+              className="relative select-none touch-none"
+              style={{ aspectRatio: `${shape.width} / ${shape.height}`, width: `min(100%, calc(50vh * ${shape.width / shape.height}))` }}
+            >
+              <div className="absolute inset-0 overflow-hidden">
+                <FrameMedia asset={asset} t={t} videoRef={videoRef} onSize={noteSize} />
+              </div>
+              {views.map((c, k) => (
+                <div
+                  key={k}
+                  role="group"
+                  aria-label={`${VIEW_TONES[k].name} view. Arrow keys move it.`}
+                  tabIndex={0}
+                  onKeyDown={onKey(k)}
+                  onPointerDown={drag(k, "move")}
+                  className={`absolute cursor-move outline outline-2 focus-visible:outline-ring ${VIEW_TONES[k].box}`}
+                  style={pct({ left: c.x, top: c.y, width: c.width, height: c.height })}
+                >
+                  <span className={`absolute left-1 top-1 rounded-xs px-1.5 text-fine text-white ${VIEW_TONES[k].tag}`}>{VIEW_TONES[k].name}</span>
+                  {HANDLES.filter(({ h }) => h.length === 2).map(({ h, at, cursor }) => (
+                    <span
+                      key={h}
+                      onPointerDown={drag(k, h)}
+                      className={`absolute ${at} -translate-x-1/2 -translate-y-1/2 grid place-items-center w-6 h-6`}
+                      style={{ cursor }}
+                      aria-hidden
+                    >
+                      <span className="block w-2.5 h-2.5 rounded-xs bg-white shadow-raised" />
+                    </span>
+                  ))}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 py-16 text-body-sm text-muted">
+              <Loader2 className="w-4 h-4 animate-spin" /> Loading the picture…
+            </div>
+          )}
+        </div>
+        {shape && (
+          // The result, small: the two views as the frame stacks them.
+          <div
+            className="relative mx-auto overflow-hidden rounded-md shadow-edge bg-black"
+            style={{ aspectRatio: `${frame.width} / ${frame.height}`, width: `min(9rem, calc(50vh * ${frame.width / frame.height}))` }}
+            aria-label="How the frame will look"
+            role="img"
+          >
+            {views.map((c, k) => {
+              const place = placeClip(shape, c, halves[k], "cover");
+              return (
+                <div
+                  key={k}
+                  className="absolute inset-x-0 overflow-hidden"
+                  style={{ top: k ? `${(halves[0].height / frame.height) * 100}%` : 0, height: `${(halves[k].height / frame.height) * 100}%` }}
+                >
+                  <div className="absolute overflow-hidden" style={pct(place.box)}>
+                    <img alt="" src={frameUrl(asset, t)} className="absolute max-w-none" style={pct(place.source)} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      {span && span.to - span.from > 0.05 && (
+        <input
+          type="range"
+          className="mt-2 w-full"
+          aria-label="Frame to look at"
+          min={span.from}
+          max={span.to}
+          step={0.01}
+          value={t}
+          onChange={(e) => setT(Number(e.target.value))}
+        />
+      )}
     </Dialog>
   );
 }
@@ -4629,6 +5057,8 @@ function TransitionPanel({
 function Inspector({
   pane,
   edl,
+  doc,
+  updateDoc,
   sel,
   update,
   srcDur,
@@ -4640,7 +5070,11 @@ function Inspector({
   playheadRef,
 }: {
   pane: Pane;
+  /** The cut as the format on screen sees it. */
   edl: Edl;
+  /** The document itself: the main format's shape is chosen on it. */
+  doc: Edl;
+  updateDoc: (fn: (d: Edl) => void) => void;
   sel: Sel;
   /** `coalesce` folds this edit into the previous undo step (one drag, one step). */
   update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
@@ -4660,7 +5094,7 @@ function Inspector({
     if (!sel)
       return (
         <div className="mt-2">
-          <FormatPicker edl={edl} update={update} resolveAsset={resolveAsset} />
+          <FormatPicker edl={doc} update={updateDoc} resolveAsset={resolveAsset} />
           <ClipsFit edl={edl} update={update} />
           <Row label="Project brief: what is this video for?">
             <textarea
@@ -4760,16 +5194,40 @@ function Inspector({
               ) : (
                 <NumberRow label="Trim end (s)" value={el.trimEnd ?? 0} min={0} onChange={(n) => set((e) => ((e as MainVideo).trimEnd = Math.max(0, n)))} />
               )}
-              <ClipFit value={el.fit} onChange={(fit) => set((x) => ((x as MainVideo).fit = fit))} />
-              {el.fit === "cover" && (
-                <ClipFraming
+              {!el.split && (
+                <>
+                  <ClipFit value={el.fit} onChange={(fit) => set((x) => ((x as MainVideo).fit = fit))} />
+                  {el.fit === "cover" && (
+                    <ClipFraming
+                      asset={resolveAsset(el.src)}
+                      crop={el.crop}
+                      frame={edl.output}
+                      onChange={(anchor) => set((x) => ((x as MainVideo).anchor = anchor))}
+                    />
+                  )}
+                  {mainCrop(el)}
+                </>
+              )}
+              {/* Stacking suits a frame at least as tall as it is wide; one already stacked stays editable anywhere. */}
+              {(el.split || edl.output.height >= edl.output.width) && (
+                <StackField
                   asset={resolveAsset(el.src)}
-                  crop={el.crop}
+                  split={el.split}
                   frame={edl.output}
-                  onChange={(anchor) => set((x) => ((x as MainVideo).anchor = anchor))}
+                  window={seg ? { from: el.trimStart ?? 0, to: (el.trimStart ?? 0) + seg.dur } : undefined}
+                  startAt={() => (el.trimStart ?? 0) + (seg ? Math.min(seg.dur, Math.max(0, playheadRef.current - seg.start)) : 0)}
+                  onChange={(split) =>
+                    set((x) => {
+                      const v = x as MainVideo;
+                      if (split) v.split = split;
+                      else {
+                        delete v.split;
+                        v.fit = "contain";
+                      }
+                    })
+                  }
                 />
               )}
-              {mainCrop(el)}
               <Row label="Clip audio">
                 <button
                   className={`${inputCls} text-left`}
@@ -5267,7 +5725,7 @@ function QualityPicker({ value, onChange }: { value: string; onChange: (q: strin
   );
 }
 
-function ExportControls({ projectId, disabled }: { projectId: string; disabled: boolean }) {
+function ExportControls({ projectId, format, disabled }: { projectId: string; format: string | null; disabled: boolean }) {
   const [quality, setQuality] = useState("standard");
   const [busy, setBusy] = useState(false);
   const [last, setLast] = useState<ExportJob | null>(null);
@@ -5280,15 +5738,22 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
     if (job.status === "completed" && job.output_url) setDone(job);
   }, []);
 
+  // Each format has its own exports: the one on screen is the one shown and exported.
   useEffect(() => {
+    let stale = false;
     api
       .get<ExportJob[]>(`/api/exports?project_id=${projectId}`)
-      .then((j) => {
+      .then((all) => {
+        if (stale) return;
+        const j = all.filter((x) => (x.format ?? null) === format);
         setLast(j[0] ?? null);
         setDone(j.find((x) => x.status === "completed" && x.output_url) ?? null);
       })
       .catch(() => {});
-  }, [projectId]);
+    return () => {
+      stale = true;
+    };
+  }, [projectId, format]);
 
   // The render runs in the background on the edit service, and each read of
   // the job is what moves it on, so keep reading until it settles. This also
@@ -5320,7 +5785,7 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
       const job = await api.send<ExportJob & { failure?: { detail?: string; path?: string } }>(
         "POST",
         `/api/projects/${projectId}/export`,
-        { quality },
+        { quality, format },
       );
       settle(job);
     } catch (e) {
@@ -5357,6 +5822,8 @@ function ExportControls({ projectId, disabled }: { projectId: string; disabled: 
       <button onClick={run} disabled={busy || !!exporting || disabled} className={btnPrimary}>
         {busy || exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Film className="w-4 h-4" />}
         {exporting ? "Exporting" : "Export"}
+        {/* Narrower screens see the format in the bar above the preview; the toolbar has no room for it. */}
+        {format && <span className="tabular-nums max-lg:hidden">{format}</span>}
       </button>
     </div>
   );

@@ -114,6 +114,35 @@ export function cropToRatio(src: Shape, ratio: number, around: { x: number; y: n
   };
 }
 
+/** The two halves a frame of `height` is stacked in, top first (the export's own split). */
+export function stackHalves(frame: Shape): [Shape, Shape] {
+  const top = 2 * Math.floor(frame.height / 4);
+  return [
+    { width: frame.width, height: top },
+    { width: frame.width, height: frame.height - top },
+  ];
+}
+
+/**
+ * A first stacking of two people seated side by side: the left half of the
+ * source on top, the right half below, each the shape of its half of the
+ * frame and as large as fits in its own side, so neither shows the other.
+ * Each sits at the top of the picture, where seated people's heads are, so
+ * a view cut short loses legs rather than faces. A starting point to adjust,
+ * not a guess at where anyone is.
+ */
+export function sideBySide(src: Shape, frame: Shape): { top: Crop; bottom: Crop } {
+  const [a, b] = stackHalves(frame).map((half) => {
+    const r = shareRatio(half.width / half.height, src);
+    const height = Math.min(1, 0.5 / r);
+    return { width: height * r, height };
+  });
+  return {
+    top: { x: 0.25 - a.width / 2, y: 0, ...a },
+    bottom: { x: 0.75 - b.width / 2, y: 0, ...b },
+  };
+}
+
 /** Slide the crop by `dx`, `dy` (shares of the source), keeping it inside. */
 export function moveCrop(c: Crop, dx: number, dy: number): Crop {
   return { ...c, x: clamp(c.x + dx, 0, 1 - c.width), y: clamp(c.y + dy, 0, 1 - c.height) };

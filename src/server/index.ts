@@ -1,3 +1,4 @@
+import { reframing } from "./reframe";
 import { backfillHighlights, libraryHighlights } from "./library-highlights";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { initDB, query, get, run } from "./db";
@@ -41,6 +42,7 @@ import { addFolderVideos, bookStep, readFolder, removeCopy, stepFootage, type Dr
 import { HIGHLIGHTS_NO_KEY, MAX_WANTED, highlightsPending, rankingDue, stepHighlights, type HighlightKind } from "./highlights";
 import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
+import { findFormat, renderDoc } from "../shared/formats";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
 import { instructEdit, type InstructHighlight } from "./instruct";
 import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
@@ -72,6 +74,7 @@ const init: MiddlewareHandler<{ Bindings: Bindings }> = async (c, next) => {
 app.use("/api/*", init);
 app.use("/s/*", init);
 app.route("/api/highlights", libraryHighlights);
+app.route("/api/reframe", reframing);
 
 app.onError((err, c) => {
   if (err.message.includes("source_unavailable")) return c.json({ error: "source_unavailable", detail: "A video in this edit was removed or is being deleted. Refresh the library before saving." }, 409);
@@ -641,6 +644,8 @@ interface ExportJob {
   size: number | null;
   /** The render's job on the edit service; null until it is submitted. */
   service_job_id: string | null;
+  /** Which of the project's formats it renders: a ratio such as "9:16", or null for the main one. */
+  format: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1903,12 +1908,23 @@ app.post("/api/projects/:id/export", async (c) => {
     );
   }
 
-  const b = (await c.req.json<{ quality?: string }>().catch(() => ({}))) as { quality?: string };
+  const b = (await c.req.json<{ quality?: string; format?: string | null }>().catch(() => ({}))) as {
+    quality?: string;
+    format?: string | null;
+  };
   const quality = ["draft", "standard", "high"].includes(b.quality ?? "") ? b.quality! : "standard";
+  const format = b.format ?? null;
+  if (format !== null && !findFormat(parsed.edl, format)) {
+    return c.json(
+      { error: "format_unknown", detail: `${format} is not one of this project's formats`, path: "/formats" },
+      422,
+    );
+  }
   const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
 
-  const res = await run("INSERT INTO export_jobs (project_id, status) VALUES (?, 'exporting')", [
+  const res = await run("INSERT INTO export_jobs (project_id, status, format) VALUES (?, 'exporting', ?)", [
     project.id,
+    format,
   ]);
   const jobId = res.lastInsertRowid as number;
 
@@ -1918,9 +1934,10 @@ app.post("/api/projects/:id/export", async (c) => {
   // with no render at all, failing only when a read noticed, 15 minutes on.
   const handover: Promise<{ ok: true } | ExportFailure> = (async () => {
     try {
-      const resolved = await resolveEdlSources(parsed.edl, cfg);
+      const resolved = await resolveEdlSources(renderDoc(parsed.edl, format), cfg);
       if ("failure" in resolved) return resolved.failure;
-      const started = await startEdit(resolved.edl, { quality, filename: `${makeKey(project.name)}.mp4` }, cfg);
+      const name = format ? `${project.name} ${format.replace(":", "x")}` : project.name;
+      const started = await startEdit(resolved.edl, { quality, filename: `${makeKey(name)}.mp4` }, cfg);
       if ("failure" in started) return started.failure;
       // The render is on its way; reads of this job settle it (settleExport).
       await run("UPDATE export_jobs SET service_job_id = ?, updated_at = datetime('now') WHERE id = ?", [

@@ -16,6 +16,8 @@
 import { z } from "zod";
 import { MAX_FADE_SECONDS } from "../shared/fade";
 import { MAX_TRANSITION_SECONDS, TRANSITION_TYPES } from "../shared/transition";
+import { parseRatio, sameShape } from "../shared/format";
+import { MAX_FORMATS } from "../shared/formats";
 
 export const MAX_ELEMENTS = 100;
 export const MAX_SOURCES = 20;
@@ -86,6 +88,29 @@ const transition = z
   })
   .strict();
 
+/** Another format's shape, named by its ratio: "9:16" (shared/formats.ts). */
+const formatId = z.string().regex(/^\d+(?:\.\d+)?:\d+(?:\.\d+)?$/, "a format is named by its ratio, such as 9:16");
+
+const split = z.object({ top: crop, bottom: crop }).strict();
+
+/** How a main clip sits in another format's frame. Absent: its whole shot. */
+const framing = (withSplit: boolean) =>
+  z
+    .record(
+      formatId,
+      z
+        .object({
+          fit: fit.optional(),
+          anchor: anchor.optional(),
+          crop: crop.optional(),
+          ...(withSplit ? { split: split.optional() } : {}),
+        })
+        .strict(),
+    )
+    .optional();
+
+const share = z.number().finite().min(0).max(1);
+
 const mainVideo = z
   .object({
     ...clipBase,
@@ -100,6 +125,9 @@ const mainVideo = z
     fit: fit.optional(),
     anchor: anchor.optional(),
     crop: crop.optional(),
+    /** Two views of the source stacked top and bottom, each filling its half. */
+    split: split.optional(),
+    framing: framing(true),
     /** Seconds to fade up from black, and down to black before the clip
      *  ends; a video clip's own sound fades with it. shared/fade.ts */
     fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
@@ -116,6 +144,7 @@ const mainImage = z
     fit: fit.optional(),
     anchor: anchor.optional(),
     crop: crop.optional(),
+    framing: framing(false),
     /** Seconds to fade up from black, and down to black before the clip
      *  ends; a video clip's own sound fades with it. shared/fade.ts */
     fadeIn: seconds.max(MAX_FADE_SECONDS).optional(),
@@ -147,6 +176,10 @@ const overlayMedia = z
     /** Fraction of canvas width; height keeps the (cropped) source aspect. */
     width: z.number().finite().min(0.01).max(1),
     crop: crop.optional(),
+    /** Where it sits in another format's frame. Absent: where the format change put it. */
+    placement: z
+      .record(formatId, z.object({ x: share, y: share, width: z.number().finite().min(0.01).max(1).optional() }).strict())
+      .optional(),
   })
   .strict();
 
@@ -170,6 +203,10 @@ const overlayText = z
       .strict()
       .optional(),
     align: z.enum(["left", "center", "right"]).optional(),
+    /** Where it sits, and how big, in another format's frame. Absent: where the format change put it. */
+    placement: z
+      .record(formatId, z.object({ x: share, y: share, fontSize: z.number().int().min(8).max(400).optional() }).strict())
+      .optional(),
   })
   .strict();
 
@@ -240,6 +277,19 @@ export const edlSchema = z
         background: hexColor.optional(),
       })
       .strict(),
+    /** More shapes of the same cut, besides `output` (shared/formats.ts). */
+    formats: z
+      .array(
+        z
+          .object({
+            id: formatId,
+            width: z.number().int().min(16).max(3840).refine((n) => n % 2 === 0, "must be even"),
+            height: z.number().int().min(16).max(2160).refine((n) => n % 2 === 0, "must be even"),
+          })
+          .strict(),
+      )
+      .max(MAX_FORMATS)
+      .optional(),
     // Drafts may be empty; export requires at least one main element.
     main: z.object({ elements: z.array(z.discriminatedUnion("type", [mainVideo, mainImage])) }).strict(),
     overlays: z.array(overlayTrack).max(MAX_TRACKS).optional(),
@@ -279,6 +329,8 @@ export function validateEdl(input: unknown): { edl: Edl } | { invalid: EdlInvali
   if (sources.size > MAX_SOURCES) {
     return { invalid: { error: "edl_invalid", detail: `too many distinct sources: ${sources.size} (max ${MAX_SOURCES})` } };
   }
+  const formatProblem = checkFormats(edl);
+  if (formatProblem) return { invalid: { error: "edl_invalid", ...formatProblem } };
   const ids = new Set<string>();
   for (const el of all) {
     if (ids.has(el.id)) {
@@ -287,6 +339,32 @@ export function validateEdl(input: unknown): { edl: Edl } | { invalid: EdlInvali
     ids.add(el.id);
   }
   return { edl };
+}
+
+/** Formats name their own shape, differ from each other and from the main one, and every framing names one. */
+function checkFormats(edl: Edl): { detail: string; path: string } | null {
+  const formats = edl.formats ?? [];
+  for (const [i, f] of formats.entries()) {
+    const r = parseRatio(f.id);
+    if (!r || !sameShape(f, { width: r.w, height: r.h })) {
+      return { detail: `format ${f.id} is ${f.width}x${f.height}, which is not that shape`, path: `/formats/${i}/id` };
+    }
+    if (sameShape(f, edl.output)) return { detail: `format ${f.id} is the main format's shape already`, path: `/formats/${i}` };
+    if (formats.slice(0, i).some((g) => sameShape(f, g))) return { detail: `format ${f.id} is listed twice`, path: `/formats/${i}` };
+  }
+  const known = new Set(formats.map((f) => f.id));
+  const unknown = (keys: string[] | undefined) => keys?.find((k) => !known.has(k));
+  for (const [i, el] of edl.main.elements.entries()) {
+    const k = unknown(el.framing && Object.keys(el.framing));
+    if (k) return { detail: `framing for ${k}, which is not one of the project's formats`, path: `/main/elements/${i}/framing/${k}` };
+  }
+  for (const [t, track] of (edl.overlays ?? []).entries()) {
+    for (const [i, el] of track.elements.entries()) {
+      const k = unknown(el.placement && Object.keys(el.placement));
+      if (k) return { detail: `placement for ${k}, which is not one of the project's formats`, path: `/overlays/${t}/elements/${i}/placement/${k}` };
+    }
+  }
+  return null;
 }
 
 type AnyElement =

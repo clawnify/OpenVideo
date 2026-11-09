@@ -38,6 +38,17 @@ describe("Ask operations", () => {
     expect(apply(d, "set_format", { format: "vertical" })).toHaveProperty("error");
   });
 
+  it("adds another format of the same cut, and keeps the main one off its shape", () => {
+    const d = edl();
+    expect(apply(d, "add_format", { format: "9:16" })).toHaveProperty("said");
+    expect(d.output).toMatchObject({ width: 1280, height: 720 });
+    expect(d.formats).toEqual([{ id: "9:16", width: 720, height: 1280 }]);
+    expect(apply(d, "add_format", { format: "9:16" })).toHaveProperty("error");
+    expect(apply(d, "add_format", { format: "16:9" })).toHaveProperty("error");
+    expect(apply(d, "set_format", { format: "9:16" })).toHaveProperty("error");
+    expect(d.output).toMatchObject({ width: 1280, height: 720 });
+  });
+
   it("clean up replaces a clip with the parts the analysis keeps", async () => {
     const d = edl();
     const out = await cleanUp(d, { clip: 0 }, new Map(), async (_asset, window) => {
