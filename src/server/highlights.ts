@@ -1,3 +1,4 @@
+import { backfillHighlights } from "./library-highlights";
 // Highlights: the selects an editor looks at first. For every logged clip of
 // a project's footage, whether it is worth an editor's time and, if it is,
 // the parts to cut from: soundbites (speech that stands on its own) and
@@ -755,6 +756,7 @@ async function setClip(id: string, fields: Record<string, unknown>, where = ""):
 
 /** Replace a clip's unreviewed picks with a new verdict's. */
 export async function saveVerdict(projectId: string, v: ClipVerdict): Promise<void> {
+  await backfillHighlights();
   await run("DELETE FROM footage_highlights WHERE footage_id = ? AND pick IS NULL", [v.id]);
   // VALUES keeps this one SELECT: D1 limits compound SELECT terms more
   // tightly than local SQLite. Eight rows plus the shared guard use 74 binds.

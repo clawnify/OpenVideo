@@ -286,3 +286,79 @@ CREATE INDEX IF NOT EXISTS idx_project_footage_source ON project_footage(project
 -- Durable deletion intent: an asset being removed cannot gain new analysis
 -- references while its media deletion is in flight. A failed cleanup can be retried.
 ALTER TABLE assets ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0;
+
+-- Reusable source selections. Project rankings remain in footage_highlights;
+-- these ranges and their media survive project deletion and regeneration.
+CREATE TABLE IF NOT EXISTS library_highlights (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('soundbite', 'broll')),
+  src_in REAL NOT NULL,
+  src_out REAL NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  speaker TEXT NOT NULL DEFAULT '',
+  source_project_id TEXT,
+  deleted_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(asset_id, kind, src_in, src_out)
+);
+CREATE INDEX IF NOT EXISTS library_highlights_created ON library_highlights(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS library_highlights_asset ON library_highlights(asset_id, deleted_at);
+
+-- Publish in the same transaction as the suggestion: an asset deletion claim
+-- or detached footage cannot race a background result into the shared catalog.
+CREATE TRIGGER IF NOT EXISTS publish_highlight_insert AFTER INSERT ON footage_highlights
+BEGIN
+  INSERT OR IGNORE INTO library_highlights (id, asset_id, kind, src_in, src_out, text, speaker, source_project_id, created_at)
+  SELECT NEW.id, a.id, NEW.kind, NEW.src_in, NEW.src_out, NEW.text, NEW.speaker, NEW.project_id, NEW.created_at
+  FROM project_footage f JOIN assets a ON a.id = f.asset_id
+  WHERE f.id = NEW.footage_id AND f.project_id = NEW.project_id AND f.status = 'ready' AND a.deleting = 0;
+END;
+CREATE TRIGGER IF NOT EXISTS publish_highlight_edit AFTER UPDATE OF src_in, src_out, text, speaker ON footage_highlights
+BEGIN
+  INSERT INTO library_highlights (id, asset_id, kind, src_in, src_out, text, speaker, source_project_id)
+  SELECT lower(hex(randomblob(8))), a.id, NEW.kind, NEW.src_in, NEW.src_out, NEW.text, NEW.speaker, NEW.project_id
+  FROM project_footage f JOIN assets a ON a.id = f.asset_id
+  WHERE f.id = NEW.footage_id AND f.project_id = NEW.project_id AND f.status = 'ready' AND a.deleting = 0
+  ON CONFLICT(asset_id, kind, src_in, src_out) DO UPDATE SET text = excluded.text, speaker = excluded.speaker;
+END;
+
+-- A retry of Create portrait clips returns the projects already created.
+ALTER TABLE edit_projects ADD COLUMN creation_batch TEXT;
+ALTER TABLE edit_projects ADD COLUMN highlight_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS edit_projects_creation ON edit_projects(creation_batch, highlight_id);
+
+-- Enforce source lifetime for every writer, including Ask and automatic cuts.
+CREATE TRIGGER IF NOT EXISTS project_assets_insert BEFORE INSERT ON edit_projects
+WHEN EXISTS (SELECT 1 FROM json_tree(NEW.edl) j WHERE j.key = 'src' AND j.type = 'text' AND j.value LIKE 'asset:%'
+  AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.id = substr(j.value, 7) AND a.deleting = 0))
+BEGIN
+  SELECT RAISE(ABORT, 'source_unavailable');
+END;
+
+-- Enforce source lifetime for every writer, including Ask and automatic cuts.
+CREATE TRIGGER IF NOT EXISTS project_assets_update BEFORE UPDATE OF edl ON edit_projects
+WHEN EXISTS (SELECT 1 FROM json_tree(NEW.edl) j WHERE j.key = 'src' AND j.type = 'text' AND j.value LIKE 'asset:%'
+  AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.id = substr(j.value, 7) AND a.deleting = 0))
+BEGIN
+  SELECT RAISE(ABORT, 'source_unavailable');
+END;
+
+-- Request identity outlives the generated projects. Completed requests never
+-- recreate a clip someone later deleted, including a retry after lost response.
+CREATE TABLE IF NOT EXISTS highlight_creations (
+  request_id TEXT PRIMARY KEY,
+  selection TEXT NOT NULL,
+  result TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TRIGGER IF NOT EXISTS complete_highlight_creation AFTER INSERT ON edit_projects
+WHEN NEW.creation_batch IS NOT NULL
+  AND (SELECT COUNT(*) FROM edit_projects WHERE creation_batch = NEW.creation_batch) =
+    (SELECT json_array_length(selection) FROM highlight_creations WHERE request_id = NEW.creation_batch)
+BEGIN
+  UPDATE highlight_creations SET result = (
+    SELECT json_group_array(json_object('id',id,'name',name,'highlight_id',highlight_id))
+    FROM edit_projects WHERE creation_batch = NEW.creation_batch
+  ) WHERE request_id = NEW.creation_batch AND result IS NULL;
+END;
