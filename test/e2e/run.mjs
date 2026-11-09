@@ -1,0 +1,1426 @@
+// End-to-end check of OpenVideo's footage-from-Drive routes: the real Hono
+// server over node:sqlite, with Drive, the media/analysis services and the
+// queue stubbed at fetch. Run it with `pnpm test:e2e`, which bundles the
+// server first. By hand: node run.mjs <bundle.mjs> <schema.sql>, the bundle
+// path relative to this file and the schema path to the working directory.
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
+import assert from "node:assert/strict";
+
+const [bundlePath, schemaPath] = process.argv.slice(2);
+let n = 0;
+const fresh = async () => (await import(`${bundlePath}?${n++}`)).default;
+
+function storage() {
+  const db = new DatabaseSync(":memory:");
+  db.exec(readFileSync(schemaPath, "utf8"));
+  return {
+    db,
+    binding: {
+      async query(sql, params = []) {
+        // Production D1 rejects the UNION-based batch insert even though
+        // node:sqlite accepts it. Keep the regression inside the real routes.
+        if (sql.includes('INSERT INTO footage_highlights') && (sql.match(/UNION ALL/gi)?.length ?? 0) >= 7) {
+          throw new Error('D1_ERROR: too many terms in compound SELECT: SQLITE_ERROR');
+        }
+        assert.ok(params.length <= 100, 'D1 allows at most 100 bound parameters');
+        if (sql.includes('INSERT INTO footage_highlights') && sql.includes("'person'") && world.beforePersonPick) {
+          const before = world.beforePersonPick; world.beforePersonPick = null; await before();
+        }
+        if (sql.includes('WITH clips(id, name, edl, creation_batch, highlight_id)') && world.beforePortraitInsert) {
+          const before = world.beforePortraitInsert; world.beforePortraitInsert = null; await before();
+        }
+        const st = db.prepare(sql);
+        const p = params.map((v) => (typeof v === "boolean" ? Number(v) : v === undefined ? null : v));
+        if (/^\s*(select|pragma|with)/i.test(sql) || /\breturning\b/i.test(sql)) return { rows: st.all(...p) };
+        const r = st.run(...p);
+        return { rows: [], meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
+      },
+    },
+  };
+}
+
+// ── the outside world ─────────────────────────────────────────────────────
+const folderEntry = (id, name) =>
+  `<div class="flip-entry" id="entry-${id}" tabindex="0" role="link"><div class="flip-entry-info"><a href="https://drive.google.com/drive/folders/${id}" target="_blank"><div class="flip-entry-list-icon"><div aria-label="Folder" class="drive-sprite-folder-list-shared-icon"></div></div><div class="flip-entry-title">${name}</div></a></div></div>`;
+const fileEntry = (id, name, type = "video/mp4") =>
+  `<div class="flip-entry" id="entry-${id}" tabindex="0" role="link"><div class="flip-entry-info"><a href="https://drive.google.com/file/d/${id}/view?usp=drive_web" target="_blank"><div class="flip-entry-list-icon"><img src="https://drive-thirdparty.googleusercontent.com/16/type/${type}" alt=""/></div><div class="flip-entry-title">${name}</div></a></div></div>`;
+const page = (title, entries) => `<html><head><title>${title}</title></head><body>${entries.join("")}</body></html>`;
+const fid = (s) => (s + "_".repeat(28)).slice(0, 28);
+
+const world = {
+  drive: {},
+  media: new Map(), // uid → { polls, name, deleted, pendingUpload }
+  uploads: new Map(), // uid → { size, at, name, patches }: uploads opened on the media service
+  big: {}, // Drive file id → { size, refuseFrom }: files Drive serves only in pieces
+  jobs: new Map(),
+  calls: [],
+  importRefusal: null,
+  analyzeRefusal: null,
+  prompts: [],
+  modelRefusal: null,
+  vtt: "WEBVTT\n\n1\n00:00:04.800 --> 00:00:09.600\nWe made it.\n",
+};
+// The platform's delivery signature, with a key of our own served as its JWKS.
+const signing = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+world.jwk = await crypto.subtle.exportKey("jwk", signing.publicKey);
+async function signed(body) {
+  const ts = Math.floor(Date.now() / 1000);
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, signing.privateKey, new TextEncoder().encode(`${ts}.${body}`)));
+  return { "X-Queue-Signature": btoa(String.fromCharCode(...sig)), "X-Queue-Timestamp": String(ts), "X-Queue-Key-Id": "test" };
+}
+function setDrive(extra = []) {
+  world.drive = {
+    [fid("day1")]: page("Day 1", [folderEntry(fid("camb"), "Cam B"), folderEntry(fid("testi"), "Testimonials"), folderEntry(fid("photos"), "Photos")]),
+    [fid("camb")]: page("Cam B", [fileEntry(fid("b1"), "B_0001.MP4"), fileEntry(fid("b2"), "B_0002.MP4"), ...extra]),
+    [fid("testi")]: page("Testimonials", [folderEntry(fid("t1"), "Testimonial 1")]),
+    [fid("t1")]: page("Testimonial 1", [fileEntry(fid("c1"), "C_9193.MP4"), fileEntry(fid("d1"), "D_7423.MP4")]),
+    [fid("photos")]: page("Photos", [fileEntry(fid("p1"), "P_0001.JPG", "image/jpeg")]),
+  };
+}
+setDrive();
+
+const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+let uidN = 0;
+// `n` bytes, made as they are read: a piece of a big file costs no memory.
+const ZEROS = new Uint8Array(1 << 20);
+const zeros = (n) => {
+  let left = n;
+  return new ReadableStream({
+    pull(c) {
+      if (left <= 0) return c.close();
+      const k = Math.min(left, ZEROS.length);
+      c.enqueue(ZEROS.subarray(0, k));
+      left -= k;
+    },
+  });
+};
+const quotaPage = () =>
+  new Response("<html><head><title>Google Drive - Quota exceeded</title></head><body>Too many users have viewed or downloaded this file recently.</body></html>", {
+    status: 200,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+globalThis.fetch = async (input, init = {}) => {
+  const url = typeof input === "string" ? input : input.url;
+  const method = init.method ?? "GET";
+  world.calls.push(`${method} ${url}`);
+  const u = new URL(url);
+  if (u.hostname === "drive.google.com" && u.pathname === "/embeddedfolderview") {
+    const html = world.drive[u.searchParams.get("id")];
+    return html ? new Response(html, { status: 200, headers: { "content-type": "text/html" } }) : new Response("no", { status: 404 });
+  }
+  if (u.hostname === "drive.usercontent.google.com") {
+    const range = new Headers(init.headers ?? {}).get("range");
+    const ranged = range !== null;
+    const id = u.searchParams.get("id");
+    // Over Drive's daily download limit: the whole file gets the quota page,
+    // a piece its bytes, unless Drive is refusing pieces from some point on.
+    const big = world.big[id];
+    if (big) {
+      if (!ranged) {
+        (world.wholeAsks ??= []).push(id);
+        return quotaPage();
+      }
+      const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(range);
+      const start = Number(a);
+      const end = Math.min(Number(b), big.size - 1);
+      if (big.refuseFrom !== undefined && start >= big.refuseFrom) return quotaPage();
+      return new Response(zeros(end - start + 1), { status: 206, headers: { "content-type": "video/mp4", "content-range": `bytes ${start}-${end}/${big.size}` } });
+    }
+    const served = world.servedSizes?.[id];
+    if (served && !ranged) return new Response("x".repeat(64), { status: 200, headers: { "content-type": "video/mp4", "content-length": String(served) } });
+    // Over the limit and refusing pieces too: nothing gets it in but waiting.
+    if (id === fid("q1") && !world.quotaLifted) return quotaPage();
+    if (id.startsWith("conn") && id !== "conn_big___________________" && !ranged) {
+      // Over Drive's daily download limit: ranged reads still work, the whole file doesn't.
+      return quotaPage();
+    }
+    return ranged
+      ? new Response("xx", { status: 206, headers: { "content-type": "video/mp4", "content-range": "bytes 0-1/123456789" } })
+      : new Response("x".repeat(64), { status: 200, headers: { "content-type": "video/mp4", "content-length": "123456789" } });
+  }
+  // The broker's link to one piece it fetched (see proxyRequest below).
+  if (u.hostname === "temp.r2.test" && u.pathname.startsWith("/piece/")) {
+    const [a, b] = u.pathname.split("/").pop().split("-").map(Number);
+    return new Response(zeros(b - a + 1), { status: 200, headers: { "content-type": "video/mp4" } });
+  }
+  // The media service's resumable upload, with the video host's rules: a
+  // named user agent ("error code: 1010" otherwise), a piece only at the
+  // upload's own offset, at most 200 MiB, and every piece but the last at
+  // least 5 MiB and a multiple of 256 KiB.
+  if (u.hostname === "upload.test") {
+    const id = u.pathname.split("/").pop();
+    const up = world.uploads.get(id);
+    const h = new Headers(init.headers ?? {});
+    if (!h.get("user-agent")) return new Response("error code: 1010", { status: 403 });
+    if (h.get("tus-resumable") !== "1.0.0") return new Response(null, { status: 412 });
+    if (!up || world.media.get(id)?.deleted) return new Response(null, { status: 404 });
+    if (method === "HEAD") return new Response(null, { status: 200, headers: { "Upload-Offset": String(up.at), "Upload-Length": String(up.size) } });
+    if (method === "PATCH") {
+      if (world.refusePatches === id) return new Response("Decoding Error", { status: 400 });
+      if (world.patchFails?.(id, up.at)) return new Response("busy", { status: 503 });
+      if (Number(h.get("upload-offset")) !== up.at) return new Response(null, { status: 409 });
+      if (h.get("content-type") !== "application/offset+octet-stream") return new Response(null, { status: 415 });
+      let n = 0;
+      for await (const chunk of init.body) n += chunk.byteLength;
+      const last = up.at + n === up.size;
+      if (n > 200 * 2 ** 20 || up.at + n > up.size || (!last && (n < 5 * 2 ** 20 || n % (256 * 1024) !== 0))) {
+        return new Response("bad chunk", { status: 400 });
+      }
+      up.patches.push(up.at);
+      up.at += n;
+      if (last) world.media.get(id).pendingUpload = false;
+      return new Response(null, { status: 204, headers: { "Upload-Offset": String(up.at) } });
+    }
+  }
+  if (u.hostname === "svc.test") {
+    if (u.pathname === "/media/uploads" && method === "POST") {
+      const body = JSON.parse(init.body);
+      const id = (++uidN).toString(16).padStart(32, "0");
+      world.media.set(id, { polls: 0, name: body.name, pendingUpload: true });
+      world.uploads.set(id, { size: body.size, at: 0, name: body.name, patches: [] });
+      return json(201, { id, upload_url: `https://upload.test/tus/${id}?tusv2=true`, expires_at: new Date(Date.now() + 6 * 3600_000).toISOString() });
+    }
+    if (u.pathname === "/media/import") {
+      if (world.importRefusal) return json(409, world.importRefusal);
+      const id = (++uidN).toString(16).padStart(32, "0");
+      world.media.set(id, { polls: 0, name: JSON.parse(init.body).name });
+      (world.importUrls ??= []).push(JSON.parse(init.body).url);
+      return json(201, { id, state: "downloading", ready: false });
+    }
+    if (u.pathname === "/media/transcode" && method === "POST") {
+      world.transcodes = (world.transcodes ?? 0) + 1;
+      (world.transcodeUrls ??= []).push(JSON.parse(init.body).url);
+      return json(202, { job_id: `00000000-0000-0000-0000-00000000000${world.transcodes}` });
+    }
+    const tj = /^\/media\/transcode\/([0-9a-f-]{36})$/.exec(u.pathname);
+    if (tj) {
+      world.tpolls = (world.tpolls ?? 0) + 1;
+      if (world.tpolls < 2) return json(200, { status: "running" });
+      const id = (++uidN).toString(16).padStart(32, "0");
+      world.media.set(id, { polls: 0, name: "re-encoded" });
+      return json(200, { status: "done", id });
+    }
+    let m = /^\/media\/([0-9a-f]{32})$/.exec(u.pathname);
+    if (m && method === "DELETE") {
+      if (world.beforeMediaDelete) { const before = world.beforeMediaDelete; world.beforeMediaDelete = null; await before(); }
+      if (world.refuseMediaDeletes > 0) {
+        world.refuseMediaDeletes--;
+        (world.refusedDeletes ??= []).push(m[1]);
+        return json(503, { error: "media_failed", detail: "storage is busy" });
+      }
+      const v = world.media.get(m[1]);
+      if (!v || v.deleted) return json(404, { error: "not_found" });
+      v.deleted = true;
+      return new Response(null, { status: 204 });
+    }
+    if (m) {
+      const v = world.media.get(m[1]);
+      if (!v || v.deleted) return json(404, { error: "not_found" });
+      if (v.pendingUpload) return json(200, { id: m[1], state: "pendingupload", ready: false, duration: null, error: null });
+      v.polls++;
+      if (v.name === "HIGH.MP4") return json(200, { id: m[1], state: "error", ready: false, duration: null, error: "The video bitrate exceeded the maximum acceptable value of 200 Mbps." });
+      const ready = v.polls >= 2;
+      const length = v.name === "SHORT.MP4" ? 0.28 : 60;
+      return json(200, { id: m[1], state: ready ? "ready" : "inprogress", ready, duration: ready ? length : null, error: null });
+    }
+    m = /^\/media\/([0-9a-f]{32})\/prepare$/.exec(u.pathname);
+    if (m) {
+      const v = world.media.get(m[1]);
+      v.prepares = (v.prepares ?? 0) + 1;
+      return json(200, { id: m[1], state: "ready", ready: true, duration: 60, download: { status: "ready", percent: 100 }, analysis: v.prepares >= 2 ? "ready" : "preparing" });
+    }
+    if (u.pathname === "/video/edit" && method === "POST") {
+      world.lastEdit = JSON.parse(init.body);
+      if (world.editRefusal) return json(422, world.editRefusal);
+      world.renders = (world.renders ?? 0) + 1;
+      return json(202, { job_id: `render${world.renders}`, status: "running" });
+    }
+    if (u.pathname === "/video/analyze") {
+      if (world.analyzeRefusal) return json(world.analyzeRefusal.status, world.analyzeRefusal.body);
+      const body = JSON.parse(init.body);
+      const job = `job${world.jobs.size + 1}`;
+      world.jobs.set(job, { polls: 0, source: body.source });
+      return json(202, { job_id: job, status: "running" });
+    }
+    m = /^\/video\/analyze\/(job\d+)$/.exec(u.pathname);
+    if (m) {
+      const j = world.jobs.get(m[1]);
+      j.polls++;
+      if (j.polls < 2) return json(200, { status: "running" });
+      return json(200, {
+        status: "done",
+        result: {
+          summary: `Log of ${j.source}`,
+          kind: j.source.endsWith("1") ? "interview" : "b-roll",
+          quality: "good",
+          issues: "",
+          quotes: [{ start: "0:05", end: "0:09.5", text: "We made it.", speaker: "woman in a red jacket" }],
+          moments: [{ start: "0:20", end: "0:26", description: "Crowd at the booth" }],
+          visible_text: ["Northwind"],
+        },
+      });
+    }
+  }
+  if (u.hostname === "services.clawnify.com" && u.pathname === "/.well-known/jwks.json") {
+    return json(200, { keys: [{ ...world.jwk, kid: "test" }] });
+  }
+  if (u.hostname === "svc.test" && /^\/media\/[0-9a-f]{32}\/captions\/en$/.test(u.pathname)) {
+    return new Response(world.vtt, { status: 200, headers: { "content-type": "text/vtt" } });
+  }
+  if (u.hostname === "openrouter.ai") {
+    const body = JSON.parse(init.body);
+    const prompt = body.messages[0].content;
+    world.prompts.push(prompt);
+    if (world.beforeModel) { const before = world.beforeModel; world.beforeModel = null; await before(); }
+    if (world.modelRefusal) return new Response(world.modelRefusal.body, { status: world.modelRefusal.status });
+    // Choosing the best: the b-roll, last listed first, then the soundbites as
+    // stand-ins. By score alone the soundbites (5) would come first.
+    if (/^PICK 1: /m.test(prompt)) {
+      const picks = [...prompt.matchAll(/^PICK (\d+): (soundbite|b-roll),/gm)].map((m) => ({ n: Number(m[1]), kind: m[2] }));
+      const content = JSON.stringify({
+        best: picks.filter((x) => x.kind === "b-roll").map((x) => x.n).reverse(),
+        reserve: picks.filter((x) => x.kind === "soundbite").map((x) => x.n),
+      });
+      return json(200, { choices: [{ message: { content } }] });
+    }
+    // One answer per clip in the prompt: a soundbite where there is speech,
+    // a shot everywhere, and B_0003 set aside.
+    const clips = [...prompt.matchAll(/^CLIP (\d+): "([^"]+)"/gm)].map((m) => ({ n: Number(m[1]), name: m[2] }));
+    const content = JSON.stringify({
+      clips: clips.map(({ n, name }) =>
+        name === "B_0003.MP4"
+          ? { clip: n, use: false, skip_reason: "camera pointed at the floor", highlights: [] }
+          : {
+              clip: n,
+              use: true,
+              skip_reason: "",
+              highlights: [
+                ...Array.from({ length: world.extraHighlights ?? 0 }, (_, i) => ({ kind: "broll", start: 30 + i * 10, end: 35 + i * 10, text: `Additional moment ${i}`, speaker: "", score: 3, reason: "distinct moment" })),
+                { kind: "broll", start: "0:20", end: "0:26", text: `Crowd at the booth (${name})`, speaker: "", score: 3, reason: "energy" },
+                ...(prompt.includes("Transcript:") ? [{ kind: "soundbite", start: "0:05.2", end: "0:09", text: "We made it.", speaker: "woman in a red jacket", score: 5, reason: "the day in three words" }] : []),
+              ],
+            },
+      ),
+    });
+    return json(200, { choices: [{ message: { content } }] });
+  }
+  if (u.hostname === "queue.test") {
+    if (world.failNextEnqueue) { world.failNextEnqueue = false; return json(503, { error: "busy" }); }
+    const body = JSON.parse(init.body);
+    world.lastEnqueue = body;
+    return json(201, { id: `qjob_${world.calls.length}`, job_id: `qjob_${world.calls.length}`, status: "pending", run_at: body.run_at });
+  }
+  throw new Error(`unexpected fetch ${method} ${url}`);
+};
+
+// ── the scenario ──────────────────────────────────────────────────────────
+const MAX_WANTED_PLUS_ONE = () => 201;
+const { db, binding } = storage();
+const app = await fresh();
+const env = { STORAGE: binding, UPLOADS: {}, CLAWNIFY_TOKEN: "clw_test", SERVICES_URL: "https://svc.test", CLAWNIFY_QUEUE_URL: "https://queue.test/queue" };
+const ctx = { waitUntil() {}, passThroughOnException() {} };
+const call = async (method, path, body) => {
+  const res = await app.request(`https://open-video.apps.clawnify.com${path}`, {
+    method,
+    headers: body ? { "content-type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  }, env, ctx);
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = text; }
+  return { status: res.status, data };
+};
+
+// 1. A project from a folder: every video in every folder inside it, no stills.
+let r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day1")}?usp=sharing` });
+assert.equal(r.status, 201, JSON.stringify(r.data));
+assert.equal(r.data.name, "Day 1");
+assert.deepEqual(r.data.footage, { folder: { id: fid("day1"), name: "Day 1" }, found: 4, added: 4, truncated: false });
+const pid = r.data.id;
+assert.ok(world.lastEnqueue, "a background step was booked");
+assert.equal(world.lastEnqueue.target_url ?? world.lastEnqueue.targetUrl, "https://open-video.apps.clawnify.com/api/footage/step");
+console.log("1 ok: project from folder, 4 videos, step booked:", world.lastEnqueue.idempotency_key ?? world.lastEnqueue.idempotencyKey);
+
+// A link that isn't a folder, and a folder that isn't public.
+r = await call("POST", "/api/projects", { folder: "https://example.com/x" });
+assert.equal(r.status, 400);
+r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("private")}` });
+assert.equal(r.status, 422);
+assert.match(r.data.detail, /shared with anyone who has the link/);
+console.log("1b ok: bad link 400, private folder 422");
+
+// 2. Reads move it on: import → ready → analysis copy → log.
+const statuses = async () => {
+  const x = await call("GET", `/api/projects/${pid}/footage?logs=0`);
+  assert.equal(x.status, 200, JSON.stringify(x.data));
+  return x.data;
+};
+let f = await statuses();
+assert.equal(f.counts.importing, 4, JSON.stringify(f.counts));
+assert.deepEqual(f.items.map((i) => i.folder), ["Day 1/Cam B", "Day 1/Cam B", "Day 1/Testimonials/Testimonial 1", "Day 1/Testimonials/Testimonial 1"]);
+const enqueuesAfterFirstRead = world.calls.filter((c) => c.includes("queue.test")).length;
+f = await statuses();
+assert.equal(world.calls.filter((c) => c.includes("queue.test")).length, enqueuesAfterFirstRead, "a read within the booked minute books nothing more");
+for (let i = 0; i < 6 && f.counts.logged < 4; i++) f = await statuses();
+assert.equal(f.counts.ready, 4, JSON.stringify(f.counts));
+assert.equal(f.counts.logged, 4, JSON.stringify(f.counts));
+assert.equal(f.next_step_at, null, "nothing left: no step booked");
+assert.deepEqual(f.items[0].log, { summary: f.items[0].log.summary, kind: f.items[0].log.kind, quality: "good" }, "logs=0 gives the short log");
+assert.equal(f.items[0].asset.duration, 60);
+console.log("2 ok: imported and logged in", world.jobs.size, "analysis jobs");
+
+// 3. The full log, paged and narrowed.
+r = await call("GET", `/api/projects/${pid}/footage?limit=1`);
+assert.equal(r.data.items.length, 1);
+assert.equal(r.data.next_offset, 1);
+assert.deepEqual(r.data.items[0].log.quotes, [{ start: 5, end: 9.5, text: "We made it.", speaker: "woman in a red jacket" }]);
+r = await call("GET", `/api/projects/${pid}/footage?folder=Day 1/Testimonials`);
+assert.equal(r.data.items.length, 2);
+r = await call("GET", `/api/projects/${pid}/footage?folder=Day 1/Test`);
+assert.equal(r.data.items.length, 0, "a folder prefix matches whole folder names only");
+r = await call("GET", `/api/projects/${pid}/footage?kind=interview`);
+assert.ok(r.data.items.length >= 1 && r.data.items.every((i) => i.log.kind === "interview"));
+const one = await call("GET", `/api/projects/${pid}/footage/${r.data.items[0].id}`);
+assert.equal(one.status, 200);
+assert.equal(one.data.log.moments[0].description, "Crowd at the booth");
+console.log("3 ok: paging, folder and kind filters, one clip");
+
+// 4. The library: a project's footage is its own.
+r = await call("GET", "/api/assets");
+assert.equal(r.data.length, 0, JSON.stringify(r.data));
+r = await call("GET", `/api/assets?project=${pid}`);
+assert.equal(r.data.length, 4);
+console.log("4 ok: footage listed with its project only");
+
+// 5. New files in Drive; a removed clip stays removed.
+setDrive([fileEntry(fid("b3"), "B_0003.MP4")]);
+r = await call("POST", `/api/projects/${pid}/footage/sync`);
+assert.equal(r.data.added, 1, JSON.stringify(r.data));
+const firstAsset = f.items[0].asset.id;
+world.refuseMediaDeletes = 1;
+r = await call("DELETE", `/api/assets/${firstAsset}`);
+assert.equal(r.status, 502, "a copy the service would not delete is not reported deleted");
+assert.match(r.data.detail, /could not be deleted/);
+assert.ok(db.prepare("SELECT 1 FROM assets WHERE id = ?").get(firstAsset), "the asset stays, to be deleted again");
+r = await call("DELETE", `/api/assets/${firstAsset}`);
+assert.equal(r.status, 200);
+r = await call("POST", `/api/projects/${pid}/footage/sync`);
+assert.equal(r.data.added, 0, "a removed clip is not brought back");
+f = await statuses();
+assert.equal(f.counts.total, 4, "the removed clip is not listed");
+console.log("5 ok: sync adds new files, removed clips stay out; a refused copy delete keeps the asset");
+
+// 6. An org-wide refusal pauses imports and leaves the clip in line.
+for (let i = 0; i < 8 && f.counts.logged < 4; i++) f = await statuses();
+setDrive([fileEntry(fid("b3"), "B_0003.MP4"), fileEntry(fid("b5"), "B_0005.MP4")]);
+r = await call("POST", `/api/projects/${pid}/footage/sync`);
+assert.equal(r.data.added, 1);
+world.importRefusal = { error: "storage_full", detail: "Your workspace's video storage is full" };
+f = await statuses();
+assert.equal(f.imports_paused, "Your workspace's video storage is full");
+assert.equal(f.counts.waiting, 1, JSON.stringify(f.counts));
+assert.equal(f.counts.failed, 0);
+world.importRefusal = null;
+for (let i = 0; i < 8 && f.counts.logged < 5; i++) f = await statuses();
+assert.equal(f.counts.logged, 5, JSON.stringify(f.counts));
+console.log("6 ok: storage full pauses imports, they resume after");
+
+// 7. Logging that the plan's allowance refuses pauses, without failing clips.
+setDrive([fileEntry(fid("b3"), "B_0003.MP4"), fileEntry(fid("b5"), "B_0005.MP4"), fileEntry(fid("b4"), "B_0004.MP4")]);
+await call("POST", `/api/projects/${pid}/footage/sync`);
+world.analyzeRefusal = { status: 403, body: { error: "quota_exceeded", detail: "monthly allowance used" } };
+for (let i = 0; i < 5; i++) f = await statuses();
+assert.equal(f.logging_paused, "monthly allowance used", JSON.stringify(f));
+assert.equal(f.counts.log_failed, 0);
+assert.equal(f.next_step_at, null, "only a limit holds the rest: no step booked");
+world.analyzeRefusal = null;
+for (let i = 0; i < 6 && f.counts.logged < 6; i++) f = await statuses();
+assert.equal(f.counts.logged, 6, JSON.stringify(f.counts));
+console.log("7 ok: allowance used pauses logging and books nothing; resumes after");
+
+// 7b. A file over Drive's download limit waits and is tried again by itself:
+// no import is attempted, no clip fails, and the next step is booked for when
+// it is due, not every minute. A person can ask Drive again now; after about a
+// day of refusals the clip gives up with the reason.
+const importsBefore = world.calls.filter((c) => c.endsWith("/media/import")).length;
+setDrive([fileEntry(fid("b3"), "B_0003.MP4"), fileEntry(fid("b5"), "B_0005.MP4"), fileEntry(fid("b4"), "B_0004.MP4"), fileEntry(fid("q1"), "B_0009.MP4")]);
+await call("POST", `/api/projects/${pid}/footage/sync`);
+f = await statuses();
+let blocked = f.items.find((i) => i.name === "B_0009.MP4");
+assert.equal(blocked.status, "waiting", JSON.stringify(blocked));
+assert.match(blocked.error, /Waiting for Google Drive/);
+const due = Date.parse(blocked.retry_at);
+assert.ok(due > Date.now() + 25 * 60_000 && due < Date.now() + 35 * 60_000, "tried again in about half an hour");
+assert.equal(f.counts.failed, 0);
+assert.equal(f.counts.drive_waiting, 1);
+assert.match(f.imports_paused, /limiting downloads of these files/);
+assert.equal(world.calls.filter((c) => c.endsWith("/media/import")).length, importsBefore, "no import was attempted");
+// The step already booked a minute out runs, finds nothing due, and books
+// the next for when the clip is.
+{
+  const body = JSON.stringify({ project_id: pid });
+  const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+  assert.equal(res.status, 200);
+  const bookedFor = Date.parse(world.lastEnqueue.run_at ?? world.lastEnqueue.runAt);
+  assert.ok(bookedFor >= due && bookedFor < due + 61_000, `the next step is booked for when the clip is due (${new Date(bookedFor).toISOString()} vs ${blocked.retry_at})`);
+}
+// Reads in the meantime don't ask Drive again.
+const probes = () => world.calls.filter((c) => c.includes(fid("q1")) && c.includes("drive.usercontent")).length;
+const probesBefore = probes();
+await statuses();
+assert.equal(probes(), probesBefore, "a read before it is due leaves Drive alone");
+// "Try Google Drive again now" asks at once: the whole file, then one byte to
+// see whether it would come in pieces (this file's pieces are refused too).
+// It also books a step a minute out, in place of the one booked for when the
+// clip was due: with a Drive connection only a delivery starts an import.
+r = await call("POST", `/api/projects/${pid}/footage/retry`);
+assert.equal(r.data.imports, 1);
+assert.ok(Date.parse(world.lastEnqueue.run_at ?? world.lastEnqueue.runAt) < Date.now() + 3 * 60_000, "a step is booked for now, not for when the clip was due");
+f = await statuses();
+assert.equal(probes(), probesBefore + 2);
+assert.ok(![...world.uploads.values()].some((x) => x.name === "B_0009.MP4"), "Drive refusing pieces too: no upload is opened");
+// Drive lifts the limit: when it is due, it imports.
+world.quotaLifted = true;
+db.prepare("UPDATE project_footage SET retry_at = ? WHERE name = 'B_0009.MP4'").run(new Date(Date.now() - 1000).toISOString());
+f = await statuses();
+blocked = f.items.find((i) => i.name === "B_0009.MP4");
+assert.equal(blocked.status, "importing", JSON.stringify(blocked));
+assert.equal(world.calls.filter((c) => c.endsWith("/media/import")).length, importsBefore + 1);
+// A clip refused for about a day gives up, saying why.
+world.quotaLifted = false;
+db.prepare("UPDATE project_footage SET status = 'waiting', drive_tries = 8, retry_at = ? WHERE name = 'B_0009.MP4'").run(new Date(Date.now() - 1000).toISOString());
+f = await statuses();
+blocked = f.items.find((i) => i.name === "B_0009.MP4");
+assert.equal(blocked.status, "failed", JSON.stringify(blocked));
+assert.match(blocked.error, /download limit for this file is used up/);
+console.log("7b ok: a clip Drive refuses waits, is tried again when due (or now on request), imports once Drive lets go, gives up after a day");
+db.prepare("DELETE FROM assets WHERE id = (SELECT asset_id FROM project_footage WHERE name = 'B_0009.MP4')").run();
+db.prepare("DELETE FROM project_footage WHERE name = 'B_0009.MP4'").run();
+world.quotaLifted = true;
+
+// 7c. A file Drive won't hand over whole still serves pieces: it comes in a
+// piece at a time, on deliveries only, into an upload on the media service,
+// and carries on from where the upload stands after a piece that didn't land
+// or a wait on Drive. An upload about to expire starts again on a new one; a
+// file over the video host's 30 GB limit fails at once, saying so.
+{
+  const P = 200 * 2 ** 20;
+  const A = 2 * P + 3 * 2 ** 20;
+  world.big[fid("big1")] = { size: A };
+  world.big[fid("big2")] = { size: 12 * 2 ** 20 };
+  world.big[fid("huge")] = { size: 31 * 2 ** 30 };
+  world.drive[fid("day4")] = page("Day 4", [
+    fileEntry(fid("big1"), "INTERVIEW_A.MP4"),
+    fileEntry(fid("big2"), "INTERVIEW_B.MP4"),
+    fileEntry(fid("huge"), "STATIC.MP4"),
+  ]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day4")}` });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  const p4 = r.data.id;
+  const items4 = async () => Object.fromEntries((await call("GET", `/api/projects/${p4}/footage?logs=0`)).data.items.map((i) => [i.name, i]));
+  const deliver4 = async () => {
+    const body = JSON.stringify({ project_id: p4 });
+    const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+    assert.equal(res.status, 200, await res.text());
+  };
+  const uploadOf = (name) => db.prepare("SELECT upload_uid FROM project_footage WHERE project_id = ? AND name = ?").get(p4, name).upload_uid;
+  const pieces = () => world.calls.filter((c) => c.startsWith("PATCH https://upload.test/")).length;
+
+  // A read opens the uploads and sends no pieces.
+  let it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].status, "importing", JSON.stringify(it["INTERVIEW_A.MP4"]));
+  assert.deepEqual(it["INTERVIEW_A.MP4"].received, { bytes: 0, size: A });
+  assert.equal(pieces(), 0, "a read sends no pieces");
+  const a1 = uploadOf("INTERVIEW_A.MP4");
+  assert.deepEqual([world.uploads.get(a1).size, world.uploads.get(a1).name], [A, "INTERVIEW_A.MP4"]);
+  assert.equal(it["STATIC.MP4"].status, "failed", "over 30 GB: no wait can get it in");
+  assert.equal(it["STATIC.MP4"].error, "33.3 GB is over the video host's 30 GB limit");
+  assert.ok(![...world.uploads.values()].some((x) => x.name === "STATIC.MP4"), "and no upload is opened for it");
+
+  // First delivery: INTERVIEW_A's second piece doesn't land, and INTERVIEW_B's
+  // upload is about to expire, so it starts again on a new one.
+  world.patchFails = (id, at) => id === a1 && at === P && !world.patchFailed && (world.patchFailed = true);
+  const b1 = uploadOf("INTERVIEW_B.MP4");
+  db.prepare("UPDATE project_footage SET upload_expires = ? WHERE project_id = ? AND name = 'INTERVIEW_B.MP4'").run(new Date(Date.now() + 60_000).toISOString(), p4);
+  await deliver4();
+  assert.deepEqual(world.uploads.get(a1).patches, [0], "one piece in; the next didn't land");
+  it = await items4();
+  assert.deepEqual(it["INTERVIEW_A.MP4"].received, { bytes: P, size: A });
+  assert.equal(world.media.get(b1).deleted, true, "the upload about to expire is deleted");
+  const b2 = uploadOf("INTERVIEW_B.MP4");
+  assert.ok(b2 && b2 !== b1, "and a new one opened");
+
+  // Second delivery: A carries on from where its upload stands, until Drive
+  // refuses a piece; it then waits on Drive and keeps its upload. B is all in.
+  world.big[fid("big1")].refuseFrom = 2 * P;
+  await deliver4();
+  assert.deepEqual(world.uploads.get(a1).patches, [0, P], "carried on from where the upload stood");
+  it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].status, "waiting", JSON.stringify(it["INTERVIEW_A.MP4"]));
+  assert.ok(it["INTERVIEW_A.MP4"].retry_at);
+  assert.equal(uploadOf("INTERVIEW_A.MP4"), a1, "its upload is kept while it waits");
+  assert.equal(it["INTERVIEW_B.MP4"].asset?.media_uid, b2, "INTERVIEW_B is in, as its upload's video");
+
+  // Asking Drive again now: it carries on without asking for the whole file again.
+  world.big[fid("big1")].refuseFrom = undefined;
+  const wholeAsks = () => world.wholeAsks.filter((x) => x === fid("big1")).length;
+  const asked = wholeAsks();
+  r = await call("POST", `/api/projects/${p4}/footage/retry`);
+  assert.equal(r.data.imports, 2, "A, and the file over the limit");
+  it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].status, "importing");
+  assert.equal(wholeAsks(), asked, "an upload under way carries on: Drive isn't asked for the whole file");
+  await deliver4();
+  assert.deepEqual(world.uploads.get(a1).patches, [0, P, 2 * P], "every piece once, in order");
+  it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].received, null);
+  assert.deepEqual([it["INTERVIEW_A.MP4"].asset?.media_uid, it["INTERVIEW_A.MP4"].asset?.size], [a1, A]);
+
+  // From there it is imported like any other: ready, then logged.
+  for (let i = 0; i < 10 && !["INTERVIEW_A.MP4", "INTERVIEW_B.MP4"].every((n) => it[n].log_status === "done"); i++) it = await items4();
+  assert.equal(it["INTERVIEW_A.MP4"].status, "ready");
+  assert.equal(it["INTERVIEW_A.MP4"].log_status, "done");
+  assert.equal(it["INTERVIEW_B.MP4"].log_status, "done");
+  r = await call("DELETE", `/api/projects/${p4}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.ok(world.media.get(a1).deleted && world.media.get(b2).deleted);
+  console.log("7c ok: a file Drive won't hand over whole comes in by pieces on deliveries, carries on after a failed piece and a wait on Drive, restarts an expiring upload; over 30 GB fails at once, saying so");
+}
+
+// 7d. Deleting a project deletes an upload still under way; one the service
+// won't delete keeps its clip for the next call.
+{
+  world.big[fid("big5")] = { size: 2 * 2 ** 20 };
+  world.drive[fid("day5")] = page("Day 5", [fileEntry(fid("big5"), "INTERVIEW_C.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day5")}` });
+  const p5 = r.data.id;
+  await call("GET", `/api/projects/${p5}/footage?logs=0`);
+  const u5 = db.prepare("SELECT upload_uid FROM project_footage WHERE project_id = ?").get(p5).upload_uid;
+  assert.ok(u5, "the read opened an upload");
+  world.refuseMediaDeletes = 1;
+  r = await call("DELETE", `/api/projects/${p5}`);
+  assert.equal(r.status, 202, JSON.stringify(r.data));
+  assert.ok(!world.media.get(u5).deleted, "refused: the clip stays, with its upload");
+  r = await call("DELETE", `/api/projects/${p5}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(world.media.get(u5).deleted, true);
+  console.log("7d ok: deleting a project deletes an upload under way, after a refusal too");
+}
+
+// 7e. A piece the video host turns away for good fails the clip with the
+// host's reason, and its upload is deleted: sending it again can't help.
+{
+  world.big[fid("big6")] = { size: 3 * 2 ** 20 };
+  world.drive[fid("day6")] = page("Day 6", [fileEntry(fid("big6"), "INTERVIEW_D.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day6")}` });
+  const p6 = r.data.id;
+  await call("GET", `/api/projects/${p6}/footage?logs=0`);
+  const u6 = db.prepare("SELECT upload_uid FROM project_footage WHERE project_id = ?").get(p6).upload_uid;
+  assert.ok(u6, "the read opened an upload");
+  world.refusePatches = u6;
+  const body = JSON.stringify({ project_id: p6 });
+  const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+  assert.equal(res.status, 200, await res.text());
+  const row = db.prepare("SELECT status, error, upload_uid FROM project_footage WHERE project_id = ?").get(p6);
+  assert.equal(row.status, "failed", JSON.stringify(row));
+  assert.equal(row.error, "the video host refused a piece of this file (400: Decoding Error)");
+  assert.equal(row.upload_uid, null);
+  assert.equal(world.media.get(u6).deleted, true, "its upload is deleted");
+  r = await call("DELETE", `/api/projects/${p6}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  console.log("7e ok: a piece the video host refuses for good fails the clip with its reason, and deletes the upload");
+}
+
+// 7f. A file Drive serves whole but over the video host's 30 GB limit is not
+// handed over to be refused after the pull: it fails at once, saying so.
+{
+  world.servedSizes = { [fid("stage")]: 34_000_000_000 };
+  world.drive[fid("day8")] = page("Day 8", [fileEntry(fid("stage"), "STAGE.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day8")}` });
+  const p8 = r.data.id;
+  const before = (world.importUrls ?? []).length;
+  const item = (await call("GET", `/api/projects/${p8}/footage?logs=0`)).data.items[0];
+  assert.equal(item.status, "failed", JSON.stringify(item));
+  assert.equal(item.error, "34.0 GB is over the video host's 30 GB limit");
+  assert.equal((world.importUrls ?? []).length, before, "nothing was handed to the video host");
+  r = await call("DELETE", `/api/projects/${p8}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  console.log("7f ok: a file over the video host's 30 GB limit fails at once with the reason, never pulled");
+}
+
+// 8. Retry puts failures back in line.
+db.prepare("UPDATE project_footage SET status = 'failed', error = 'x' WHERE project_id = ? AND name = 'B_0002.MP4'").run(pid);
+r = await call("POST", `/api/projects/${pid}/footage/retry`);
+assert.deepEqual(r.data, { imports: 1, logs: 0 });
+console.log("8 ok: retry");
+
+// 8b. Export: the handover runs under the request's waitUntil, so a caller
+// going away mid-request cannot cut it off, and it records the render's job.
+const clipAsset = f.items.find((i) => i.status === "ready").asset.id;
+const doc = (els) => ({ version: 1, output: { width: 1280, height: 720, fps: 30, background: "#000000" }, main: { elements: els }, overlays: [], audio: [] });
+r = await call("PUT", `/api/projects/${pid}`, { edl: doc([{ id: "a", type: "video", src: `asset:${clipAsset}`, duration: 2 }, { id: "b", type: "video", src: `asset:${clipAsset}`, trimStart: 3, duration: 2 }]) });
+assert.equal(r.status, 200, JSON.stringify(r.data));
+const held = [];
+ctx.waitUntil = (p) => held.push(p);
+r = await call("POST", `/api/projects/${pid}/export`, { quality: "draft" });
+assert.equal(r.status, 201, JSON.stringify(r.data));
+assert.ok(held.length >= 1, "the handover is held past the response");
+assert.equal(db.prepare("SELECT service_job_id FROM export_jobs WHERE id = ?").get(r.data.id).service_job_id, "render1");
+world.editRefusal = { error: "edl_invalid", detail: "bad trim", path: "/main/elements/1/trimStart" };
+r = await call("POST", `/api/projects/${pid}/export`, { quality: "draft" });
+assert.equal(r.data.status, "failed");
+assert.deepEqual(r.data.failure, { error: "edl_invalid", detail: "bad trim", path: "/main/elements/1/trimStart" });
+assert.match(db.prepare("SELECT error FROM export_jobs WHERE id = ?").get(r.data.id).error, /bad trim \(at \/main\/elements\/1\/trimStart\)/);
+world.editRefusal = null;
+ctx.waitUntil = () => {};
+console.log("8b ok: export handover held past the response; refusals recorded with their pointer");
+
+// 8c. One cut, two formats: the 9:16 export renders that format's framing and
+// frame, the main export is untouched by it, and the render service never
+// sees this app's format fields.
+{
+  const top = { x: 0, y: 0.1, width: 0.5, height: 0.79 };
+  const bottom = { x: 0.5, y: 0.1, width: 0.5, height: 0.79 };
+  const two = {
+    ...doc([{ id: "a", type: "video", src: `asset:${clipAsset}`, duration: 2, fit: "cover", framing: { "9:16": { fit: "contain", split: { top, bottom } } } }]),
+    formats: [{ id: "9:16", width: 720, height: 1280 }],
+  };
+  r = await call("PUT", `/api/projects/${pid}`, { edl: two });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  r = await call("POST", `/api/projects/${pid}/export`, { quality: "draft", format: "9:16" });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.format, "9:16");
+  const tall = world.lastEdit.edl;
+  assert.deepEqual([tall.output.width, tall.output.height], [720, 1280]);
+  assert.deepEqual(tall.main.elements[0].split, { top, bottom });
+  assert.doesNotMatch(JSON.stringify(world.lastEdit), /framing|placement|formats/);
+  assert.match(world.lastEdit.filename, /9x16/);
+  r = await call("POST", `/api/projects/${pid}/export`, { quality: "draft" });
+  assert.equal(r.data.format, null);
+  const wide = world.lastEdit.edl;
+  assert.deepEqual([wide.output.width, wide.output.height], [1280, 720]);
+  assert.equal(wide.main.elements[0].fit, "cover");
+  assert.equal(wide.main.elements[0].split, undefined);
+  r = await call("POST", `/api/projects/${pid}/export`, { format: "1:1" });
+  assert.equal(r.status, 422);
+  assert.equal(r.data.error, "format_unknown");
+  r = await call("PUT", `/api/projects/${pid}`, { edl: { ...two, formats: [] } });
+  assert.equal(r.status, 422, "framing for a format the project does not have is refused");
+  assert.equal(r.data.path, "/main/elements/0/framing/9:16");
+  console.log("8c ok: each format exports its own frame and framing; unknown formats refused");
+}
+
+// 9. The queue's call must be signed.
+r = await call("POST", "/api/footage/step", { project_id: pid });
+assert.equal(r.status, 401);
+console.log("9 ok: unsigned step refused");
+
+// 11. Highlights: asked for, read on the queue's delivery (never on a read),
+// reviewed, exported, found again without losing a person's calls.
+const deliver = async () => {
+  const body = JSON.stringify({ project_id: pid });
+  const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+  const text = await res.text();
+  assert.equal(res.status, 200, text);
+  return JSON.parse(text);
+};
+const logged = db.prepare("SELECT COUNT(*) AS n FROM project_footage WHERE project_id = ? AND status = 'ready' AND log_status = 'done'").get(pid).n;
+r = await call("GET", `/api/projects/${pid}/highlights`);
+assert.equal(r.data.asked, false);
+r = await call("POST", `/api/projects/${pid}/highlights`, { brief: "A 60 s sizzle of the booth" });
+assert.equal(r.status, 202, JSON.stringify(r.data));
+assert.equal(r.data.paused, "finding highlights needs an OpenRouter key: add one in the dashboard's API Keys settings", "no key: says so");
+env.OPENROUTER_API_KEY = "or_test";
+r = await call("POST", `/api/projects/${pid}/highlights`, {});
+assert.equal(r.data.pending, logged, JSON.stringify(r.data));
+assert.equal(r.data.paused, null);
+assert.equal(db.prepare("SELECT brief FROM edit_projects WHERE id = ?").get(pid).brief, "A 60 s sizzle of the booth", "the brief was kept");
+r = await call("GET", `/api/projects/${pid}/highlights`);
+assert.equal(world.prompts.length, 0, "a read never calls the model");
+assert.equal(r.data.clips.pending, logged);
+let d = await deliver();
+assert.ok(world.prompts.length >= 1, "the delivery read the clips");
+assert.match(world.prompts[0], /A 60 s sizzle of the booth/);
+r = await call("GET", `/api/projects/${pid}/highlights?skipped=1`);
+assert.equal(r.data.clips.pending, 0, JSON.stringify(r.data.clips));
+assert.equal(r.data.clips.done, logged);
+assert.equal(r.data.clips.skipped, 1);
+assert.deepEqual(r.data.skipped.map((s) => [s.name, s.reason]), [["B_0003.MP4", "camera pointed at the floor"]]);
+const soundbites = r.data.highlights.filter((h) => h.kind === "soundbite");
+assert.ok(soundbites.length >= 1, JSON.stringify(r.data.highlights));
+assert.equal(r.data.highlights[0].score, 5, "best first");
+assert.deepEqual([soundbites[0].start, soundbites[0].end], [4.6, 9.9], "the soundbite is snapped to its transcript line, with a breath");
+assert.equal(r.data.counts.total, r.data.highlights.length);
+assert.equal(r.data.highlights[0].clip.asset_id !== null, true);
+console.log(`11 ok: ${logged} clips read in one delivery (${world.prompts.length} model calls), ${r.data.counts.total} picks, 1 set aside`);
+
+// Review: keep, drop, bad calls refused; a person's own pick.
+const [first, second] = r.data.highlights;
+r = await call("PATCH", `/api/projects/${pid}/highlights/${first.id}`, { pick: "keep" });
+assert.equal(r.data.pick, "keep");
+r = await call("PATCH", `/api/projects/${pid}/highlights/${second.id}`, { pick: "drop" });
+assert.equal(r.data.pick, "drop");
+r = await call("PATCH", `/api/projects/${pid}/highlights/${second.id}`, { pick: "maybe" });
+assert.equal(r.status, 400);
+r = await call("PATCH", `/api/projects/${pid}/highlights/${second.id}`, { start: 10, end: 500 });
+assert.equal(r.status, 400, "an out past the clip's end is refused");
+const skippedClip = db.prepare("SELECT id FROM project_footage WHERE project_id = ? AND name = 'B_0003.MP4'").get(pid).id;
+r = await call("POST", `/api/projects/${pid}/highlights/items`, { clip: skippedClip, kind: "broll", text: "Used anyway" });
+assert.equal(r.status, 201, JSON.stringify(r.data));
+assert.deepEqual([r.data.start, r.data.end, r.data.pick, r.data.origin], [0, 60, "keep", "person"]);
+r = await call("GET", `/api/projects/${pid}/highlights?pick=keep`);
+assert.equal(r.data.highlights.length, 2);
+r = await call("GET", `/api/projects/${pid}/highlights?kind=soundbite&min_score=5`);
+assert.ok(r.data.highlights.every((h) => h.kind === "soundbite" && h.score === 5));
+console.log("11b ok: keep, drop, refusals, a person's own pick, filters");
+
+// Export: a sheet of everything not dropped by default, or only the kept.
+let res = await app.request(`https://open-video.apps.clawnify.com/api/projects/${pid}/highlights/export?format=csv`, {}, env, ctx);
+assert.equal(res.status, 200);
+assert.match(res.headers.get("content-type"), /text\/csv/);
+assert.match(res.headers.get("content-disposition"), /attachment; filename="Day 1 highlights.csv"/);
+let csv = (await res.text()).replace(/^\uFEFF/, "").trim().split("\r\n");
+const total = db.prepare("SELECT COUNT(*) AS n FROM footage_highlights WHERE project_id = ? AND (pick IS NULL OR pick = 'keep')").get(pid).n;
+assert.equal(csv.length, total + 1, "a header and every pick not dropped");
+res = await app.request(`https://open-video.apps.clawnify.com/api/projects/${pid}/highlights/export?format=csv&pick=keep`, {}, env, ctx);
+csv = (await res.text()).trim().split("\r\n");
+assert.equal(csv.length, 3);
+assert.ok(csv.slice(1).every((l) => l.includes(",Kept,")));
+console.log("11c ok: sheet export,", total, "rows by default, 2 kept");
+
+// Find again: unreviewed picks are replaced, a person's calls stay, and the
+// model is told what was already reviewed. A b-roll shot is dropped too, so
+// the taste holds a dropped pick whose words no kept pick has.
+const droppedShot = (await call("GET", `/api/projects/${pid}/highlights?kind=broll&pick=open`)).data.highlights[0];
+r = await call("PATCH", `/api/projects/${pid}/highlights/${droppedShot.id}`, { pick: "drop" });
+assert.equal(r.status, 200, JSON.stringify(r.data));
+const promptsBefore = world.prompts.length;
+r = await call("POST", `/api/projects/${pid}/highlights`, { again: true });
+assert.equal(r.data.pending, logged);
+d = await deliver();
+assert.ok(world.prompts.length > promptsBefore);
+assert.ok(world.prompts.slice(promptsBefore).some((p) => p.includes("Already reviewed by a person")), "reviewed stretches are passed as taken");
+const again = world.prompts.slice(promptsBefore).join("\n");
+assert.match(again, /\] kept: /, "each reviewed stretch says whether it was kept");
+assert.match(again, /\] dropped: /, "or dropped");
+assert.match(again, /Learn their taste from it/, "the reading learns from the calls");
+assert.ok(again.includes(`"${first.text.slice(0, 160)}" (scored ${first.score} when proposed)`), "a kept pick is shown as kept, with the score it had");
+assert.ok(again.includes('"Used anyway" (added by them)'), "and a person's own pick as theirs");
+assert.ok(again.indexOf("Dropped:") > again.indexOf("Kept:"), "dropped picks follow kept ones");
+const droppedList = again.slice(again.indexOf("Dropped:")).split("\n\n")[0];
+assert.ok(droppedList.includes(`"${droppedShot.text}" (scored`), "a dropped pick is shown as dropped");
+// The two best picks are two takes of one line (the stub says the same words
+// on every clip with speech): one kept, one dropped. The dropped take is not
+// taught as a line the person didn't want.
+assert.equal(second.text, first.text);
+assert.ok(!droppedList.includes(`"${second.text}"`), "a dropped take of a kept line is left out of the taste");
+assert.equal(db.prepare("SELECT pick FROM footage_highlights WHERE id = ?").get(first.id).pick, "keep", "a kept pick survives finding again");
+assert.equal(db.prepare("SELECT pick FROM footage_highlights WHERE id = ?").get(second.id).pick, "drop", "so does a dropped one");
+console.log("11d ok: finding again keeps a person's calls, tells the model about them, and passes kept and dropped as the taste to learn, without another take of a kept line");
+
+// Stop: a find-again in line is stopped before any delivery reads it. Clips
+// read before keep their picks and count as read; a clip never read goes back
+// to not asked and doesn't rejoin on a delivery; asking again resumes.
+{
+  const picksBefore = db.prepare("SELECT COUNT(*) AS n FROM footage_highlights WHERE project_id = ?").get(pid).n;
+  r = await call("POST", `/api/projects/${pid}/highlights`, { again: true });
+  assert.ok(r.data.pending > 0);
+  const fresh = db.prepare("SELECT id FROM project_footage WHERE project_id = ? AND highlights_status = 'waiting' LIMIT 1").get(pid).id;
+  db.prepare("DELETE FROM footage_highlights WHERE footage_id = ?").run(fresh);
+  db.prepare("UPDATE project_footage SET skip_reason = NULL WHERE id = ?").run(fresh);
+  const prompts = world.prompts.length;
+  r = await call("POST", `/api/projects/${pid}/highlights/stop`, {});
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.pending, 0);
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  assert.equal(r.data.stopped, true);
+  assert.equal(r.data.clips.pending, 0);
+  assert.equal(r.data.clips.not_asked, 1, JSON.stringify(r.data.clips));
+  assert.equal(r.data.clips.done, logged - 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM footage_highlights WHERE project_id = ?").get(pid).n <= picksBefore, true, "nothing new was found");
+  await deliver();
+  assert.equal(world.prompts.length, prompts, "stopped: a delivery reads nothing");
+  assert.equal(db.prepare("SELECT highlights_status FROM project_footage WHERE id = ?").get(fresh).highlights_status, null, "stopped: the clip doesn't rejoin");
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  const waitingNow = r.data.clips.not_asked;
+  assert.ok(waitingNow >= 1, "the stopped clip, and any logged since, wait");
+  r = await call("POST", `/api/projects/${pid}/highlights`, {});
+  assert.equal(r.data.pending, waitingNow, JSON.stringify(r.data));
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  assert.equal(r.data.stopped, false);
+  const loggedNow = r.data.clips.logged;
+  await deliver();
+  assert.ok(world.prompts.length > prompts, "asking again resumes");
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  assert.equal(r.data.clips.done + r.data.clips.pending, loggedNow, JSON.stringify(r.data.clips));
+  assert.equal(r.data.clips.not_asked, 0);
+  console.log("11d2 ok: stopping keeps what was found, and later clips wait until asked again");
+}
+
+// A busy model puts clips back in line; a refusal fails them with the reason;
+// retry puts the failed back in line.
+// (B_0001 was deleted from the project in 5: a ready clip is the one to use.)
+const target = db.prepare("SELECT name FROM project_footage WHERE project_id = ? AND status = 'ready' AND highlights_status = 'done' ORDER BY name LIMIT 1").get(pid).name;
+db.prepare("UPDATE project_footage SET highlights_status = 'waiting' WHERE project_id = ? AND name = ?").run(pid, target);
+world.modelRefusal = { status: 429, body: "rate limited" };
+d = await deliver();
+assert.equal(db.prepare("SELECT highlights_status FROM project_footage WHERE project_id = ? AND name = ?").get(pid, target).highlights_status, "waiting");
+assert.ok(d.next_step_at, "another step is booked");
+world.modelRefusal = { status: 400, body: "context too long" };
+d = await deliver();
+const failed = db.prepare("SELECT highlights_status, highlights_error FROM project_footage WHERE project_id = ? AND name = ?").get(pid, target);
+assert.equal(failed.highlights_status, "failed");
+assert.match(failed.highlights_error, /context too long/);
+world.modelRefusal = null;
+r = await call("POST", `/api/projects/${pid}/highlights`, {});
+const wasFailed = db.prepare("SELECT COUNT(*) AS n FROM project_footage WHERE project_id = ? AND highlights_status = 'waiting'").get(pid).n;
+assert.ok(r.data.pending >= 1 && r.data.pending === wasFailed, "retry puts every failed clip of the batch back in line");
+d = await deliver();
+assert.equal(db.prepare("SELECT highlights_status FROM project_footage WHERE project_id = ? AND name = ?").get(pid, target).highlights_status, "done");
+console.log("11e ok: busy model waits, a refusal fails with its reason, retry");
+
+// A clip logged after highlights were asked for joins in by itself.
+setDrive([fileEntry(fid("b3"), "B_0003.MP4"), fileEntry(fid("b5"), "B_0005.MP4"), fileEntry(fid("b4"), "B_0004.MP4"), fileEntry(fid("b6"), "B_0006.MP4")]);
+await call("POST", `/api/projects/${pid}/footage/sync`);
+const b6 = () => db.prepare("SELECT log_status, highlights_status FROM project_footage WHERE project_id = ? AND name = 'B_0006.MP4'").get(pid);
+for (let i = 0; i < 10 && b6().log_status !== "done"; i++) f = await statuses();
+assert.equal(b6().log_status, "done");
+assert.equal(b6().highlights_status, null, "not read until a delivery");
+d = await deliver();
+assert.equal(db.prepare("SELECT highlights_status FROM project_footage WHERE project_id = ? AND name = 'B_0006.MP4'").get(pid).highlights_status, "done");
+console.log("11f ok: a clip logged later is read by itself");
+
+// A clip a fraction of a second long is logged as too short, without an
+// analysis: there is nothing in it to read, and the analysis fails on it.
+setDrive([fileEntry(fid("b3"), "B_0003.MP4"), fileEntry(fid("b5"), "B_0005.MP4"), fileEntry(fid("b4"), "B_0004.MP4"), fileEntry(fid("b6"), "B_0006.MP4"), fileEntry(fid("s1"), "SHORT.MP4")]);
+await call("POST", `/api/projects/${pid}/footage/sync`);
+const jobsBeforeShort = world.jobs.size;
+const short = () => db.prepare("SELECT status, log_status, log FROM project_footage WHERE project_id = ? AND name = 'SHORT.MP4'").get(pid);
+for (let i = 0; i < 10 && short().log_status !== "done"; i++) f = await statuses();
+assert.equal(short().status, "ready");
+assert.equal(short().log_status, "done", JSON.stringify(short()));
+assert.deepEqual(JSON.parse(short().log), { summary: "A 0.3 s clip, too short to use.", kind: "other", quality: "unusable", issues: "too short to use", quotes: [], moments: [], visible_text: [] });
+assert.equal(world.jobs.size, jobsBeforeShort, "no analysis was asked for");
+console.log("11g ok: a clip under a second is logged as too short, without an analysis");
+
+// How many: a number of highlights is chosen from all the picks in one more
+// model call, on a delivery once nothing is left to read. Dropping one of the
+// best brings in the next without the model; a new number orders them again.
+{
+  const isRanking = (p) => /^PICK 1: /m.test(p);
+  const rankings = () => world.prompts.filter(isRanking).length;
+  // At least one kept pick, so the best has to count it in.
+  if (!db.prepare("SELECT 1 FROM footage_highlights WHERE project_id = ? AND pick = 'keep'").get(pid)) {
+    const open = db.prepare("SELECT id FROM footage_highlights WHERE project_id = ? AND pick IS NULL AND kind = 'soundbite' LIMIT 1").get(pid);
+    assert.equal((await call("PATCH", `/api/projects/${pid}/highlights/${open.id}`, { pick: "keep" })).status, 200);
+  }
+  const kept = db.prepare("SELECT id FROM footage_highlights WHERE project_id = ? AND pick = 'keep'").all(pid).map((x) => x.id);
+  for (const bad of [0, MAX_WANTED_PLUS_ONE(), 2.5, "7"]) {
+    r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted: bad });
+    assert.equal(r.status, 400, `refused: ${bad}`);
+  }
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  assert.deepEqual([r.data.wanted, r.data.ranking, r.data.counts.best], [null, null, 0], "no number: no best");
+  const wanted = kept.length + 2;
+  const before = world.prompts.length;
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.ok(r.data.next_step_at, "a step is booked to choose them");
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.equal(world.prompts.length, before, "a read never calls the model");
+  assert.deepEqual([r.data.wanted, r.data.ranking.status, r.data.ranking.due], [wanted, "waiting", true]);
+  d = await deliver();
+  assert.equal(rankings(), 1, "one call chose them");
+  const prompt = world.prompts.at(-1);
+  assert.match(prompt, new RegExp(`Choose the ${wanted} that make the best set`));
+  assert.match(prompt, /picks marked KEPT were kept by the person reviewing: they are in `best`. Choose the other 2 to go with them/);
+  assert.match(prompt, /A 60 s sizzle of the booth/, "for the brief");
+  const pickLines = prompt.split("\n").filter((l) => l.startsWith("PICK "));
+  assert.ok(!pickLines.some((l) => l.includes(droppedShot.text)), "a dropped pick is not a candidate");
+  assert.ok(prompt.slice(prompt.indexOf("Dropped:")).includes(droppedShot.text), "only taste to learn from");
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.equal(r.data.ranking.status, "done");
+  assert.equal(r.data.counts.best, wanted);
+  let best = r.data.highlights;
+  assert.equal(best.length, wanted, JSON.stringify(best.map((h) => [h.kind, h.pick, h.score])));
+  assert.ok(kept.every((k) => best.some((h) => h.id === k)), "every kept pick is in");
+  const chosen = best.filter((h) => h.pick !== "keep");
+  assert.ok(chosen.every((h) => h.kind === "broll"), "the model's choice, not the score's");
+  assert.ok(best.every((h, i) => i === 0 || best[i - 1].score >= h.score), "listed best scored first");
+  const ranks = db.prepare("SELECT rank FROM footage_highlights WHERE project_id = ? AND pick IS NOT 'drop' ORDER BY rank").all(pid).map((x) => x.rank);
+  assert.ok(ranks.every((x, i) => x === i + 1), `every pick not dropped has a place: ${ranks}`);
+  console.log(`11h ok: best ${wanted} chosen in one call, kept picks in, the model's order over the score`);
+
+  // Dropping one of the best brings in the next, with no call; so does the export.
+  const out = chosen[0];
+  r = await call("PATCH", `/api/projects/${pid}/highlights/${out.id}`, { pick: "drop" });
+  assert.equal(r.status, 200);
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.equal(r.data.highlights.length, wanted);
+  assert.ok(!r.data.highlights.some((h) => h.id === out.id), "the dropped one left");
+  assert.ok(r.data.highlights.some((h) => !best.some((b) => b.id === h.id)), "the next came in");
+  assert.equal(rankings(), 1, "without a call");
+  best = r.data.highlights;
+  res = await app.request(`https://open-video.apps.clawnify.com/api/projects/${pid}/highlights/export?format=csv&pick=best`, {}, env, ctx);
+  csv = (await res.text()).replace(/^\uFEFF/, "").trim().split("\r\n");
+  assert.equal(csv.length, wanted + 1, "the export takes the best");
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best&kind=broll`);
+  assert.ok(r.data.highlights.every((h) => h.kind === "broll" && best.some((b) => b.id === h.id)), "filters narrow the best");
+  console.log("11h2 ok: a drop brings in the next without the model; the export and filters take the best");
+
+  // A new number orders them again; a busy model waits; a refusal says why
+  // and waits for a person; no number, no best.
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted: wanted + 1 });
+  d = await deliver();
+  assert.equal(rankings(), 2);
+  assert.match(world.prompts.at(-1), new RegExp(`Choose the ${wanted + 1} that make`));
+  world.modelRefusal = { status: 429, body: "rate limited" };
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted });
+  d = await deliver();
+  assert.ok(d.next_step_at, "busy: another step is booked");
+  assert.equal(db.prepare("SELECT highlights_rank_status FROM edit_projects WHERE id = ?").get(pid).highlights_rank_status, "waiting");
+  world.modelRefusal = { status: 400, body: "context too long" };
+  d = await deliver();
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.equal(r.data.ranking.status, "failed");
+  assert.match(r.data.ranking.error, /context too long/);
+  assert.equal(r.data.ranking.due, false);
+  assert.equal(r.data.highlights.length, wanted, "the last order still stands");
+  world.modelRefusal = null;
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted });
+  d = await deliver();
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  assert.equal(r.data.ranking.status, "done", "trying again chose them");
+  console.log("11h3 ok: a new number orders again; busy waits, a refusal says why, trying again works");
+
+  // Footage still coming in: new picks wait to be ordered again for a while,
+  // and a number a person sets never waits.
+  db.prepare("INSERT INTO project_footage (project_id, drive_file_id, name, folder, status, retry_at) VALUES (?, 'coming_file_000000000000000', 'LATE.MP4', 'Day 1/Cam B', 'waiting', '2099-01-01T00:00:00Z')").run(pid);
+  const reread = db.prepare("SELECT name FROM project_footage WHERE project_id = ? AND status = 'ready' AND highlights_status = 'done' AND skip_reason IS NULL ORDER BY name LIMIT 1").get(pid).name;
+  db.prepare("UPDATE project_footage SET highlights_status = 'waiting' WHERE project_id = ? AND name = ?").run(pid, reread);
+  const n = rankings();
+  d = await deliver();
+  assert.equal(rankings(), n, "new picks while footage is coming: not ordered again at once");
+  r = await call("GET", `/api/projects/${pid}/highlights`);
+  assert.deepEqual([r.data.ranking.status, r.data.ranking.due], ["waiting", false]);
+  db.prepare("UPDATE edit_projects SET highlights_rank_at = datetime('now', '-16 minutes') WHERE id = ?").run(pid);
+  d = await deliver();
+  assert.equal(rankings(), n + 1, "but again after a while");
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted: wanted + 2 });
+  d = await deliver();
+  assert.equal(rankings(), n + 2, "a new number never waits");
+  db.prepare("DELETE FROM project_footage WHERE project_id = ? AND name = 'LATE.MP4'").run(pid);
+  r = await call("PUT", `/api/projects/${pid}/highlights/wanted`, { wanted: null });
+  assert.equal(r.status, 200);
+  r = await call("GET", `/api/projects/${pid}/highlights?pick=best`);
+  assert.deepEqual([r.data.wanted, r.data.ranking], [null, null]);
+  assert.equal(r.data.highlights.length, r.data.counts.total - r.data.counts.dropped, "no number: best is everything not dropped");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM footage_highlights WHERE project_id = ? AND rank IS NOT NULL").get(pid).n, 0);
+  console.log("11h4 ok: while footage comes in the order waits a while, a person's number never; no number, no best");
+}
+
+// 10. Project deletion preserves shared Highlights; unshared media still
+// cleans up in batches and retains failed deletions for retry.
+const sharedAssetIds = db.prepare("SELECT DISTINCT asset_id FROM library_highlights WHERE deleted_at IS NULL").all().map(r => r.asset_id);
+assert.ok(sharedAssetIds.length);
+const cleanupUid = 'c'.repeat(32);
+world.media.set(cleanupUid, { name: 'unshared.mp4', polls: 2, deleted: false });
+db.prepare("INSERT INTO assets(id,key,name,content_type,size,duration,media_uid) VALUES ('unshared-delete','unshared-delete','unshared.mp4','video/mp4',100,60,?)").run(cleanupUid);
+db.prepare("INSERT INTO project_footage(project_id,drive_file_id,name,status,asset_id) VALUES (?, '000-unshared-delete','unshared.mp4','ready','unshared-delete')").run(pid);
+const stmt = db.prepare("INSERT INTO project_footage (project_id, drive_file_id, name, folder) VALUES (?, ?, ?, 'Bulk')");
+for (let i = 0; i < 150; i++) stmt.run(pid, `bulk${i}`, `bulk${i}.mp4`);
+world.refuseMediaDeletes = 1;
+r = await call("DELETE", `/api/projects/${pid}`);
+assert.equal(r.status, 202, JSON.stringify(r.data));
+assert.ok(r.data.remaining > 0);
+const refusedUid = world.refusedDeletes.at(-1);
+const kept = db.prepare("SELECT f.id FROM project_footage f JOIN assets a ON a.id = f.asset_id WHERE a.media_uid = ?").get(refusedUid);
+assert.ok(kept, "the clip whose copy the service would not delete is kept for the next call");
+r = await call("DELETE", `/api/projects/${pid}`);
+assert.equal(r.status, 200, JSON.stringify(r.data));
+assert.equal(db.prepare("SELECT COUNT(*) AS n FROM project_footage").get().n, 0);
+assert.equal(db.prepare("SELECT COUNT(*) AS n FROM assets").get().n, sharedAssetIds.length);
+assert.equal(db.prepare("SELECT COUNT(*) AS n FROM edit_projects").get().n, 0);
+assert.equal(db.prepare("SELECT COUNT(*) AS n FROM footage_highlights").get().n, 0, "its highlights went with it");
+assert.equal(world.media.get(refusedUid).deleted, true, "the refused copy was deleted on the next call");
+const deleted = [...world.media.values()].filter((v) => v.deleted).length;
+console.log(`10 ok: project deleted in two calls, ${deleted} media copies deleted, a refused one on the second`);
+
+// 12. With the org's Google Drive connection, clips come in through it, not
+// the shared link: on deliveries only (a download through it is slow). The
+// calls are Google's own Drive API through the broker (`proxyRequest`); no
+// Composio action is run. A file over what one answer through it carries
+// (250 MB) comes by the original's shared link from then on, never by a copy
+// in the connected account.
+const CONN_SIZES = { conn_small_________________: 1000, conn_big___________________: 9_000_000_000, conn_high__________________: 2000 };
+env.CREDENTIALS = {
+  async listConnected() {
+    return ["googledrive"];
+  },
+  async executeTool(service, action) {
+    (world.connActions ??= []).push(action);
+    return { data: null, error: "footage runs no action", successful: false };
+  },
+  // The broker as it answers since the proxy passes the provider's status and
+  // a file's link through: Google Drive's base already ends in /drive/v3.
+  async proxyRequest(service, orgId, req) {
+    (world.proxied ??= []).push(`${req.method} ${req.endpoint}`);
+    const q = Object.fromEntries((req.parameters ?? []).map((p) => [p.name, p.value]));
+    const m = /^\/files\/([^/?]+)$/.exec(req.endpoint);
+    if (service !== "googledrive" || !m) return { data: null, error: `googledrive 404: no ${req.endpoint}`, successful: false, status: 404 };
+    const id = decodeURIComponent(m[1]);
+    if (req.method === "DELETE") {
+      world.removeTries = (world.removeTries ?? 0) + 1;
+      if (world.refuseRemoves > 0) {
+        world.refuseRemoves--;
+        return { data: { error: { code: 403 } }, error: "googledrive 403: User rate limit exceeded", successful: false, status: 403 };
+      }
+      (world.removed ??= []).push(id);
+      return { data: null, error: null, successful: true, status: 204 };
+    }
+    if (q.alt === "media" && q.Range) {
+      // One piece, as the broker answers a ranged read: a link to its bytes,
+      // with Drive's own status and range.
+      const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(q.Range);
+      (world.proxiedRanges ??= []).push(Number(a));
+      return {
+        data: null,
+        error: null,
+        successful: true,
+        status: 206,
+        headers: { "content-range": `bytes ${a}-${b}/${CONN_SIZES[id]}` },
+        file: { url: `https://temp.r2.test/piece/${id}/${a}-${b}`, contentType: "video/mp4", size: Number(b) - Number(a) + 1, expiresAt: null },
+      };
+    }
+    if (q.alt === "media") {
+      world.connCalls = (world.connCalls ?? 0) + 1;
+      const size = CONN_SIZES[id] ?? 1000;
+      return { data: null, error: null, successful: true, status: 200, file: { url: `https://temp.r2.test/${id}`, contentType: "video/mp4", size, expiresAt: null } };
+    }
+    return { data: { name: "x.MP4", mimeType: "video/mp4", size: String(CONN_SIZES[id] ?? 1000) }, error: null, successful: true, status: 200 };
+  },
+};
+env.CLAWNIFY_ORG_ID = "org1";
+world.drive[fid("day2")] = page("Day 2", [fileEntry("conn_small_________________", "A_0001.MP4"), fileEntry("conn_big___________________", "Interview.MP4")]);
+r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day2")}` });
+assert.equal(r.status, 201, JSON.stringify(r.data));
+const p2 = r.data.id;
+const reads = async () => (await call("GET", `/api/projects/${p2}/footage?logs=0`)).data;
+let f2 = await reads();
+assert.equal(f2.counts.importing, 0, "a read starts no download through the connection");
+assert.equal(world.connCalls ?? 0, 0);
+const deliver2 = async () => {
+  const body = JSON.stringify({ project_id: p2 });
+  const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+  assert.equal(res.status, 200);
+};
+await deliver2();
+f2 = await reads();
+const small = f2.items.find((i) => i.name === "A_0001.MP4");
+const big = f2.items.find((i) => i.name === "Interview.MP4");
+assert.equal(small.status, "importing", JSON.stringify(small));
+assert.ok(world.importUrls.includes("https://temp.r2.test/conn_small_________________"), "imported from the connection's link");
+// Over what one answer through the connection carries: the original's shared
+// link, the same delivery. It was never asked for whole through the broker
+// (only its size), and no copy, permission or folder was made anywhere.
+assert.equal(big.status, "importing", JSON.stringify(big));
+assert.ok(world.importUrls.includes("https://drive.usercontent.google.com/download?id=conn_big___________________&export=download&confirm=t"), "imported from the original's shared link");
+assert.equal(db.prepare("SELECT link_only, copy_id FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().link_only, 2);
+const bigCalls = () => world.proxied.filter((c) => c.includes("conn_big"));
+assert.deepEqual(bigCalls(), ["GET /files/conn_big___________________"], "only its size was asked for");
+assert.deepEqual(world.connActions ?? [], [], "footage runs no Composio action");
+const callsBefore = bigCalls().length;
+// A copy an earlier version made for this clip is deleted once the import is
+// over (Drive refuses the first try: it stays on the clip and goes on the
+// next), and the connection's download isn't tried again for the file it
+// couldn't take.
+const leftover = "copy_left__________________";
+db.prepare("UPDATE project_footage SET copy_id = ? WHERE drive_file_id = 'conn_big___________________'").run(leftover);
+world.refuseRemoves = 1;
+for (let i = 0; i < 6; i++) await deliver2();
+assert.equal(bigCalls().length, callsBefore, "the connection isn't asked again for the file it couldn't carry");
+assert.equal(db.prepare("SELECT status FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().status, "ready");
+assert.deepEqual(world.removed, [leftover], "the leftover copy is deleted once the import is over");
+assert.equal(world.removeTries, 2, "a refused delete keeps the copy on the clip and is tried again");
+assert.equal(db.prepare("SELECT copy_id FROM project_footage WHERE drive_file_id = 'conn_big___________________'").get().copy_id, null);
+assert.deepEqual(world.connActions ?? [], [], "still no Composio action");
+console.log("12 ok: imports through the Drive API over the connection on deliveries; a file over 250 MB comes by its shared link, never fetched whole through the broker, no copy made; a leftover copy is deleted, after a refused delete too");
+
+// 12b. A big file coming in by pieces, whose shared link Drive starts refusing
+// part-way (past about 4 GB read, live): the pieces it refuses come through
+// the connection, which still serves them, and the clip never waits.
+{
+  const P = 200 * 2 ** 20;
+  const size = 2 * P + 3 * 2 ** 20;
+  world.big[fid("big7")] = { size, refuseFrom: P };
+  CONN_SIZES[fid("big7")] = size;
+  world.drive[fid("day7")] = page("Day 7", [fileEntry(fid("big7"), "INTERVIEW_E.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day7")}` });
+  const p7 = r.data.id;
+  const deliver7 = async () => {
+    const body = JSON.stringify({ project_id: p7 });
+    const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+    assert.equal(res.status, 200, await res.text());
+  };
+  const row7 = () => db.prepare("SELECT status, upload_uid, asset_id, error FROM project_footage WHERE project_id = ?").get(p7);
+  await deliver7(); // over 250 MB for the connection: shared link, quota page, an upload opens
+  const u7 = row7().upload_uid;
+  assert.ok(u7, JSON.stringify(row7()));
+  world.proxiedRanges = [];
+  await deliver7(); // the pieces
+  assert.deepEqual(world.uploads.get(u7).patches, [0, P, 2 * P], "every piece in, in order");
+  assert.deepEqual(world.proxiedRanges, [P, 2 * P], "the refused pieces came through the connection");
+  assert.equal(row7().status, "importing");
+  assert.ok(row7().asset_id, "and the clip is in, without waiting on Drive");
+  r = await call("DELETE", `/api/projects/${p7}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  console.log("12b ok: pieces the shared link refuses part-way come through the Drive connection; the clip never waits");
+}
+
+// 12c. A file whose shared link Drive refuses entirely, even its first byte:
+// its size and every piece come through the connection, and it never waits.
+// 12d. The same for a file over the video host's 30 GB limit: the
+// connection's size says so, and it fails at once with the reason.
+{
+  const P = 200 * 2 ** 20;
+  const size = 2 * P + 3 * 2 ** 20;
+  world.big[fid("big9")] = { size, refuseFrom: 0 };
+  CONN_SIZES[fid("big9")] = size;
+  world.big[fid("huge9")] = { size: 33_000_000_000, refuseFrom: 0 };
+  CONN_SIZES[fid("huge9")] = 33_000_000_000;
+  world.drive[fid("day9")] = page("Day 9", [fileEntry(fid("big9"), "INTERVIEW_F.MP4"), fileEntry(fid("huge9"), "STAGE_B.MP4")]);
+  r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day9")}` });
+  const p9 = r.data.id;
+  const deliver9 = async () => {
+    const body = JSON.stringify({ project_id: p9 });
+    const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+    assert.equal(res.status, 200, await res.text());
+  };
+  const row9 = (name) => db.prepare("SELECT status, error, upload_uid, upload_size, asset_id FROM project_footage WHERE project_id = ? AND name = ?").get(p9, name);
+  await deliver9();
+  const u9 = row9("INTERVIEW_F.MP4").upload_uid;
+  assert.ok(u9, JSON.stringify(row9("INTERVIEW_F.MP4")));
+  assert.equal(row9("INTERVIEW_F.MP4").upload_size, size, "the size came through the connection");
+  assert.deepEqual([row9("STAGE_B.MP4").status, row9("STAGE_B.MP4").error], ["failed", "33.0 GB is over the video host's 30 GB limit"]);
+  assert.ok(![...world.uploads.values()].some((x) => x.name === "STAGE_B.MP4"), "no upload for the file over the limit");
+  world.proxiedRanges = [];
+  await deliver9();
+  assert.deepEqual(world.uploads.get(u9).patches, [0, P, 2 * P], "every piece in, in order");
+  assert.deepEqual(world.proxiedRanges, [0, P, 2 * P], "every piece through the connection");
+  assert.ok(row9("INTERVIEW_F.MP4").asset_id, "and the clip is in");
+  r = await call("DELETE", `/api/projects/${p9}`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  console.log("12c ok: a file whose shared link Drive refuses entirely comes in through the connection, size and pieces");
+  console.log("12d ok: one over the 30 GB limit fails at once, on the connection's size");
+}
+
+// 13. A source over the video host's bitrate cap goes back in line marked for
+// re-encoding; the re-encode becomes a media id, and the clip is ready.
+world.drive[fid("day3")] = page("Day 3", [fileEntry("conn_high__________________", "HIGH.MP4")]);
+r = await call("POST", "/api/projects", { folder: `https://drive.google.com/drive/folders/${fid("day3")}` });
+const p3 = r.data.id;
+const deliver3 = async () => {
+  const body = JSON.stringify({ project_id: p3 });
+  const res = await app.request("https://open-video.apps.clawnify.com/api/footage/step", { method: "POST", headers: { "content-type": "application/json", ...(await signed(body)) }, body }, env, ctx);
+  assert.equal(res.status, 200);
+};
+const row3 = () => db.prepare("SELECT status, transcode, transcode_job, asset_id, error FROM project_footage WHERE project_id = ?").get(p3);
+const refused = () => [...world.media.values()].filter((v) => v.name === "HIGH.MP4");
+for (let i = 0; i < 3 && !world.transcodes; i++) await deliver3();
+assert.equal(world.transcodes, 1, "a re-encode was started");
+assert.equal(row3().transcode, 1);
+assert.ok(refused().every((v) => v.deleted), "the refused copy was deleted");
+for (let i = 0; i < 5 && row3().status !== "ready"; i++) await deliver3();
+assert.equal(row3().status, "ready", JSON.stringify(row3()));
+assert.equal(row3().transcode_job, null);
+console.log("13 ok: a clip over the bitrate cap is re-encoded on the way in and imports");
+console.log("ALL OK");
+
+// 14. Library footage: an existing upload can be analysed by any project,
+// without gaining ownership of the media, or inheriting another project's picks.
+{
+  const uid = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+  const assetId = 'library-talk';
+  world.media.set(uid, { name: 'talk 1.mp4', polls: 2, deleted: false });
+  db.prepare("INSERT INTO assets (id, key, name, content_type, size, duration, media_uid) VALUES (?, ?, ?, 'video/mp4', ?, ?, ?)")
+    .run(assetId, `media/${uid}`, 'talk 1.mp4', 9452386420, 1506.16, uid);
+  const projectA = (await call('POST', '/api/projects', { name: 'Library A' })).data.id;
+  const projectB = (await call('POST', '/api/projects', { name: 'Library B' })).data.id;
+  const attach = (p, a = assetId) => call('POST', `/api/projects/${p}/footage/assets`, { asset_id: a });
+  const row = (p) => db.prepare("SELECT * FROM project_footage WHERE project_id = ? AND source_kind = 'library'").get(p);
+  const delivery = async (p) => {
+    const body = JSON.stringify({ project_id: p });
+    const response = await app.request('https://open-video.apps.clawnify.com/api/footage/step', { method: 'POST', headers: { 'content-type': 'application/json', ...(await signed(body)) }, body }, env, ctx);
+    assert.equal(response.status, 200, await response.text());
+  };
+  const externalBefore = world.calls.length;
+  world.failNextEnqueue = true;
+  let x = await attach(projectA);
+  assert.equal(x.status, 201, JSON.stringify(x));
+  assert.equal(db.prepare('SELECT footage_step_at FROM edit_projects WHERE id = ?').get(projectA).footage_step_at, null, 'first queue booking failed');
+  const keyBeforeRecovery = env.OPENROUTER_API_KEY;
+  delete env.OPENROUTER_API_KEY;
+  assert.ok((await call('GET', `/api/projects/${projectA}/highlights`)).data.next_step_at, 'reading preparation progress recovers a failed queue booking without a model key');
+  env.OPENROUTER_API_KEY = keyBeforeRecovery;
+  assert.equal(row(projectA).source_kind, 'library');
+  assert.equal(row(projectA).drive_file_id, `asset:${assetId}`);
+  assert.equal(row(projectA).status, 'ready');
+  assert.equal((await attach(projectA)).data.added, false, 'duplicate attach returns the same reference');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM project_footage WHERE project_id = ?").get(projectA).n, 1);
+  assert.equal((await call('GET', `/api/projects/${projectA}/highlights`)).data.clips.preparing, 1, 'logging progress is visible before highlights begin');
+  assert.ok((await call('GET', '/api/assets')).data.some(a => a.id === assetId), 'reference remains in shared library');
+  assert.ok((await call('GET', `/api/assets?project=${projectB}`)).data.some(a => a.id === assetId), 'available to another project');
+  assert.equal((await call('DELETE', `/api/assets/${assetId}`)).status, 409, 'active reference protects permanent asset deletion');
+  world.extraHighlights = 9; // Cross the eight-row batch boundary on a long upload.
+  await call('POST', `/api/projects/${projectA}/highlights`, { brief: 'Best moments from this talk' });
+  for (let i = 0; i < 10 && row(projectA).highlights_status !== 'done'; i++) await delivery(projectA);
+  assert.equal(row(projectA).log_status, 'done');
+  assert.equal(row(projectA).highlights_status, 'done');
+  x = await call('GET', `/api/projects/${projectA}/highlights`);
+  assert.equal(x.data.highlights.length, 11, 'all picks survive multiple D1-safe batches');
+  world.extraHighlights = 0;
+  const picked = x.data.highlights[0];
+  await call('PATCH', `/api/projects/${projectA}/highlights/${picked.id}`, { pick: 'keep' });
+  const jobsBeforeReuse = world.jobs.size;
+  assert.equal((await attach(projectB)).status, 201);
+  assert.equal(row(projectB).log_status, 'done', 'completed analysis reused by another project');
+  assert.equal(row(projectB).highlights_status, null, 'highlight choices are not copied');
+  await call('POST', `/api/projects/${projectB}/highlights`, { brief: 'Different purpose' });
+  await delivery(projectB);
+  assert.equal(world.jobs.size, jobsBeforeReuse, 'no repeated video analysis after completed log reuse');
+  const picksB = (await call('GET', `/api/projects/${projectB}/highlights`)).data.highlights;
+  assert.ok(picksB.length && picksB.every(h => h.pick === null && h.id !== picked.id));
+  const csv = await call('GET', `/api/projects/${projectB}/highlights/export?format=csv`);
+  assert.ok(!csv.data.includes('drive.google.com'), 'a library source never gets a fake Drive URL');
+  const since = world.calls.slice(externalBefore);
+  assert.ok(!since.some(c => /POST .*\/media\/(import|uploads)/.test(c) || /drive\.google|drive\.usercontent/.test(c)), 'library analysis never transfers or fetches Drive footage');
+  // Unsupported and still-processing assets fail clearly without entering work.
+  db.prepare("INSERT INTO assets (id, key, name, content_type) VALUES ('old', 'old.mp4', 'old.mp4', 'video/mp4')").run();
+  assert.equal((await attach(projectA, 'old')).status, 422);
+  assert.equal((await attach(projectA, 'missing')).status, 404);
+  assert.equal((await call('POST', `/api/projects/${projectA}/footage/assets`, [])).status, 400);
+  const ownerAsset = db.prepare("SELECT asset_id FROM project_footage WHERE source_kind = 'drive' AND asset_id IS NOT NULL LIMIT 1").get();
+  assert.equal((await attach(projectA, ownerAsset.asset_id)).status, 404, 'cannot borrow a Drive-owned asset with different deletion rules');
+  // Picker is bounded and literal-searchable, and marks attached assets.
+  for (let i = 0; i < 51; i++) db.prepare("INSERT INTO assets (id,key,name,content_type,media_uid) VALUES (?,?,?,'video/mp4',?)").run(`picker${i}`, `picker/${i}`, `Picker ${i}`, uid);
+  x = await call('GET', `/api/projects/${projectA}/library-videos?search=Picker`);
+  assert.equal(x.data.items.length, 50); assert.equal(x.data.next_offset, 50);
+  assert.equal((await call('GET', `/api/projects/${projectA}/library-videos?search=Picker&offset=50`)).data.items.length, 1);
+  x = await call('GET', `/api/projects/${projectA}/library-videos?search=talk%201`);
+  assert.equal(x.data.items[0].attached, true);
+  assert.equal((await call('GET', `/api/projects/${projectA}/library-videos?search=%25`)).data.items.length, 0, 'percent is a literal search');
+  // Detaching while a model request is in flight cannot resurrect its picks.
+  const removedDuringManual = row(projectB).id;
+  world.beforePersonPick = async () => { await call('DELETE', `/api/projects/${projectB}/footage/assets/${assetId}`); };
+  assert.equal((await call('POST', `/api/projects/${projectB}/highlights/items`, { clip: removedDuringManual, start: 1, end: 4 })).status, 404);
+  assert.equal(world.beforePersonPick, null, 'manual-pick detach interleaving ran');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM footage_highlights WHERE footage_id = ?').get(removedDuringManual).n, 0);
+  await attach(projectB); await delivery(projectB);
+  const removedDuringModel = row(projectB).id;
+  await call('POST', `/api/projects/${projectB}/highlights`, { again: true });
+  world.beforeModel = async () => {
+    assert.equal((await call('DELETE', `/api/projects/${projectB}/footage/assets/${assetId}`)).status, 200);
+  };
+  await delivery(projectB);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM footage_highlights WHERE footage_id = ?').get(removedDuringModel).n, 0, 'late result cannot recreate deleted highlights');
+  assert.equal((await attach(projectB)).status, 201);
+  await delivery(projectB);
+  assert.equal((await call('DELETE', `/api/projects/${projectA}`)).status, 200);
+  assert.ok(db.prepare('SELECT 1 FROM assets WHERE id = ?').get(assetId));
+  assert.equal(world.media.get(uid).deleted, false, 'project deletion preserves the shared media');
+  assert.ok((await call('GET', `/api/projects/${projectB}/highlights`)).data.highlights.length, 'other project selections survive');
+  const oldReference = row(projectB).id;
+  assert.equal((await call('DELETE', `/api/projects/${projectB}/footage/assets/${assetId}`)).status, 200);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM footage_highlights WHERE footage_id = ?').get(oldReference).n, 0);
+  assert.equal(world.media.get(uid).deleted, false, 'detaching also preserves media');
+  assert.equal((await attach(projectB)).status, 201, 'can attach again after removing reference');
+  assert.notEqual(row(projectB).id, oldReference, 'old analysis deliveries cannot touch the new reference');
+  assert.equal((await call('DELETE', `/api/projects/${projectB}`)).status, 200);
+  assert.equal((await call('DELETE', `/api/assets/${assetId}`)).status, 409, 'shared highlights retain their source after project deletion');
+  for (const h of db.prepare('SELECT id FROM library_highlights WHERE asset_id = ?').all(assetId)) {
+    assert.equal((await call('DELETE', `/api/highlights/${h.id}`)).status, 200);
+  }
+  world.beforeMediaDelete = async () => {
+    const attempt = await attach((await call('POST', '/api/projects', { name: 'Deletion race' })).data.id);
+    assert.equal(attempt.status, 404, 'a deletion claim refuses attachments while external cleanup waits');
+  };
+  assert.equal((await call('DELETE', `/api/assets/${assetId}`)).status, 200);
+  assert.equal(world.beforeMediaDelete, null, 'the interleaving actually ran');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM project_footage WHERE asset_id = ?').get(assetId).n, 0);
+  const waitingProject = (await call('POST', '/api/projects', { name: 'Drive backoff check' })).data.id;
+  const tomorrow = new Date(Date.now() + 86400000).toISOString();
+  db.prepare("INSERT INTO project_footage(project_id,drive_file_id,name,retry_at) VALUES (?, 'backoff-drive', 'deferred.mp4', ?)").run(waitingProject, tomorrow);
+  db.prepare('UPDATE edit_projects SET footage_step_at = ? WHERE id = ?').run(tomorrow, waitingProject);
+  await call('GET', `/api/projects/${waitingProject}/highlights`);
+  assert.equal(db.prepare('SELECT footage_step_at FROM edit_projects WHERE id = ?').get(waitingProject).footage_step_at, tomorrow, 'Highlights polling preserves Drive retry backoff');
+  console.log('14 ok: library video reused without import; isolated highlights, cached logs, bounded picker, guarded deletion and detach/re-add');
+}
+
+// 15. Shared source ranges: migration, deduplication, lifetime, portrait batches
+// and deletion interleavings all go through the real routes/database triggers.
+{
+  const asset = 'common-source'; const uid = 'f'.repeat(32);
+  world.media.set(uid, { name: 'common.mp4', polls: 2, deleted: false });
+  db.prepare("INSERT INTO assets(id,key,name,content_type,size,duration,media_uid) VALUES (?,?,'common.mp4','video/mp4',100,100,?)").run(asset, asset, uid);
+  const origin = (await call('POST','/api/projects',{name:'Common origin'})).data.id;
+  db.prepare("INSERT INTO project_footage(id,project_id,drive_file_id,name,status,asset_id) VALUES ('common-footage',?,'common-drive','common.mp4','ready',?)").run(origin,asset);
+  const make = (start,end,text) => call('POST',`/api/projects/${origin}/highlights/items`,{clip:'common-footage',start,end,text,kind:'soundbite'});
+  const first = await make(10,20,'One reusable thought'); assert.equal(first.status,201);
+  const second = await make(40,55,'Another thought'); assert.equal(second.status,201);
+  await make(10,20,'One reusable thought');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM library_highlights WHERE asset_id = ?').get(asset).n,2,'identical source intervals are one shared object');
+  let list = await call('GET','/api/highlights?search=common.mp4'); assert.equal(list.status,200);
+  assert.equal(list.data.items.length,2);
+  const ids = list.data.items.map(h => h.id);
+  const body = {ids, request_id:crypto.randomUUID()};
+  const racedRequest = crypto.randomUUID();
+  world.beforePortraitInsert = async () => {
+    const loser = await call('POST','/api/highlights/projects',{ids:[ids[1]],request_id:racedRequest});
+    assert.equal(loser.status,409,'request claim already pins its original selection');
+  };
+  const winner = await call('POST','/api/highlights/projects',{ids:[ids[0]],request_id:racedRequest});
+  assert.equal(winner.status,201);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM edit_projects WHERE creation_batch = ?').get(racedRequest).n,1);
+  await call('DELETE',`/api/projects/${winner.data.projects[0].id}`);
+  const before = db.prepare('SELECT edl FROM edit_projects WHERE id = ?').get(origin).edl;
+  const created = await call('POST','/api/highlights/projects',body); assert.equal(created.status,201,JSON.stringify(created.data));
+  const retry = await call('POST','/api/highlights/projects',body); assert.equal(retry.status,200);
+  assert.deepEqual(retry.data.projects,created.data.projects,'retry returns the same projects');
+  assert.equal((await call('POST','/api/highlights/projects',{...body,ids:[ids[0]]})).status,409,'request reuse cannot change its selection');
+  for (const p of created.data.projects) {
+    const edl = (await call('GET',`/api/projects/${p.id}`)).data.edl;
+    assert.deepEqual([edl.output.width,edl.output.height],[1920,1080]);
+    assert.deepEqual(edl.formats,[{id:'9:16',width:1080,height:1920}],'each started project carries a 9:16 version');
+    assert.equal(edl.main.elements[0].framing,undefined,'nothing is framed until someone frames it');
+    const h = list.data.items.find(h => h.id === p.highlight_id);
+    assert.deepEqual([edl.main.elements[0].src,edl.main.elements[0].trimStart,edl.main.elements[0].duration],[`asset:${asset}`,h.src_in,h.src_out-h.src_in]);
+  }
+  assert.equal(db.prepare('SELECT edl FROM edit_projects WHERE id = ?').get(origin).edl,before,'original timeline unchanged');
+  // Legacy upgrade: remove only the publication and migration marker, then
+  // exercise the production backfill. Removed selections stay tombstoned.
+  await call('DELETE',`/api/highlights/${ids[0]}`);
+  db.prepare('DELETE FROM library_highlights WHERE id = ?').run(ids[1]);
+  db.prepare("DELETE FROM app_settings WHERE key = 'library_highlights_v1'").run();
+  list = await call('GET','/api/highlights?search=common.mp4');
+  assert.equal(list.data.items.length,1,'legacy backfill restores old selections without resurrecting removals');
+  assert.equal((await call('DELETE',`/api/projects/${origin}`)).status,200);
+  assert.equal((await call('GET','/api/highlights?search=common.mp4')).data.items.length,1,'catalog survives its original project');
+  assert.equal(world.media.get(uid).deleted,false);
+  assert.equal((await call('DELETE',`/api/assets/${asset}`)).status,409);
+  await call('DELETE',`/api/highlights/${ids[1]}`);
+  assert.equal((await call('DELETE',`/api/assets/${asset}`)).status,409,'created timelines remain independent references');
+  await call('DELETE',`/api/projects/${created.data.projects[0].id}`);
+  assert.equal((await call('POST','/api/highlights/projects',{...body,ids:[created.data.projects[1].highlight_id]})).status,409,'deletion cannot change an existing request selection');
+  assert.equal((await call('POST','/api/highlights/projects',body)).status,410,'retry never resurrects one deleted clip');
+  await call('DELETE',`/api/projects/${created.data.projects[1].id}`);
+  assert.equal((await call('POST','/api/highlights/projects',body)).status,410,'retry never resurrects a deleted batch');
+  world.beforeMediaDelete = async () => {
+    const result = await call('POST','/api/projects',{name:'Racing edit',edl:{version:1,output:{width:1080,height:1920,fps:30},main:{elements:[{id:'v',type:'video',src:`asset:${asset}`,duration:10}]}}});
+    assert.equal(result.status,409,'EDL writer cannot attach a source claimed for deletion');
+  };
+  assert.equal((await call('DELETE',`/api/assets/${asset}`)).status,200);
+  assert.equal(world.beforeMediaDelete,null);
+  assert.equal((await call('POST','/api/highlights/projects',{ids,request_id:crypto.randomUUID()})).status,409);
+  console.log('15 ok: shared catalog migration, range deduplication, two-format projects started on request, retry identity and source lifetime');
+}

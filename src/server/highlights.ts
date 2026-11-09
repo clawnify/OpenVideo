@@ -1,3 +1,4 @@
+import { backfillHighlights } from "./library-highlights";
 // Highlights: the selects an editor looks at first. For every logged clip of
 // a project's footage, whether it is worth an editor's time and, if it is,
 // the parts to cut from: soundbites (speech that stands on its own) and
@@ -51,7 +52,75 @@ export interface HighlightClip {
   /** WebVTT, or null when there is none (no speech, or not made). */
   transcript: string | null;
   /** Stretches a person already kept or dropped: never picked again. */
-  taken?: { start: number; end: number; text: string }[];
+  taken?: Reviewed[];
+}
+
+/** A stretch of a clip a person already kept or dropped. */
+export interface Reviewed {
+  start: number;
+  end: number;
+  text: string;
+  pick: "keep" | "drop";
+}
+
+/**
+ * What a person has kept and dropped across the project, latest first: the
+ * taste a reading learns from, beside the brief.
+ */
+export interface Taste {
+  kept: TasteExample[];
+  dropped: TasteExample[];
+}
+
+export interface TasteExample {
+  kind: HighlightKind;
+  text: string;
+  speaker: string;
+  /** The score it had when it was proposed. */
+  score: number;
+  /** A pick the person added themselves. */
+  own: boolean;
+}
+
+/** How many of each a prompt carries: enough to show a taste, bounded however long the review. */
+export const TASTE_EXAMPLES = 15;
+
+/** A reviewed pick as the database holds it. */
+export interface ReviewedPick {
+  pick: "keep" | "drop";
+  kind: HighlightKind;
+  text: string;
+  speaker: string;
+  score: number;
+  origin: string;
+}
+
+/** The words of a pick, without case or punctuation: what two takes of one line share. */
+function sameWords(text: string): string {
+  return text
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * The taste a reading learns from, `reviewed` latest first. A dropped pick
+ * that says what a kept one says is left out: it is another camera's take of
+ * a line the person kept, not a line they didn't want.
+ */
+export function tasteFrom(reviewed: ReviewedPick[]): Taste {
+  const example = (r: ReviewedPick): TasteExample => ({ kind: r.kind, text: r.text, speaker: r.speaker, score: r.score, own: r.origin === "person" });
+  const kept = reviewed.filter((r) => r.pick === "keep");
+  const keptWords = new Set(kept.map((r) => sameWords(r.text)).filter(Boolean));
+  return {
+    kept: kept.slice(0, TASTE_EXAMPLES).map(example),
+    dropped: reviewed
+      .filter((r) => r.pick === "drop" && !keptWords.has(sameWords(r.text)))
+      .slice(0, TASTE_EXAMPLES)
+      .map(example),
+  };
 }
 
 export interface ClipVerdict {
@@ -148,7 +217,9 @@ function clipBlock(n: number, c: HighlightClip): string {
     lines.push("No speech.");
   }
   if (c.taken?.length) {
-    lines.push(`Already reviewed by a person, don't pick again or overlap: ${c.taken.map((t) => `[${stamp(t.start)}-${stamp(t.end)}] ${t.text.slice(0, 80)}`).join("; ")}`);
+    lines.push(
+      `Already reviewed by a person, don't pick again or overlap: ${c.taken.map((t) => `[${stamp(t.start)}-${stamp(t.end)}] ${t.pick === "keep" ? "kept" : "dropped"}: ${t.text.slice(0, 80)}`).join("; ")}`,
+    );
   }
   return lines.join("\n");
 }
@@ -182,7 +253,19 @@ export function batchClips<T extends HighlightClip>(clips: T[], limits = BATCH):
   return out;
 }
 
-export function highlightsPrompt(brief: string, clips: HighlightClip[]): string {
+function tasteBlock(taste: Taste | undefined): string {
+  if (!taste || (!taste.kept.length && !taste.dropped.length)) return "";
+  const line = (e: TasteExample) =>
+    `- ${e.kind === "soundbite" ? "soundbite" : "b-roll"}${e.speaker ? `, ${e.speaker.slice(0, 60)}` : ""}: "${e.text.slice(0, 160)}" (${e.own ? "added by them" : `scored ${e.score} when proposed`})`;
+  const parts = [
+    "The person reviewing these picks has already kept and dropped some in this project, latest first. Learn their taste from it: score picks like the kept ones higher, and leave out or mark down picks like the ones they drop. Where this and the brief above disagree, the brief wins.",
+  ];
+  if (taste.kept.length) parts.push(`Kept:\n${taste.kept.map(line).join("\n")}`);
+  if (taste.dropped.length) parts.push(`Dropped:\n${taste.dropped.map(line).join("\n")}`);
+  return `\n\n${parts.join("\n")}`;
+}
+
+export function highlightsPrompt(brief: string, clips: HighlightClip[], taste?: Taste): string {
   const goal = brief.trim() ? brief.trim().slice(0, 2000) : "a short highlight video of this shoot";
   return `You are the assistant editor making selects for: ${goal}
 
@@ -200,7 +283,7 @@ A soundbite's speaker is who says it as the log describes them ("man in a red sh
 
 Picks in a clip never overlap, and the same moment is never picked twice. When two clips show the same moment (two cameras, or a retake), pick from the better one and say so in the other's reason or skip reason.
 
-How many: as many as are worth an editor's look. A 5-second shot has none or one. A long interview or talk: read it all, start to finish, and pick every strong soundbite, roughly one for every two or three minutes of talk and more where it is strong; a 45-minute interview usually gives fifteen or more. The logger's picks are a hint: include the strong ones, and find the others they missed.
+How many: as many as are worth an editor's look. A 5-second shot has none or one. A long interview or talk: read it all, start to finish, and pick every strong soundbite, roughly one for every two or three minutes of talk and more where it is strong; a 45-minute interview usually gives fifteen or more. The logger's picks are a hint: include the strong ones, and find the others they missed.${tasteBlock(taste)}
 
 ${clips.map((c, i) => clipBlock(i + 1, c)).join("\n\n")}`;
 }
@@ -299,12 +382,12 @@ export interface HighlightsFailure {
   retry: boolean;
 }
 
-/** One model call over one batch of clips. */
-export async function findHighlights(
+/** One structured call to the model: its answer as JSON, or why there is none. */
+async function askModel(
   key: string | undefined,
-  brief: string,
-  clips: HighlightClip[],
-): Promise<{ verdicts: ClipVerdict[] } | { failure: HighlightsFailure }> {
+  prompt: string,
+  schema: { name: string; schema: object; maxTokens: number },
+): Promise<{ parsed: unknown } | { failure: HighlightsFailure }> {
   if (!key) {
     return {
       failure: {
@@ -321,10 +404,10 @@ export async function findHighlights(
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: MODEL,
-        messages: [{ role: "user", content: highlightsPrompt(brief, clips) }],
-        max_tokens: 24_000,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: schema.maxTokens,
         temperature: 0.2,
-        response_format: { type: "json_schema", json_schema: { name: "highlights", strict: true, schema: HIGHLIGHTS_SCHEMA } },
+        response_format: { type: "json_schema", json_schema: { name: schema.name, strict: true, schema: schema.schema } },
       }),
     });
   } catch (err) {
@@ -335,17 +418,167 @@ export async function findHighlights(
     return { failure: { error: "highlights_failed", detail, retry: res.status === 429 || res.status >= 500 } };
   }
   const body = (await res.json().catch(() => null)) as { choices?: { message?: { content?: string } }[] } | null;
-  let parsed: unknown = null;
   try {
-    parsed = JSON.parse(body?.choices?.[0]?.message?.content ?? "");
+    return { parsed: JSON.parse(body?.choices?.[0]?.message?.content ?? "") };
   } catch {
-    parsed = null;
+    return { parsed: null };
   }
-  const verdicts = readHighlights(parsed, clips);
+}
+
+/** One model call over one batch of clips. */
+export async function findHighlights(
+  key: string | undefined,
+  brief: string,
+  clips: HighlightClip[],
+  taste?: Taste,
+): Promise<{ verdicts: ClipVerdict[] } | { failure: HighlightsFailure }> {
+  const answer = await askModel(key, highlightsPrompt(brief, clips, taste), { name: "highlights", schema: HIGHLIGHTS_SCHEMA, maxTokens: 24_000 });
+  if ("failure" in answer) return answer;
+  const verdicts = readHighlights(answer.parsed, clips);
   if (!verdicts.length) {
     return { failure: { error: "highlights_failed", detail: "the model's answer could not be read", retry: true } };
   }
   return { verdicts };
+}
+
+// ── the best of them ────────────────────────────────────────────────────────
+// A project can ask for a number of highlights. Each reading sees a dozen
+// clips, so a count written in the brief can't hold for the whole project
+// (each call took it for its own batch). Instead, once every clip is read,
+// one more call reads all the picks found and puts them in order for the
+// brief: the best set of that many first, then stand-ins. Every pick not
+// dropped gets a place, so changing what is kept or dropped never needs the
+// model again: the best are the kept ones, then the first in that order.
+
+/** The most highlights a project can ask for. */
+export const MAX_WANTED = 200;
+/** Roughly how much of the picks one ordering reads: past it, the lowest scored wait at the end. */
+export const RANK_CHARS = 300_000;
+
+/** A pick as the ordering reads it. */
+export interface RankCandidate {
+  id: string;
+  kind: HighlightKind;
+  start: number;
+  end: number;
+  text: string;
+  speaker: string;
+  score: number;
+  reason: string;
+  /** A person kept it: it counts toward the number first. */
+  kept: boolean;
+  /** Its clip's file name and folder. */
+  name: string;
+  folder: string;
+}
+
+export const RANKING_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["best", "reserve"],
+  properties: {
+    best: { type: "array", items: { type: "integer" }, description: "the chosen picks' numbers, best first" },
+    reserve: { type: "array", items: { type: "integer" }, description: "stand-ins' numbers, best first" },
+  },
+};
+
+const byClip = (a: RankCandidate, b: RankCandidate) =>
+  a.folder.localeCompare(b.folder) || a.name.localeCompare(b.name) || a.start - b.start || a.id.localeCompare(b.id);
+const byScore = (a: RankCandidate, b: RankCandidate) => b.score - a.score || byClip(a, b);
+
+function pickLine(n: number, p: RankCandidate): string {
+  const where = `"${p.name.slice(0, 200)}"${p.folder ? ` in "${p.folder.slice(0, 200)}"` : ""} at ${stamp(p.start)}, ${(p.end - p.start).toFixed(1)} s`;
+  const what = p.kind === "soundbite" ? `${p.speaker ? `${p.speaker.slice(0, 80)}: ` : ""}"${p.text.slice(0, 240)}"` : p.text.slice(0, 160);
+  return `PICK ${n}: ${p.kind === "soundbite" ? "soundbite" : "b-roll"}, ${p.score}/5${p.kept ? ", KEPT" : ""}, ${where}. ${what}${p.reason ? ` Why: ${p.reason.slice(0, 160)}` : ""}`;
+}
+
+/**
+ * The picks one ordering reads: the kept ones, then the best scored, up to
+ * about `chars` of prompt; listed clip by clip, so the model reads the shoot
+ * in order rather than the scores it is meant to look past.
+ */
+export function rankingPool(candidates: RankCandidate[], chars = RANK_CHARS): RankCandidate[] {
+  const ranked = [...candidates].sort((a, b) => Number(b.kept) - Number(a.kept) || byScore(a, b));
+  const pool: RankCandidate[] = [];
+  let size = 0;
+  for (const p of ranked) {
+    const s = pickLine(0, p).length + 1;
+    if (pool.length && size + s > chars) break;
+    pool.push(p);
+    size += s;
+  }
+  return pool.sort(byClip);
+}
+
+export function rankingPrompt(brief: string, pool: RankCandidate[], total: number, wanted: number, taste?: Taste): string {
+  const goal = brief.trim() ? brief.trim().slice(0, 2000) : "a short highlight video of this shoot";
+  const kept = pool.filter((p) => p.kept).length;
+  const reserve = Math.min(wanted, Math.max(0, pool.length - wanted));
+  const keptRule = !kept
+    ? ""
+    : kept < wanted
+      ? `\n\nThe ${kept} picks marked KEPT were kept by the person reviewing: they are in \`best\`. Choose the other ${wanted - kept} to go with them.`
+      : `\n\nThe person reviewing kept ${kept} picks (marked KEPT), ${kept === wanted ? "as many as" : "more than"} the ${wanted} wanted: \`best\` is the best ${wanted} of the kept picks.`;
+  return `You are the assistant editor narrowing the selects for: ${goal}
+
+Every clip of the shoot has been read, and these picks were found in it${pool.length < total ? ` (the ${pool.length} best scored of ${total})` : ""}, each with the score it got on its own (1 to 5) and why. Choose the ${wanted} that make the best set for this video, as \`best\`, best first.
+
+A good set:
+- does what the goal above asks, first: the mix of soundbites and b-roll it wants, or, when it doesn't say, enough of each to cut a video from. When it centres on one person, talk or clip, most of the set can come from that one clip: nothing has to come from every clip or camera;
+- never has the same moment twice: one line said twice (a retake, or two cameras on one answer) or one moment filmed by two cameras. Keep the better one;
+- otherwise varies, as far as the goal allows: different moments, people, places, angles and shot sizes, not several shots of the same thing;
+- puts what works together ahead of what scored well alone.${keptRule}
+
+Then list up to ${reserve} more as \`reserve\`, best first: they stand in, in that order, when the person drops one from \`best\`.${tasteBlock(taste)}
+
+${pool.map((p, i) => pickLine(i + 1, p)).join("\n")}`;
+}
+
+/**
+ * The model's answer → every candidate's id, in order: what it chose, then
+ * its stand-ins, then the rest by score. A soundbite saying what one placed
+ * before it says (a retake, another camera) waits with the rest.
+ */
+export function readRanking(raw: unknown, pool: RankCandidate[], candidates: RankCandidate[]): string[] {
+  const answer = (raw ?? {}) as { best?: unknown; reserve?: unknown };
+  const list = (v: unknown) => (Array.isArray(v) ? v : []);
+  const placed: RankCandidate[] = [];
+  const seen = new Set<number>();
+  const said = new Set<string>();
+  for (const v of [...list(answer.best), ...list(answer.reserve)]) {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 1 || n > pool.length || seen.has(n)) continue;
+    seen.add(n);
+    const p = pool[n - 1];
+    const words = p.kind === "soundbite" ? sameWords(p.text) : "";
+    if (words && said.has(words)) continue;
+    if (words) said.add(words);
+    placed.push(p);
+  }
+  const ids = new Set(placed.map((p) => p.id));
+  return [...placed, ...candidates.filter((p) => !ids.has(p.id)).sort(byScore)].map((p) => p.id);
+}
+
+/** One model call: every candidate in order, the best `wanted` first. */
+export async function rankHighlights(
+  key: string | undefined,
+  brief: string,
+  candidates: RankCandidate[],
+  wanted: number,
+  taste?: Taste,
+): Promise<{ order: string[] } | { failure: HighlightsFailure }> {
+  const pool = rankingPool(candidates);
+  const answer = await askModel(key, rankingPrompt(brief, pool, candidates.length, wanted, taste), {
+    name: "best_highlights",
+    schema: RANKING_SCHEMA,
+    maxTokens: 8_000,
+  });
+  if ("failure" in answer) return answer;
+  const best = (answer.parsed as { best?: unknown } | null)?.best;
+  if (!Array.isArray(best) || !best.length) {
+    return { failure: { error: "highlights_failed", detail: "the model's answer could not be read", retry: true } };
+  }
+  return { order: readRanking(answer.parsed, pool, candidates) };
 }
 
 // ── the step ────────────────────────────────────────────────────────────────
@@ -387,6 +620,131 @@ export async function highlightsPending(projectId: string): Promise<number> {
   return n?.n ?? 0;
 }
 
+// The ordering, on the project: NULL (no number asked for) → waiting →
+// running → done | failed. Waiting again whenever new picks land, the number
+// changes or highlights are asked for again; it runs once nothing is left to
+// read, on a delivery like the reading.
+
+/**
+ * Whether a project's picks wait to be put in order now (a claim left by a
+ * step that died counts). While footage is still coming in, new picks land a
+ * few at a time for hours: then the order is made again at most every
+ * `RANK_EVERY`, and once more when the last clip is read. A number a person
+ * sets clears `highlights_rank_at`, so it never waits.
+ */
+export async function rankingDue(projectId: string): Promise<boolean> {
+  const row = await get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM edit_projects p
+      WHERE p.id = ? AND p.highlights_at IS NOT NULL AND p.highlights_wanted IS NOT NULL
+        AND ((p.highlights_rank_status = 'waiting'
+              AND (p.highlights_rank_at IS NULL OR p.highlights_rank_at < datetime('now', ?)
+                   OR NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.project_id = p.id
+                        AND (f.status IN ('waiting', 'importing')
+                             OR (f.status = 'ready' AND (f.log_status IS NULL OR f.log_status IN ('preparing', 'running')))))))
+             OR (p.highlights_rank_status = 'running' AND p.highlights_rank_at < datetime('now', '-5 minutes')))`,
+    [projectId, `-${RANK_EVERY_MINUTES} minutes`],
+  );
+  return (row?.n ?? 0) > 0;
+}
+
+/** How often, at most, the order is made again while footage is still coming in. */
+export const RANK_EVERY_MINUTES = 15;
+
+/** Each candidate's place, 1 the best: a JSON list a statement, whatever the project's size. */
+async function saveOrder(projectId: string, ids: string[]): Promise<void> {
+  // A dropped pick holds no place: undropped later, it waits behind the rest.
+  await run("UPDATE footage_highlights SET rank = NULL WHERE project_id = ? AND pick = 'drop' AND rank IS NOT NULL", [projectId]);
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = JSON.stringify(ids.slice(i, i + 500));
+    await run(
+      `UPDATE footage_highlights SET rank = ? + (SELECT key FROM json_each(?) WHERE value = footage_highlights.id)
+        WHERE project_id = ? AND id IN (SELECT value FROM json_each(?))`,
+      [i + 1, chunk, projectId, chunk],
+    );
+  }
+}
+
+interface RankRow {
+  id: string;
+  kind: HighlightKind;
+  src_in: number;
+  src_out: number;
+  text: string;
+  speaker: string;
+  score: number;
+  reason: string;
+  pick: string | null;
+  name: string;
+  folder: string;
+}
+
+/** Put a project's picks in order, if they wait for it. */
+export async function stepRanking(key: string | undefined, projectId: string): Promise<{ moving: boolean; blocked: string | null }> {
+  if (!(await rankingDue(projectId))) return { moving: false, blocked: null };
+  if (!key) return { moving: false, blocked: HIGHLIGHTS_NO_KEY };
+  const claimed = await run(
+    `UPDATE edit_projects SET highlights_rank_status = 'running', highlights_rank_at = datetime('now')
+      WHERE id = ? AND (highlights_rank_status = 'waiting' OR (highlights_rank_status = 'running' AND highlights_rank_at < datetime('now', '-5 minutes')))`,
+    [projectId],
+  );
+  if (!claimed.changes) return { moving: false, blocked: null };
+  const project = await get<{ brief: string; highlights_wanted: number | null }>("SELECT brief, highlights_wanted FROM edit_projects WHERE id = ?", [
+    projectId,
+  ]);
+  // The number was taken away (or the project deleted) since: nothing to choose.
+  if (!project?.highlights_wanted) return { moving: false, blocked: null };
+  const rows = await query<RankRow>(
+    `SELECT h.id, h.kind, h.src_in, h.src_out, h.text, h.speaker, h.score, h.reason, h.pick, f.name, f.folder
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id
+      WHERE h.project_id = ? AND f.status != 'removed' AND (h.pick IS NULL OR h.pick = 'keep')`,
+    [projectId],
+  );
+  const candidates: RankCandidate[] = rows.map((r) => ({
+    id: r.id,
+    kind: r.kind,
+    start: r.src_in,
+    end: r.src_out,
+    text: r.text,
+    speaker: r.speaker,
+    score: r.score,
+    reason: r.reason,
+    kept: r.pick === "keep",
+    name: r.name,
+    folder: r.folder,
+  }));
+  const wanted = project.highlights_wanted;
+  let order: string[];
+  if (candidates.length <= wanted) {
+    // Every one of them is in: there is nothing to choose.
+    order = [...candidates].sort((a, b) => Number(b.kept) - Number(a.kept) || byScore(a, b)).map((p) => p.id);
+  } else {
+    const reviewed = await query<ReviewedPick>(
+      `SELECT text, pick, kind, speaker, score, origin FROM footage_highlights
+        WHERE project_id = ? AND pick IS NOT NULL ORDER BY updated_at DESC, id`,
+      [projectId],
+    );
+    const ranked = await rankHighlights(key, project.brief, candidates, wanted, tasteFrom(reviewed));
+    if ("failure" in ranked) {
+      // Busy or unreachable: again on a later step. Anything else would fail
+      // the same way again, so it says why and waits for a person.
+      const { retry, detail } = ranked.failure;
+      await run(
+        "UPDATE edit_projects SET highlights_rank_status = ?, highlights_rank_error = ? WHERE id = ? AND highlights_rank_status = 'running'",
+        [retry ? "waiting" : "failed", retry ? null : detail, projectId],
+      );
+      return { moving: retry, blocked: retry ? null : detail };
+    }
+    order = ranked.order;
+  }
+  await saveOrder(projectId, order);
+  // New picks, a new number or a new ask while this ran leave it waiting.
+  const done = await run(
+    "UPDATE edit_projects SET highlights_rank_status = 'done', highlights_rank_error = NULL WHERE id = ? AND highlights_rank_status = 'running'",
+    [projectId],
+  );
+  return { moving: done.changes === 0 && (await rankingDue(projectId)), blocked: null };
+}
+
 async function setClip(id: string, fields: Record<string, unknown>, where = ""): Promise<boolean> {
   const keys = Object.keys(fields);
   const res = await run(
@@ -398,14 +756,20 @@ async function setClip(id: string, fields: Record<string, unknown>, where = ""):
 
 /** Replace a clip's unreviewed picks with a new verdict's. */
 export async function saveVerdict(projectId: string, v: ClipVerdict): Promise<void> {
+  await backfillHighlights();
   await run("DELETE FROM footage_highlights WHERE footage_id = ? AND pick IS NULL", [v.id]);
-  // Ten values a row, under D1's hundred bound parameters a statement.
+  // VALUES keeps this one SELECT: D1 limits compound SELECT terms more
+  // tightly than local SQLite. Eight rows plus the shared guard use 74 binds.
   for (let i = 0; i < v.highlights.length; i += 8) {
     const chunk = v.highlights.slice(i, i + 8);
     await run(
-      `INSERT INTO footage_highlights (project_id, footage_id, kind, src_in, src_out, text, speaker, score, reason, origin)
-       VALUES ${chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai')").join(", ")}`,
-      chunk.flatMap((h) => [projectId, v.id, h.kind, h.start, h.end, h.text, h.speaker, h.score, h.reason]),
+      `WITH picks(project_id, footage_id, kind, src_in, src_out, text, speaker, score, reason) AS (
+         VALUES ${chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ")}
+       )
+       INSERT INTO footage_highlights (project_id, footage_id, kind, src_in, src_out, text, speaker, score, reason, origin)
+       SELECT picks.*, 'ai' FROM picks
+       WHERE EXISTS (SELECT 1 FROM project_footage WHERE id = ? AND project_id = ? AND status = 'ready')`,
+      [...chunk.flatMap((h) => [projectId, v.id, h.kind, h.start, h.end, h.text, h.speaker, h.score, h.reason]), v.id, projectId],
     );
   }
   await setClip(v.id, { highlights_status: "done", highlights_error: null, skip_reason: v.skip });
@@ -414,14 +778,17 @@ export async function saveVerdict(projectId: string, v: ClipVerdict): Promise<vo
 /**
  * Read the next few batches of a project's waiting clips. Clips logged since
  * the project asked for highlights join first, and a claim left by a step
- * that died goes back in line.
+ * that died goes back in line. With nothing left to read, the picks are put
+ * in order if the project asked for a number of them.
  */
 export async function stepHighlights(cfg: MediaConfig, key: string | undefined, projectId: string): Promise<HighlightsOutcome> {
   const project = await get<{ brief: string; highlights_at: string | null; highlights_stopped_at: string | null }>(
     "SELECT brief, highlights_at, highlights_stopped_at FROM edit_projects WHERE id = ?",
     [projectId],
   );
-  if (!project?.highlights_at || project.highlights_stopped_at) return { pending: 0, moving: false, blocked: null };
+  if (!project?.highlights_at) return { pending: 0, moving: false, blocked: null };
+  // Stopped, nothing more is read, but what was found is still put in order.
+  if (project.highlights_stopped_at) return { pending: 0, ...(await stepRanking(key, projectId)) };
   await run(
     `UPDATE project_footage SET highlights_status = 'waiting'
       WHERE project_id = ? AND status = 'ready' AND log_status = 'done' AND highlights_status IS NULL`,
@@ -442,13 +809,21 @@ export async function stepHighlights(cfg: MediaConfig, key: string | undefined, 
       LIMIT ?`,
     [projectId, HIGHLIGHT_CALLS * BATCH.clips],
   );
-  const taken = new Map<string, { start: number; end: number; text: string }[]>();
+  // What a person reviewed, latest first: each clip's own stretches are never
+  // picked again, and the latest calls across the project are the taste the
+  // reading learns from.
+  const taken = new Map<string, Reviewed[]>();
+  let taste: Taste | undefined;
   if (rows.length) {
-    const reviewed = await query<{ footage_id: string; src_in: number; src_out: number; text: string }>(
-      "SELECT footage_id, src_in, src_out, text FROM footage_highlights WHERE project_id = ? AND pick IS NOT NULL",
+    const reviewed = await query<ReviewedPick & { footage_id: string; src_in: number; src_out: number }>(
+      `SELECT footage_id, src_in, src_out, text, pick, kind, speaker, score, origin FROM footage_highlights
+        WHERE project_id = ? AND pick IS NOT NULL ORDER BY updated_at DESC, id`,
       [projectId],
     );
-    for (const r of reviewed) taken.set(r.footage_id, [...(taken.get(r.footage_id) ?? []), { start: r.src_in, end: r.src_out, text: r.text }]);
+    for (const r of reviewed) {
+      taken.set(r.footage_id, [...(taken.get(r.footage_id) ?? []), { start: r.src_in, end: r.src_out, text: r.text, pick: r.pick }]);
+    }
+    taste = tasteFrom(reviewed);
   }
 
   // The rate and size a timeline for the editor's own software needs, for
@@ -498,9 +873,10 @@ export async function stepHighlights(cfg: MediaConfig, key: string | undefined, 
   }
 
   let blocked: string | null = null;
+  let saved = false;
   await Promise.all(
     batches.map(async (b) => {
-      const found = await findHighlights(key, project.brief, b);
+      const found = await findHighlights(key, project.brief, b, taste);
       if ("failure" in found) {
         // Busy or unreachable: back in line for a later step. Anything else
         // would fail the same way again, so the clips say why.
@@ -512,11 +888,21 @@ export async function stepHighlights(cfg: MediaConfig, key: string | undefined, 
       }
       const answered = new Set(found.verdicts.map((v) => v.id));
       for (const v of found.verdicts) await saveVerdict(projectId, v);
+      saved ||= found.verdicts.length > 0;
       for (const c of b) {
         if (!answered.has(c.id)) await setClip(c.id, { highlights_status: "failed", highlights_error: "the model gave no answer for this clip" });
       }
     }),
   );
+  // New picks: the order has to take them in.
+  if (saved) {
+    await run(
+      "UPDATE edit_projects SET highlights_rank_status = 'waiting', highlights_rank_error = NULL WHERE id = ? AND highlights_wanted IS NOT NULL",
+      [projectId],
+    );
+  }
   const pending = await highlightsPending(projectId);
-  return { pending, moving: pending > 0 && !blocked, blocked };
+  if (pending > 0) return { pending, moving: !blocked, blocked };
+  const ranking = await stepRanking(key, projectId);
+  return { pending, moving: ranking.moving, blocked: blocked ?? ranking.blocked };
 }

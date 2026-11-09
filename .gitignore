@@ -16,3 +16,6 @@ dist
 
 # Internal design-system guidance for the builder/agent — never published
 DESIGN.md
+
+# The server bundle `pnpm test:e2e` builds before it runs
+test/e2e/.server.mjs

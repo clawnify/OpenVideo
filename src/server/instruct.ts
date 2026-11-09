@@ -20,7 +20,8 @@ import {
   type Transition,
   type TransitionType,
 } from "../shared/transition";
-import { FORMAT_PRESETS, reshape, sizeFor } from "../shared/format";
+import { FORMAT_PRESETS, reshape, sameShape, sizeFor } from "../shared/format";
+import { addFormat, MAX_FORMATS } from "../shared/formats";
 import { ADJUST_KEYS, cleanAdjust, describeAdjust, type Adjust } from "../shared/adjust";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -52,6 +53,8 @@ export interface InstructHighlight {
   speaker: string;
   score: number;
   kept: boolean;
+  /** One of the best the project asked for a number of (src/server/highlights.ts). */
+  best?: boolean;
 }
 
 export interface InstructFailure {
@@ -233,7 +236,18 @@ const OPS = [
   },
   {
     name: "set_format",
-    description: `Change the shape of the finished video. ${FORMAT_PRESETS.map((p) => `${p.ratio} is ${p.name.toLowerCase()} (${p.hint})`).join("; ")}.`,
+    description: `Change the shape of the main video. ${FORMAT_PRESETS.map((p) => `${p.ratio} is ${p.name.toLowerCase()} (${p.hint})`).join("; ")}. To deliver the same cut in another shape as well, use add_format instead.`,
+    parameters: {
+      type: "object",
+      properties: { format: { type: "string", enum: FORMAT_PRESETS.map((p) => p.ratio) } },
+      required: ["format"],
+    },
+  },
+  {
+    name: "add_format",
+    description:
+      "Deliver the same cut in another shape too, such as a 9:16 version of a 16:9 video. Timing, words and sound stay shared; " +
+      "each clip starts there on its whole shot, for the person to frame.",
     parameters: {
       type: "object",
       properties: { format: { type: "string", enum: FORMAT_PRESETS.map((p) => p.ratio) } },
@@ -410,8 +424,21 @@ export function apply(
       const preset = FORMAT_PRESETS.find((p) => p.ratio === args.format);
       if (!preset) return { error: `format must be one of ${FORMAT_PRESETS.map((p) => p.ratio).join(", ")}` };
       const size = sizeFor(preset.ratio, Math.max(draft.output.width, draft.output.height))!;
+      if (draft.formats?.some((f) => sameShape(f, size))) {
+        return { error: `${preset.ratio} is already one of this project's formats; it is edited and exported as its own version` };
+      }
       Object.assign(draft, reshape(draft, size.width, size.height));
       return { said: `Set the video to ${preset.ratio} ${preset.name.toLowerCase()}` };
+    }
+    case "add_format": {
+      const preset = FORMAT_PRESETS.find((p) => p.ratio === args.format);
+      if (!preset) return { error: `format must be one of ${FORMAT_PRESETS.map((p) => p.ratio).join(", ")}` };
+      const next = addFormat(draft, preset.ratio);
+      if (next === draft) {
+        return { error: `${preset.ratio} is already this project's shape or one of its formats, or it has ${MAX_FORMATS} already` };
+      }
+      Object.assign(draft, next);
+      return { said: `Added a ${preset.ratio} ${preset.name.toLowerCase()} version; frame its shots in the editor` };
     }
     default:
       return { error: `no such operation "${name}"` };
@@ -503,9 +530,10 @@ function describeHighlights(list: InstructHighlight[]): string {
   if (!list.length) return "";
   const lines = list.slice(0, MAX_LISTED).map((h) => {
     const what = h.kind === "soundbite" ? `${h.speaker ? `${h.speaker}: ` : ""}"${h.text.slice(0, 160)}"` : h.text.slice(0, 120);
-    return `  ${h.id}: ${h.kind}, score ${h.score}${h.kept ? ", kept" : ""}, ${(h.end - h.start).toFixed(1)}s, ${what}`;
+    return `  ${h.id}: ${h.kind}, score ${h.score}${h.kept ? ", kept" : ""}${h.best ? ", best" : ""}, ${(h.end - h.start).toFixed(1)}s, ${what}`;
   });
-  return `\n\nHighlights from the footage (picked and scored from every clip; kept means a person chose it):\n${lines.join("\n")}`;
+  const best = list.some((h) => h.best) ? "; best means one of the best set the person asked for" : "";
+  return `\n\nHighlights from the footage (picked and scored from every clip; kept means a person chose it${best}):\n${lines.join("\n")}`;
 }
 
 const SYSTEM = [
@@ -515,7 +543,7 @@ const SYSTEM = [
   "Positions on the main track are the order the clips play in.",
   "Make the smallest set of changes that does what was asked, then stop and say in one sentence what you changed.",
   "If the request cannot be done with these operations, say so plainly instead of guessing.",
-  "When highlights are listed, they are the best parts of the footage: to build or extend a cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then higher scores, and keep to the length asked for.",
+  "When highlights are listed, they are the best parts of the footage: to build or extend a cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then ones marked best, then higher scores, and keep to the length asked for.",
 ].join(" ");
 
 /**

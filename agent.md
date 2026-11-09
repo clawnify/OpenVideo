@@ -40,6 +40,53 @@ Drive folder and its subfolders, and a file outside it is refused. Pass
 `folder=<id>` to `GET /api/drive/files` to list one folder (its subfolders come
 back as `folders`); a search looks inside that folder only, never the subtree.
 
+## Shared Highlights
+
+Highlights are reusable source ranges, available to every project at `/highlights`
+and in the editor's Highlights rail. `GET /api/highlights?search=&offset=0`
+returns up to 48 `items` and `next_offset`. Each item has `id`, `asset_id`,
+`src_in`, `src_out`, `kind`, `text`, `speaker` and its video's metadata.
+Use `asset:<asset_id>` with `trimStart: src_in` and `duration: src_out-src_in`
+to add one to any timeline. That edit is an independent snapshot.
+
+New project suggestions appear in the shared catalog automatically. Identical
+source/kind/range combinations share one catalog entry. Project briefs, scores,
+best-N ordering and keep/drop decisions remain project-specific. Finding again,
+detaching footage or deleting a project does not remove shared selections or
+videos they retain. Existing installations publish their old selections on first
+catalog access or before a destructive operation.
+
+`POST /api/highlights/projects { ids: ["…"], request_id: "<UUID>" }` starts
+1–12 projects, one per highlight, each a 1920×1080 cut with a 9:16 format (see
+"More formats of the same cut"). Retry with the SAME request_id and selection
+after a network error; the response returns the same projects. Use a new
+request_id for an intentional new set. Every shot starts whole in 9:16; nothing
+is framed until a person, or AI reframe, frames it. Only start projects when
+someone asks for them.
+
+`DELETE /api/highlights/{id}` removes a shared selection for everyone. Existing
+timelines keep their clips. A tombstone prevents regeneration from silently
+restoring it. Permanent video deletion is refused while shared Highlights,
+project analysis or timelines still use it.
+
+## Highlights from existing library videos
+
+1. Reuse uploaded videos; never ask someone to upload the same video again.
+   Open Highlights from any project's Media panel, then Choose library videos.
+   The API's bounded picker is `GET /api/projects/{id}/library-videos` (`search`, `offset`).
+2. Add a video with `POST /api/projects/{id}/footage/assets { "asset_id": "…", "language"?: "en" }`.
+   This starts analysis, reusing a completed log in the same language when one
+   exists. It references the original video, without copying or moving it.
+   Only ready videos uploaded through the editor or imported from Drive are
+   supported; older storage-only videos remain editable on the timeline.
+3. Ask for highlights against the project's brief as below. Preparation and
+   analysis run in the background; selections are separate in each project.
+4. To stop using a library video for Highlights, delete its reference with
+   `DELETE /api/projects/{id}/footage/assets/{assetId}`. This removes that
+   project's analysis and picks, leaving shared Highlights, the video and timelines intact.
+   Deleting a project also preserves library videos. Permanent asset deletion
+   is refused while a timeline or library analysis reference still uses it.
+
 ## Footage from a Drive folder
 
 A shoot usually arrives as a Google Drive folder shared with "anyone with the
@@ -54,7 +101,7 @@ POST /api/projects/{id}/footage/folders { "url": "<folder link>", "language"?: "
 Every video in the folder, and in every folder inside it, becomes the
 project's own footage (photos and other files are left out). It is listed with
 that project only (`GET /api/assets?project={id}`), and deleting the project
-deletes it. No Drive connection is needed: the folder only has to be shared
+deletes unused copies; media retained by shared Highlights or other edits stays in the library. No Drive connection is needed: the folder only has to be shared
 with the link, and one that isn't answers 422 `folder_unreadable`. The answer's
 `footage` says how many videos were found and how many were new.
 
@@ -82,6 +129,7 @@ otherwise), `next_offset`, and `items`:
 {
   "id": "…", "name": "B_0012.MP4", "folder": "Day 1/Cam B",
   "status": "ready",                       // waiting | importing | ready | failed
+  "received": null,                        // while it comes in a piece at a time: { "bytes", "size" }
   "asset": { "id": "…", "duration": 41.2 }, // the EDL uses "asset:<id>"
   "log_status": "done",                    // preparing | running | done | failed
   "log": {
@@ -113,17 +161,34 @@ and the reason. They are read from the logs and transcripts in the background,
 a folder at a time, and clips logged later join by themselves.
 
 ```
-POST  /api/projects/{id}/highlights          { "brief"?: "…", "again"?: true }
+POST  /api/projects/{id}/highlights          { "brief"?: "…", "again"?: true, "wanted"?: 25 }
+PUT   /api/projects/{id}/highlights/wanted   { "wanted": 25 | null }   how many; nothing is read again
 POST  /api/projects/{id}/highlights/stop     stop reading; picks so far stay, asking again resumes
 GET   /api/projects/{id}/highlights          best first, 100 a page (limit up to 1000, offset)
       &kind=soundbite|broll  &min_score=2..5  &folder=Day 1/Cam B
-      &pick=open|keep|drop|not_dropped|all   &sort=score|clip  &skipped=1
+      &pick=best|open|keep|drop|not_dropped|all   &sort=score|clip  &skipped=1
 PATCH /api/projects/{id}/highlights/{hid}    { "pick"?: "keep"|"drop"|null, "start"?, "end"?, "speaker"?, "text"? }
 POST  /api/projects/{id}/highlights/items    { "clip": "<clipId>", "start"?, "end"?, "kind"?, "text"? }
-GET   /api/projects/{id}/highlights/export?format=csv|xml&pick=keep|not_dropped&root=&fps=
+GET   /api/projects/{id}/highlights/export?format=csv|xml&pick=best|keep|not_dropped&root=&fps=
 ```
 
-`again` reads every clip again; what a person kept or dropped stays as it is.
+`wanted` is how many highlights the video wants (1 to 200; null, the default:
+every pick worth a look). Write the number there, never in the brief: each
+reading sees a dozen clips, so a count in the brief only holds for each dozen.
+With a number, every clip is still read, then one more model call goes over
+all the picks and puts them in order for the brief: the best set of that many
+first (the mix the brief asks for, one clip may give most of it, never the
+same moment twice), then stand-ins. `pick=best` lists that set, best scored
+first (or by clip with `sort=clip`): kept picks count first toward the number
+(when more are kept than wanted, the best of them), then the model's choice.
+Dropping one brings in its next stand-in with no new call. A new number orders them again; picks from clips read later do too, at
+most every 15 minutes while footage is still coming in. The list says where it
+stands: `wanted`, `counts.best`, and `ranking: { status: waiting | running |
+done | failed, error, due }`.
+
+`again` reads every clip again; what a person kept or dropped stays as it is,
+and each reading learns from those calls (the latest 15 kept and 15 dropped)
+beside the brief. A `PATCH` with `pick` is how you teach it.
 A soundbite's `speaker` is who says it as the clip's log describes them; it
 names a person only when the clip itself does (said, shown or logged), so
 correct it with the person's name and title when you know them.
@@ -147,22 +212,31 @@ each file's Drive link.
 cut from the kept soundbites" places them with its `add_highlight` operation.
 
 Google Drive limits how often a file shared with the link can be downloaded,
-and on a heavy day it refuses the files of a whole folder for a while. A clip it
-refuses is not failed: it waits (`status: "waiting"` with `retry_at`, counted in
+and on a heavy day it refuses the files of a whole folder for a while. It
+refuses the whole file but still serves pieces of it, so a refused file of up
+to 30 GB comes in a piece at a time instead, in the background steps only:
+`status: "importing"`, with `received` saying how much is in. A big file takes
+a while this way. A file over 30 GB, the most the video host takes, fails at
+once with that reason, before anything is pulled: retry it if the limit is
+raised. A clip Drive won't serve even a piece of
+is not failed: it waits (`status: "waiting"` with `retry_at`, counted in
 `counts.drive_waiting`) and is tried again by itself, further apart each time,
-for about a day, after which it fails with the reason. `imports_paused` says so
-when every waiting clip is waiting on Drive. A copy of the folder in another
-Drive account has its own limit.
+for about a day, after which it fails with the reason. One that was coming in
+by pieces carries on from where it got to. `imports_paused` says so when every
+waiting clip is waiting on Drive. A copy of the folder in another Drive account
+has its own limit.
 
 When the org has a Google Drive connection whose account can open the
 folder, clips are downloaded through it instead, as that account, which
-Drive's limit on shared links doesn't touch. Those downloads run in the
-background steps only. A file too big for the connection's temporary storage
-(seen at 9 GB; 3.4 GB passed) is copied inside Google into a temporary
-folder of the connected account ("OpenVideo imports (temporary)"), shared
-with the link, imported from the copy, and the copy is deleted once the
-import is over (or with the project). Only if that fails too does it come by
-the original's shared link.
+Drive's limit on shared links doesn't touch: Google's own Drive API, signed
+by the connection. Those downloads run in the background steps only. A file
+over 250 MB, more than one answer through the connection carries, comes by
+the original's shared link, as above: whole, or a piece at a time when Drive
+refuses it whole. A piece Drive refuses on the shared link (it can, after a
+few GB of one file) comes through the connection instead. It is never copied inside Google first: Drive answers a header
+check on a fresh copy of a big file with an empty page, and the video host
+refuses such a download. Copies an earlier version made are deleted once
+their import is over (or with the project).
 
 A source over the video host's 200 Mbps cap (all-intra camera files) is
 re-encoded on the way in, by itself: it imports a little later, as high-quality
@@ -186,7 +260,11 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
 | GET  | `/api/drive` | Whether Google Drive is connected: `{ connected }` |
 | GET  | `/api/drive/files?kind=media\|audio&q=&page=` | Search the org's Drive, newest first → `{ files, nextPageToken }` |
-| POST | `/api/drive/import` | `{ fileId, duration? }` brings a Drive file into the library → the asset |
+| POST | `/api/drive/import` | `{ fileId, duration? }`: videos return HTTP 202 `{ import }`; images/audio return the asset. Poll the job until ready, then use its `asset_id` |
+| GET | `/api/drive/imports` | Active imports first, then recent history (at most 40); reopening repairs missed scheduling without transferring bytes |
+| GET | `/api/drive/imports/{id}` | One import: state, byte progress, safe error and result `asset_id`; never an upload URL |
+| POST | `/api/drive/imports/{id}/cancel` | Stop an unfinished import and clean up its upload in the background |
+| POST | `/api/drive/imports/{id}/retry` | Retry a failed import after cleanup, retaining its job ID; a changed Drive file needs a new import |
 | GET  | `/api/assets/{id}/source` | The asset's bytes, wherever they live (a redirect) |
 | GET  | `/api/assets/{id}/playback` | For long footage: `{ ready, hls, thumbnail, duration }` |
 | GET  | `/api/assets/{id}/frame?t=` | One frame of long footage, as an image |
@@ -201,7 +279,8 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | POST | `/api/projects/{id}/footage/folders` | `{ url, language? }` adds a Drive folder shared with the link |
 | POST | `/api/projects/{id}/footage/sync` | Takes in files added to the folders since → `{ added }` |
 | POST | `/api/projects/{id}/footage/retry` | Puts failed imports and logs back in line → `{ imports, logs }` |
-| POST | `/api/projects/{id}/highlights` | Find the footage's highlights `{ brief?, again? }` (in the background) |
+| POST | `/api/projects/{id}/highlights` | Find the footage's highlights `{ brief?, again?, wanted? }` (in the background) |
+| PUT  | `/api/projects/{id}/highlights/wanted` | How many highlights `{ wanted: 1..200 \| null }`: the best that many are chosen from all the picks |
 | POST | `/api/projects/{id}/highlights/stop` | Stop reading: clips in line go back, later clips wait until asked again |
 | GET  | `/api/projects/{id}/highlights` | The highlights, best first, filtered and paged → `{ clips, counts, highlights, next_offset, paused }` |
 | PATCH | `/api/projects/{id}/highlights/{hid}` | A person's call `{ pick?: keep\|drop\|null, start?, end?, speaker?, text? }` |
@@ -211,7 +290,7 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
 | POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied }` |
 | DELETE | `/api/projects/{id}` | Delete a project, its export history and its footage from Drive; `202 { remaining }` means call again |
-| POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job, `status: "exporting"` |
+| POST | `/api/projects/{id}/export` | Export `{ quality?, format? }` → returns the job, `status: "exporting"` |
 | GET  | `/api/exports/{id}` | One export; read it until it is no longer `exporting` |
 | GET  | `/api/exports?project_id={id}` | Export history |
 | GET  | `/api/projects/{id}/share` | The project's share link → `{ url, export_id, newer_export }` (`url: null` when off) |
@@ -342,6 +421,41 @@ and keeps each logo's size on screen and the side of the frame it sits on.
 Clips keep their `fit`; set `"cover"` on each to fill the new frame instead of
 showing bars.
 
+**Two stacked views.** A main-track video can show two parts of its source at
+once, one above the other: `split: { "top": <crop>, "bottom": <crop> }`, each a
+`crop` as above, each filling its half of the frame. It suits two people seated
+side by side or facing each other in one shot, stacked in a tall format. Both
+views play the same moment with one sound, and `fit`, `anchor` and `crop` are
+ignored while `split` is set. Give each crop its half's shape (for 1080x1920,
+1080x960) so nothing more is cut off.
+
+**More formats of the same cut.** One project can deliver the same cut in
+several shapes: `output` is the main format, and `formats: [{ "id": "9:16",
+"width": 1080, "height": 1920 }]` lists the others (at most 4; `id` is the
+shape's ratio; size them at the main format's short side, as `/instruct`'s
+`add_format` and the editor do). Timing, words and sound are shared: a trim,
+split, title text or caption change reaches every format. What differs is
+framing, set per format:
+
+- a main-track clip's `framing: { "9:16": { "fit", "anchor", "crop", "split" } }`
+  replaces those four fields in that format. Without an entry the clip shows
+  its whole shot there, letterboxed: nothing is guessed.
+- an overlay's `placement: { "9:16": { "x", "y", "width" } }` (media) or
+  `{ "x", "y", "fontSize" }` (text) places it in that format. Without one it
+  sits where a format change would move it.
+
+Every key of `framing` and `placement` must be one of `formats`. Removing a
+format means removing its entries too. Example: a 16:9 interview clip whose two
+guests are stacked in the vertical version:
+
+```json
+{ "id": "c1", "type": "video", "src": "asset:…", "trimStart": 510, "duration": 14,
+  "fit": "cover",
+  "framing": { "9:16": { "split": {
+    "top":    { "x": 0.06, "y": 0.12, "width": 0.40, "height": 0.63 },
+    "bottom": { "x": 0.54, "y": 0.12, "width": 0.40, "height": 0.63 } } } } }
+```
+
 **Captions** are a project setting, not overlays: an optional `captions` block,
 `{ "enabled": true, "lang": "en", "style": { "size": 0.055, "position":
 "bottom", "margin": 0.08, "background": true, "outline": false, "color":
@@ -464,8 +578,10 @@ if the proposal misses the brief.
 ### Exporting
 
 `POST /api/projects/{id}/export` with optional
-`{ "quality": "draft" | "standard" | "high" }` (draft is fast — use it for
-review cuts, then export `high` for the final). The call returns once the
+`{ "quality": "draft" | "standard" | "high", "format": "9:16" }` (draft is fast — use it for
+review cuts, then export `high` for the final). `format` picks one of the
+project's `formats`; leave it out for the main one. Each export renders one
+format, and the job says which in `format` (null for the main one). The call returns once the
 render is submitted, with the job at `status: "exporting"`. The render runs in
 the background, so read `GET /api/exports/{id}` every few seconds until the
 status changes: `"completed"` with `output_url`, `duration` and `size`, or
@@ -503,3 +619,15 @@ link gets a new address.
 4. Adjust with read → transform → `PUT`, fixing anything validation points at.
 5. Export `draft` to review, then `high` for the final. To send it to someone
    outside the workspace, turn on the share link and give them its `url`.
+
+### Importing library videos from Drive
+
+Use the picker/import API, never a whole-file download action or a public sharing
+change. Video imports keep running after the tab closes; poll their status and
+wait for `ready` before putting `asset_id` on a timeline. Repeated clicks reuse
+an active import. Up to four imports can be queued per app, two transferring at
+once. The original must remain accessible and unchanged until import completes.
+Limits: 30 GB and four hours. Transfer and processing consume the workspace's
+video storage; this path does not request footage analysis or spend AI credits.
+An import in `failed` keeps cleanup work until its upload is deleted. Retry once
+cleanup completes; for `source_changed`, start a new import of the updated file.

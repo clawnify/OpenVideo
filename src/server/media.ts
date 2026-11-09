@@ -17,6 +17,8 @@ const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 export interface MediaConfig {
   servicesUrl?: string;
   token?: string;
+  /** Background steps must not keep a lease alive on an unbounded HTTP call. */
+  timeoutMs?: number;
 }
 
 export interface MediaFailure {
@@ -67,6 +69,7 @@ async function call<T>(
   }
   const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/media${path}`, {
     ...init,
+    signal: init.signal ?? (cfg.timeoutMs ? AbortSignal.timeout(cfg.timeoutMs) : undefined),
     headers: {
       Authorization: `Bearer ${cfg.token}`,
       ...(init.body ? { "Content-Type": "application/json" } : {}),
@@ -144,12 +147,12 @@ export async function openMediaUpload(
   size: number,
   name: string,
   maxDurationSeconds?: number,
-): Promise<{ id: string; uploadUrl: string } | { failure: MediaFailure }> {
-  const res = await call<{ id: string; upload_url: string }>(cfg, "/uploads", {
+): Promise<{ id: string; uploadUrl: string; expiresAt: string | null } | { failure: MediaFailure }> {
+  const res = await call<{ id: string; upload_url: string; expires_at?: string }>(cfg, "/uploads", {
     method: "POST",
     body: JSON.stringify({ size, name, ...(maxDurationSeconds ? { max_duration_seconds: maxDurationSeconds } : {}) }),
   });
-  return "failure" in res ? res : { id: res.data.id, uploadUrl: res.data.upload_url };
+  return "failure" in res ? res : { id: res.data.id, uploadUrl: res.data.upload_url, expiresAt: res.data.expires_at ?? null };
 }
 
 export async function mediaState(cfg: MediaConfig, uid: string): Promise<{ media: MediaState } | { failure: MediaFailure }> {
@@ -213,6 +216,12 @@ export async function mediaFacts(
   return { fps: rates.length ? Math.max(...rates) : null, width: state.media.width, height: state.media.height };
 }
 
+/**
+ * Delete a video on the media service. One already gone counts as deleted.
+ * Any other refusal throws: the caller keeps its row and tries again, rather
+ * than forgetting a copy that still counts against the org's storage.
+ */
 export async function deleteMedia(cfg: MediaConfig, uid: string): Promise<void> {
-  await call(cfg, `/${uid}`, { method: "DELETE" });
+  const res = await call(cfg, `/${uid}`, { method: "DELETE" });
+  if ("failure" in res && res.failure.error !== "not_found") throw new Error(res.failure.detail);
 }

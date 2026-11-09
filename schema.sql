@@ -119,9 +119,9 @@ CREATE TABLE IF NOT EXISTS footage_sources (
   PRIMARY KEY (project_id, folder_id)
 );
 
--- One row per video in those folders and every folder inside them. The video
--- belongs to its project: the media library lists it with that project only,
--- and deleting the project deletes it. It moves on by itself (see
+-- One row per source video in a project. Drive-folder copies belong to the
+-- project and are deleted with it; library references (source_kind below)
+-- never own the video and do not hide it from the library. Work advances (see
 -- src/server/footage.ts):
 --   status:     waiting | importing | ready | failed | removed
 --   log_status: NULL (not started) | preparing | running | done | failed
@@ -219,3 +219,168 @@ ALTER TABLE project_footage ADD COLUMN copy_id TEXT;
 -- other refusal sends it back to be re-encoded.
 ALTER TABLE project_footage ADD COLUMN transcode INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE project_footage ADD COLUMN transcode_job TEXT;
+
+-- A file Google Drive won't hand over whole (its download limit) still serves
+-- byte ranges, so it comes in a piece at a time, into an upload on the media
+-- service (src/server/relay.ts). Set while that upload is open: its id and
+-- link, when the link expires, the file's size, and how much is in so far
+-- (for showing; the upload itself says where it stands).
+ALTER TABLE project_footage ADD COLUMN upload_uid TEXT;
+ALTER TABLE project_footage ADD COLUMN upload_url TEXT;
+ALTER TABLE project_footage ADD COLUMN upload_expires TEXT;
+ALTER TABLE project_footage ADD COLUMN upload_size INTEGER;
+ALTER TABLE project_footage ADD COLUMN upload_done INTEGER;
+
+-- How many highlights the project wants; NULL: every pick worth a look. Once
+-- every clip is read, one more model call puts the picks in order for the
+-- brief, the best set of that many first (src/server/highlights.ts). The
+-- ordering: NULL | waiting | running | done | failed, with the error, and
+-- when it was last claimed (a claim older than five minutes is taken over).
+ALTER TABLE edit_projects ADD COLUMN highlights_wanted INTEGER;
+ALTER TABLE edit_projects ADD COLUMN highlights_rank_status TEXT;
+ALTER TABLE edit_projects ADD COLUMN highlights_rank_error TEXT;
+ALTER TABLE edit_projects ADD COLUMN highlights_rank_at TEXT;
+-- A pick's place in that order, 1 the best. The best are the kept picks,
+-- then the first in this order; NULL: not placed yet.
+ALTER TABLE footage_highlights ADD COLUMN rank INTEGER;
+
+-- Standalone library imports. Upload URLs are private capabilities, never API output.
+CREATE TABLE IF NOT EXISTS drive_imports (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL,
+  service TEXT NOT NULL,
+  account TEXT,
+  source_version TEXT NOT NULL,
+  name TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  duration REAL,
+  state TEXT NOT NULL DEFAULT 'queued',
+  received INTEGER NOT NULL DEFAULT 0,
+  upload_uid TEXT,
+  upload_url TEXT,
+  upload_expires_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0,
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  cleanup_pending INTEGER NOT NULL DEFAULT 0,
+  error_code TEXT,
+  asset_id TEXT,
+  next_step_at INTEGER NOT NULL DEFAULT 0,
+  lease_token TEXT,
+  lease_until INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS drive_imports_active_file ON drive_imports(file_id)
+  WHERE state IN ('queued', 'uploading', 'processing', 'cancelling');
+CREATE INDEX IF NOT EXISTS drive_imports_due ON drive_imports(state, next_step_at);
+
+-- Project footage can reference an existing library video without owning it.
+-- drive_file_id retains its legacy name: a real Drive ID for drive sources,
+-- or the stable asset:<id> source key for library references. source_kind,
+-- never the key's spelling, determines ownership and import behavior.
+ALTER TABLE project_footage ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'drive';
+CREATE INDEX IF NOT EXISTS idx_project_footage_source ON project_footage(project_id, source_kind, status);
+
+-- Durable deletion intent: an asset being removed cannot gain new analysis
+-- references while its media deletion is in flight. A failed cleanup can be retried.
+ALTER TABLE assets ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0;
+
+-- Reusable source selections. Project rankings remain in footage_highlights;
+-- these ranges and their media survive project deletion and regeneration.
+CREATE TABLE IF NOT EXISTS library_highlights (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('soundbite', 'broll')),
+  src_in REAL NOT NULL,
+  src_out REAL NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  speaker TEXT NOT NULL DEFAULT '',
+  source_project_id TEXT,
+  deleted_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(asset_id, kind, src_in, src_out)
+);
+CREATE INDEX IF NOT EXISTS library_highlights_created ON library_highlights(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS library_highlights_asset ON library_highlights(asset_id, deleted_at);
+
+-- Publish in the same transaction as the suggestion: an asset deletion claim
+-- or detached footage cannot race a background result into the shared catalog.
+CREATE TRIGGER IF NOT EXISTS publish_highlight_insert AFTER INSERT ON footage_highlights
+BEGIN
+  INSERT OR IGNORE INTO library_highlights (id, asset_id, kind, src_in, src_out, text, speaker, source_project_id, created_at)
+  SELECT NEW.id, a.id, NEW.kind, NEW.src_in, NEW.src_out, NEW.text, NEW.speaker, NEW.project_id, NEW.created_at
+  FROM project_footage f JOIN assets a ON a.id = f.asset_id
+  WHERE f.id = NEW.footage_id AND f.project_id = NEW.project_id AND f.status = 'ready' AND a.deleting = 0;
+END;
+CREATE TRIGGER IF NOT EXISTS publish_highlight_edit AFTER UPDATE OF src_in, src_out, text, speaker ON footage_highlights
+BEGIN
+  INSERT INTO library_highlights (id, asset_id, kind, src_in, src_out, text, speaker, source_project_id)
+  SELECT lower(hex(randomblob(8))), a.id, NEW.kind, NEW.src_in, NEW.src_out, NEW.text, NEW.speaker, NEW.project_id
+  FROM project_footage f JOIN assets a ON a.id = f.asset_id
+  WHERE f.id = NEW.footage_id AND f.project_id = NEW.project_id AND f.status = 'ready' AND a.deleting = 0
+  ON CONFLICT(asset_id, kind, src_in, src_out) DO UPDATE SET text = excluded.text, speaker = excluded.speaker;
+END;
+
+-- A retry of Create portrait clips returns the projects already created.
+ALTER TABLE edit_projects ADD COLUMN creation_batch TEXT;
+ALTER TABLE edit_projects ADD COLUMN highlight_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS edit_projects_creation ON edit_projects(creation_batch, highlight_id);
+
+-- Enforce source lifetime for every writer, including Ask and automatic cuts.
+CREATE TRIGGER IF NOT EXISTS project_assets_insert BEFORE INSERT ON edit_projects
+WHEN EXISTS (SELECT 1 FROM json_tree(NEW.edl) j WHERE j.key = 'src' AND j.type = 'text' AND j.value LIKE 'asset:%'
+  AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.id = substr(j.value, 7) AND a.deleting = 0))
+BEGIN
+  SELECT RAISE(ABORT, 'source_unavailable');
+END;
+
+-- Enforce source lifetime for every writer, including Ask and automatic cuts.
+CREATE TRIGGER IF NOT EXISTS project_assets_update BEFORE UPDATE OF edl ON edit_projects
+WHEN EXISTS (SELECT 1 FROM json_tree(NEW.edl) j WHERE j.key = 'src' AND j.type = 'text' AND j.value LIKE 'asset:%'
+  AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.id = substr(j.value, 7) AND a.deleting = 0))
+BEGIN
+  SELECT RAISE(ABORT, 'source_unavailable');
+END;
+
+-- Request identity outlives the generated projects. Completed requests never
+-- recreate a clip someone later deleted, including a retry after lost response.
+CREATE TABLE IF NOT EXISTS highlight_creations (
+  request_id TEXT PRIMARY KEY,
+  selection TEXT NOT NULL,
+  result TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TRIGGER IF NOT EXISTS complete_highlight_creation AFTER INSERT ON edit_projects
+WHEN NEW.creation_batch IS NOT NULL
+  AND (SELECT COUNT(*) FROM edit_projects WHERE creation_batch = NEW.creation_batch) =
+    (SELECT json_array_length(selection) FROM highlight_creations WHERE request_id = NEW.creation_batch)
+BEGIN
+  UPDATE highlight_creations SET result = (
+    SELECT json_group_array(json_object('id',id,'name',name,'highlight_id',highlight_id))
+    FROM edit_projects WHERE creation_batch = NEW.creation_batch
+  ) WHERE request_id = NEW.creation_batch AND result IS NULL;
+END;
+
+-- Shared advice is source-time data; chosen framing stays on each editable clip.
+CREATE TABLE IF NOT EXISTS video_reframes (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  source_start REAL NOT NULL,
+  source_end REAL NOT NULL,
+  status TEXT NOT NULL,
+  attempt TEXT NOT NULL,
+  job_id TEXT,
+  result TEXT,
+  error TEXT,
+  width INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(asset_id, revision, source_start, source_end)
+);
+
+-- Which of the project's formats an export renders (src/shared/formats.ts):
+-- a ratio such as '9:16', or NULL for the project's main format.
+ALTER TABLE export_jobs ADD COLUMN format TEXT;

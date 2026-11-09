@@ -38,6 +38,17 @@ describe("Ask operations", () => {
     expect(apply(d, "set_format", { format: "vertical" })).toHaveProperty("error");
   });
 
+  it("adds another format of the same cut, and keeps the main one off its shape", () => {
+    const d = edl();
+    expect(apply(d, "add_format", { format: "9:16" })).toHaveProperty("said");
+    expect(d.output).toMatchObject({ width: 1280, height: 720 });
+    expect(d.formats).toEqual([{ id: "9:16", width: 720, height: 1280 }]);
+    expect(apply(d, "add_format", { format: "9:16" })).toHaveProperty("error");
+    expect(apply(d, "add_format", { format: "16:9" })).toHaveProperty("error");
+    expect(apply(d, "set_format", { format: "9:16" })).toHaveProperty("error");
+    expect(d.output).toMatchObject({ width: 1280, height: 720 });
+  });
+
   it("clean up replaces a clip with the parts the analysis keeps", async () => {
     const d = edl();
     const out = await cleanUp(d, { clip: 0 }, new Map(), async (_asset, window) => {
@@ -186,5 +197,24 @@ describe("highlights in Ask", () => {
     expect(bodies[0].tools.map((t) => t.function.name)).toContain("add_highlight");
     expect(bodies[1].tools.map((t) => t.function.name)).not.toContain("add_highlight");
     expect(bodies[1].messages[1].content).not.toContain("Highlights from the footage");
+    expect(bodies[0].messages[1].content).not.toContain("best means");
+  });
+
+  it("marks the best the project asked for a number of, and says what that means", async () => {
+    const bodies: { messages: { role: string; content: string }[] }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        bodies.push(JSON.parse(init.body as string));
+        return new Response(JSON.stringify({ choices: [{ message: { content: "Nothing to do." } }] }));
+      }),
+    );
+    const best = [{ ...picks[1], best: true }, { ...picks[0], kept: false }];
+    await instructEdit(edl(), "make a 30s cut", new Map(), { openrouterKey: "k" }, new Map(), undefined, best);
+    const said = bodies[0].messages[1].content;
+    expect(said).toContain("h2: broll, score 4, best, 5.5s, Crowd at the booth");
+    expect(said).toContain('h1: soundbite, score 5, 4.6s, woman in a green blazer: "Shipping fast is the whole point."');
+    expect(said).toContain("best means one of the best set the person asked for");
+    expect(bodies[0].messages[0].content).toContain("Prefer kept ones, then ones marked best, then higher scores");
   });
 });
