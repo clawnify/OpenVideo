@@ -27,6 +27,9 @@ function storage() {
         if (sql.includes('INSERT INTO footage_highlights') && sql.includes("'person'") && world.beforePersonPick) {
           const before = world.beforePersonPick; world.beforePersonPick = null; await before();
         }
+        if (sql.includes('WITH clips(id, name, edl, creation_batch, highlight_id)') && world.beforePortraitInsert) {
+          const before = world.beforePortraitInsert; world.beforePortraitInsert = null; await before();
+        }
         const st = db.prepare(sql);
         const p = params.map((v) => (typeof v === "boolean" ? Number(v) : v === undefined ? null : v));
         if (/^\s*(select|pragma|with)/i.test(sql) || /\breturning\b/i.test(sql)) return { rows: st.all(...p) };
@@ -981,7 +984,14 @@ console.log("11g ok: a clip under a second is logged as too short, without an an
   console.log("11h4 ok: while footage comes in the order waits a while, a person's number never; no number, no best");
 }
 
-// 10. Deleting the project deletes its footage, a batch at a time.
+// 10. Project deletion preserves shared Highlights; unshared media still
+// cleans up in batches and retains failed deletions for retry.
+const sharedAssetIds = db.prepare("SELECT DISTINCT asset_id FROM library_highlights WHERE deleted_at IS NULL").all().map(r => r.asset_id);
+assert.ok(sharedAssetIds.length);
+const cleanupUid = 'c'.repeat(32);
+world.media.set(cleanupUid, { name: 'unshared.mp4', polls: 2, deleted: false });
+db.prepare("INSERT INTO assets(id,key,name,content_type,size,duration,media_uid) VALUES ('unshared-delete','unshared-delete','unshared.mp4','video/mp4',100,60,?)").run(cleanupUid);
+db.prepare("INSERT INTO project_footage(project_id,drive_file_id,name,status,asset_id) VALUES (?, '000-unshared-delete','unshared.mp4','ready','unshared-delete')").run(pid);
 const stmt = db.prepare("INSERT INTO project_footage (project_id, drive_file_id, name, folder) VALUES (?, ?, ?, 'Bulk')");
 for (let i = 0; i < 150; i++) stmt.run(pid, `bulk${i}`, `bulk${i}.mp4`);
 world.refuseMediaDeletes = 1;
@@ -994,7 +1004,7 @@ assert.ok(kept, "the clip whose copy the service would not delete is kept for th
 r = await call("DELETE", `/api/projects/${pid}`);
 assert.equal(r.status, 200, JSON.stringify(r.data));
 assert.equal(db.prepare("SELECT COUNT(*) AS n FROM project_footage").get().n, 0);
-assert.equal(db.prepare("SELECT COUNT(*) AS n FROM assets").get().n, 0);
+assert.equal(db.prepare("SELECT COUNT(*) AS n FROM assets").get().n, sharedAssetIds.length);
 assert.equal(db.prepare("SELECT COUNT(*) AS n FROM edit_projects").get().n, 0);
 assert.equal(db.prepare("SELECT COUNT(*) AS n FROM footage_highlights").get().n, 0, "its highlights went with it");
 assert.equal(world.media.get(refusedUid).deleted, true, "the refused copy was deleted on the next call");
@@ -1291,6 +1301,10 @@ console.log("ALL OK");
   assert.equal((await attach(projectB)).status, 201, 'can attach again after removing reference');
   assert.notEqual(row(projectB).id, oldReference, 'old analysis deliveries cannot touch the new reference');
   assert.equal((await call('DELETE', `/api/projects/${projectB}`)).status, 200);
+  assert.equal((await call('DELETE', `/api/assets/${assetId}`)).status, 409, 'shared highlights retain their source after project deletion');
+  for (const h of db.prepare('SELECT id FROM library_highlights WHERE asset_id = ?').all(assetId)) {
+    assert.equal((await call('DELETE', `/api/highlights/${h.id}`)).status, 200);
+  }
   world.beforeMediaDelete = async () => {
     const attempt = await attach((await call('POST', '/api/projects', { name: 'Deletion race' })).data.id);
     assert.equal(attempt.status, 404, 'a deletion claim refuses attachments while external cleanup waits');
@@ -1305,4 +1319,70 @@ console.log("ALL OK");
   await call('GET', `/api/projects/${waitingProject}/highlights`);
   assert.equal(db.prepare('SELECT footage_step_at FROM edit_projects WHERE id = ?').get(waitingProject).footage_step_at, tomorrow, 'Highlights polling preserves Drive retry backoff');
   console.log('14 ok: library video reused without import; isolated highlights, cached logs, bounded picker, guarded deletion and detach/re-add');
+}
+
+// 15. Shared source ranges: migration, deduplication, lifetime, portrait batches
+// and deletion interleavings all go through the real routes/database triggers.
+{
+  const asset = 'common-source'; const uid = 'f'.repeat(32);
+  world.media.set(uid, { name: 'common.mp4', polls: 2, deleted: false });
+  db.prepare("INSERT INTO assets(id,key,name,content_type,size,duration,media_uid) VALUES (?,?,'common.mp4','video/mp4',100,100,?)").run(asset, asset, uid);
+  const origin = (await call('POST','/api/projects',{name:'Common origin'})).data.id;
+  db.prepare("INSERT INTO project_footage(id,project_id,drive_file_id,name,status,asset_id) VALUES ('common-footage',?,'common-drive','common.mp4','ready',?)").run(origin,asset);
+  const make = (start,end,text) => call('POST',`/api/projects/${origin}/highlights/items`,{clip:'common-footage',start,end,text,kind:'soundbite'});
+  const first = await make(10,20,'One reusable thought'); assert.equal(first.status,201);
+  const second = await make(40,55,'Another thought'); assert.equal(second.status,201);
+  await make(10,20,'One reusable thought');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM library_highlights WHERE asset_id = ?').get(asset).n,2,'identical source intervals are one shared object');
+  let list = await call('GET','/api/highlights?search=common.mp4'); assert.equal(list.status,200);
+  assert.equal(list.data.items.length,2);
+  const ids = list.data.items.map(h => h.id);
+  const body = {ids, request_id:crypto.randomUUID()};
+  const racedRequest = crypto.randomUUID();
+  world.beforePortraitInsert = async () => {
+    const loser = await call('POST','/api/highlights/projects',{ids:[ids[1]],request_id:racedRequest});
+    assert.equal(loser.status,409,'request claim already pins its original selection');
+  };
+  const winner = await call('POST','/api/highlights/projects',{ids:[ids[0]],request_id:racedRequest});
+  assert.equal(winner.status,201);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM edit_projects WHERE creation_batch = ?').get(racedRequest).n,1);
+  await call('DELETE',`/api/projects/${winner.data.projects[0].id}`);
+  const before = db.prepare('SELECT edl FROM edit_projects WHERE id = ?').get(origin).edl;
+  const created = await call('POST','/api/highlights/projects',body); assert.equal(created.status,201,JSON.stringify(created.data));
+  const retry = await call('POST','/api/highlights/projects',body); assert.equal(retry.status,200);
+  assert.deepEqual(retry.data.projects,created.data.projects,'retry returns the same projects');
+  assert.equal((await call('POST','/api/highlights/projects',{...body,ids:[ids[0]]})).status,409,'request reuse cannot change its selection');
+  for (const p of created.data.projects) {
+    const edl = (await call('GET',`/api/projects/${p.id}`)).data.edl;
+    assert.deepEqual([edl.output.width,edl.output.height],[1080,1920]);
+    const h = list.data.items.find(h => h.id === p.highlight_id);
+    assert.deepEqual([edl.main.elements[0].src,edl.main.elements[0].trimStart,edl.main.elements[0].duration],[`asset:${asset}`,h.src_in,h.src_out-h.src_in]);
+  }
+  assert.equal(db.prepare('SELECT edl FROM edit_projects WHERE id = ?').get(origin).edl,before,'original timeline unchanged');
+  // Legacy upgrade: remove only the publication and migration marker, then
+  // exercise the production backfill. Removed selections stay tombstoned.
+  await call('DELETE',`/api/highlights/${ids[0]}`);
+  db.prepare('DELETE FROM library_highlights WHERE id = ?').run(ids[1]);
+  db.prepare("DELETE FROM app_settings WHERE key = 'library_highlights_v1'").run();
+  list = await call('GET','/api/highlights?search=common.mp4');
+  assert.equal(list.data.items.length,1,'legacy backfill restores old selections without resurrecting removals');
+  assert.equal((await call('DELETE',`/api/projects/${origin}`)).status,200);
+  assert.equal((await call('GET','/api/highlights?search=common.mp4')).data.items.length,1,'catalog survives its original project');
+  assert.equal(world.media.get(uid).deleted,false);
+  assert.equal((await call('DELETE',`/api/assets/${asset}`)).status,409);
+  await call('DELETE',`/api/highlights/${ids[1]}`);
+  assert.equal((await call('DELETE',`/api/assets/${asset}`)).status,409,'created timelines remain independent references');
+  await call('DELETE',`/api/projects/${created.data.projects[0].id}`);
+  assert.equal((await call('POST','/api/highlights/projects',{...body,ids:[created.data.projects[1].highlight_id]})).status,409,'deletion cannot change an existing request selection');
+  assert.equal((await call('POST','/api/highlights/projects',body)).status,410,'retry never resurrects one deleted clip');
+  await call('DELETE',`/api/projects/${created.data.projects[1].id}`);
+  assert.equal((await call('POST','/api/highlights/projects',body)).status,410,'retry never resurrects a deleted batch');
+  world.beforeMediaDelete = async () => {
+    const result = await call('POST','/api/projects',{name:'Racing edit',edl:{version:1,output:{width:1080,height:1920,fps:30},main:{elements:[{id:'v',type:'video',src:`asset:${asset}`,duration:10}]}}});
+    assert.equal(result.status,409,'EDL writer cannot attach a source claimed for deletion');
+  };
+  assert.equal((await call('DELETE',`/api/assets/${asset}`)).status,200);
+  assert.equal(world.beforeMediaDelete,null);
+  assert.equal((await call('POST','/api/highlights/projects',{ids,request_id:crypto.randomUUID()})).status,409);
+  console.log('15 ok: shared catalog migration, range deduplication, independent portrait edits, retry identity and source lifetime');
 }

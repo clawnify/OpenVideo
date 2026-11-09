@@ -1,3 +1,4 @@
+import { backfillHighlights, libraryHighlights } from "./library-highlights";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { initDB, query, get, run } from "./db";
 import {
@@ -70,8 +71,10 @@ const init: MiddlewareHandler<{ Bindings: Bindings }> = async (c, next) => {
 };
 app.use("/api/*", init);
 app.use("/s/*", init);
+app.route("/api/highlights", libraryHighlights);
 
 app.onError((err, c) => {
+  if (err.message.includes("source_unavailable")) return c.json({ error: "source_unavailable", detail: "A video in this edit was removed or is being deleted. Refresh the library before saving." }, 409);
   console.error(err);
   return c.json({ error: err.message || String(err) }, 500);
 });
@@ -98,8 +101,10 @@ app.get("/api/assets", async (c) => {
   const rows = await query<Asset>(
     `SELECT * FROM assets a
       WHERE NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = a.id AND f.source_kind = 'drive' AND f.project_id IS NOT ?)
+         OR EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = a.id AND h.deleted_at IS NULL)
+         OR EXISTS (SELECT 1 FROM edit_projects p, json_tree(p.edl) j WHERE p.id = ? AND j.key = 'src' AND j.value = 'asset:' || a.id)
       ORDER BY created_at DESC`,
-    [c.req.query("project") ?? null],
+    [c.req.query("project") ?? null, c.req.query("project") ?? null],
   );
   c.executionCtx.waitUntil(sweepUploads(c.env).catch((err) => console.error("upload sweep:", String(err))));
   return c.json(rows);
@@ -515,6 +520,7 @@ app.patch("/api/assets/:id", async (c) => {
 });
 
 app.delete("/api/assets/:id", async (c) => {
+  await backfillHighlights();
   const row = await get<Asset & { proxy_key?: string | null }>("SELECT * FROM assets WHERE id = ?", [
     c.req.param("id"),
   ]);
@@ -535,9 +541,13 @@ app.delete("/api/assets/:id", async (c) => {
         409,
       );
     }
+    if (await get("SELECT 1 FROM library_highlights WHERE asset_id = ? AND deleted_at IS NULL LIMIT 1", [row.id])) {
+      return c.json({ error: "in_use", detail: "Still used by shared Highlights. Remove those highlights before deleting this video." }, 409);
+    }
     // Atomically exclude new library references before external deletion.
     // Leave the intent on a failed cleanup: retry DELETE to finish it.
     const claimed = await run(`UPDATE assets SET deleting = 1 WHERE id = ?
+      AND NOT EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = assets.id AND h.deleted_at IS NULL)
       AND NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = assets.id AND f.source_kind = 'library' AND f.status != 'removed')
       AND NOT EXISTS (SELECT 1 FROM edit_projects WHERE edl LIKE ?)`, [row.id, `%"asset:${row.id}"%`]);
     if (!claimed.changes) return c.json({ error: "in_use", detail: "This video was added to a project. Remove it from that project before deleting it." }, 409);
@@ -894,6 +904,7 @@ app.post("/api/projects/:id/autocut", async (c) => {
 });
 
 app.delete("/api/projects/:id", async (c) => {
+  await backfillHighlights();
   const id = c.req.param("id");
   // Its footage from Drive goes first. Each clip is a copy on the media
   // service, counted against the org's storage until it is deleted there, so
@@ -945,11 +956,12 @@ app.delete("/api/projects/:id", async (c) => {
           }
         }
         if (f.asset_id) {
-          const usedElsewhere = await get(
-            "SELECT 1 AS used FROM edit_projects WHERE id != ? AND edl LIKE ? LIMIT 1",
-            [id, `%"asset:${f.asset_id}"%`],
-          );
-          if (!usedElsewhere) {
+          const claim = await run(`UPDATE assets SET deleting = 1 WHERE id = ?
+            AND NOT EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = assets.id AND h.deleted_at IS NULL)
+            AND NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = assets.id AND f.project_id != ? AND f.status != 'removed')
+            AND NOT EXISTS (SELECT 1 FROM edit_projects WHERE id != ? AND edl LIKE ?)`,
+            [f.asset_id, id, id, `%"asset:${f.asset_id}"%`]);
+          if (claim.changes) {
             try {
               if (f.media_uid) await deleteMedia(mediaCfg(c.env), f.media_uid);
             } catch {
@@ -1244,7 +1256,8 @@ app.get("/api/projects/:id/library-videos", async (c) => {
             EXISTS (SELECT 1 FROM project_footage f WHERE f.project_id = ? AND f.asset_id = a.id AND f.source_kind = 'library' AND f.status != 'removed') AS attached
        FROM assets a WHERE a.content_type LIKE 'video/%'
         AND (? = '' OR instr(lower(a.name), lower(?)) > 0)
-        AND NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = a.id AND f.source_kind = 'drive')
+        AND (NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = a.id AND f.source_kind = 'drive')
+      OR EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = a.id AND h.deleted_at IS NULL))
       ORDER BY a.created_at DESC, a.id LIMIT 51 OFFSET ?`, [id, search, search, offset]);
   return c.json({ items: rows.slice(0, 50).map((a) => ({ id: a.id, name: a.name, duration: a.duration, attached: !!a.attached,
     supported: !!a.media_uid && !a.deleting, unavailable_reason: a.deleting ? "This video is being removed from the library." : !a.media_uid ? "This older upload supports timeline editing only." : null })), next_offset: rows.length > 50 ? offset + 50 : null });
@@ -1257,7 +1270,8 @@ app.post("/api/projects/:id/footage/assets", async (c) => {
   if (!b || Array.isArray(b) || typeof b.asset_id !== "string" || b.asset_id.length > 100 || (b.language !== undefined && (typeof b.language !== "string" || !LANGUAGE.test(b.language))))
     return c.json({ error: "invalid_request", detail: "Choose a library video and a two-letter speech language." }, 400);
   const asset = await get<Asset>(`SELECT a.* FROM assets a WHERE a.id = ? AND a.deleting = 0
-    AND NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = a.id AND f.source_kind = 'drive')`, [b.asset_id]);
+    AND (NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = a.id AND f.source_kind = 'drive')
+      OR EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = a.id AND h.deleted_at IS NULL))`, [b.asset_id]);
   if (!asset) return c.json({ error: "not_found", detail: "This video is not in the shared library." }, 404);
   if (!asset.content_type.startsWith("video/") || !asset.media_uid)
     return c.json({ error: "unsupported_video", detail: "Highlights needs a video uploaded through the editor or imported from Drive. This older storage-only file can still be edited on the timeline." }, 422);
@@ -1289,6 +1303,7 @@ app.post("/api/projects/:id/footage/assets", async (c) => {
 // Removing a reference never removes media or changes a timeline. Stop work
 // first so an in-flight analysis cannot make this reference ready again.
 app.delete("/api/projects/:id/footage/assets/:asset", async (c) => {
+  await backfillHighlights();
   const id = c.req.param("id"), asset = c.req.param("asset");
   const row = await get<{ id: string }>("SELECT id FROM project_footage WHERE project_id = ? AND source_kind = 'library' AND asset_id = ?", [id, asset]);
   if (row) {

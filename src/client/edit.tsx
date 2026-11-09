@@ -10,6 +10,7 @@
 // array — reordering is a splice, splitting is two trims), saved with a
 // debounced PUT; validation errors surface with their JSON pointer.
 
+import { SharedHighlights, highlightAsset } from "./library-highlights";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { keepEdgeFades, splitClip } from "../shared/split";
@@ -290,7 +291,7 @@ export interface Edl {
   captions?: ProjectCaptions;
 }
 
-type RailTab = "media" | "audio" | "text" | "captions";
+type RailTab = "media" | "highlights" | "audio" | "text" | "captions";
 
 export interface EditProject {
   id: string;
@@ -960,7 +961,7 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
             title={`Delete “${confirmDel.name}”?`}
             body={
               confirmDel.footage
-                ? "The project, its highlights, export history and Drive-folder copies are deleted. Videos in the shared media library and originals in Google Drive are kept."
+                ? "The project and its export history are deleted. Shared highlights and videos used by them or other projects are kept. Unused Drive-folder copies are removed; originals in Google Drive are kept."
                 : "The project and its export history go with it. Your footage stays in the media library."
             }
             onConfirm={() => remove(confirmDel)}
@@ -1435,7 +1436,7 @@ export function EditEditor({
     <div className="flex-1 flex flex-col min-h-0">
       {/* Project bar. The name edits in place — there is no edit mode and no
           pencil: the value itself is the control. */}
-      <div className="flex items-center gap-3 px-4 h-12 border-b border-border bg-surface shrink-0">
+      <div className="flex items-center gap-1 sm:gap-3 px-4 h-12 border-b border-border bg-surface shrink-0">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -1780,6 +1781,7 @@ function LeftPanel({
         {(
           [
             ["media", Film, "Media"],
+            ["highlights", Sparkles, "Highlights"],
             ["audio", Music, "Audio"],
             ["text", TypeIcon, "Text"],
             ["captions", CaptionsIcon, "Captions"],
@@ -1799,7 +1801,11 @@ function LeftPanel({
         ))}
       </div>
       <div className="flex-1 min-w-0 overflow-y-auto p-3">
-        {tab === "captions" ? (
+        {tab === "highlights" ? <SharedHighlights onAdd={h => {
+          const asset = highlightAsset(h);
+          setAssets(prev => prev.some(a => a.id === asset.id) ? prev : [...prev, asset]);
+          update(d => d.main.elements.push({ id: rid(), type: "video", src: `asset:${asset.id}`, trimStart: h.src_in, duration: h.src_out - h.src_in }));
+        }} /> : tab === "captions" ? (
           <CaptionsPanel
             edl={edl}
             update={update}
@@ -1819,7 +1825,7 @@ function LeftPanel({
           <>
             {tab === "media" && onOpenHighlights && (
               <button onClick={onOpenHighlights} className={`${btnSecondary} w-full justify-center mb-3`}>
-                <Sparkles className="w-4 h-4" /> Highlights
+                <Sparkles className="w-4 h-4" /> Find highlights
               </button>
             )}
             {tab === "media" && hasFootage && (

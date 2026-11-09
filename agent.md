@@ -40,6 +40,33 @@ Drive folder and its subfolders, and a file outside it is refused. Pass
 `folder=<id>` to `GET /api/drive/files` to list one folder (its subfolders come
 back as `folders`); a search looks inside that folder only, never the subtree.
 
+## Shared Highlights
+
+Highlights are reusable source ranges, available to every project at `/highlights`
+and in the editor's Highlights rail. `GET /api/highlights?search=&offset=0`
+returns up to 48 `items` and `next_offset`. Each item has `id`, `asset_id`,
+`src_in`, `src_out`, `kind`, `text`, `speaker` and its video's metadata.
+Use `asset:<asset_id>` with `trimStart: src_in` and `duration: src_out-src_in`
+to add one to any timeline. That edit is an independent snapshot.
+
+New project suggestions appear in the shared catalog automatically. Identical
+source/kind/range combinations share one catalog entry. Project briefs, scores,
+best-N ordering and keep/drop decisions remain project-specific. Finding again,
+detaching footage or deleting a project does not remove shared selections or
+videos they retain. Existing installations publish their old selections on first
+catalog access or before a destructive operation.
+
+`POST /api/highlights/projects { ids: ["…"], request_id: "<UUID>" }` creates
+1–12 separate editable 1080×1920 projects. Retry with the SAME request_id and
+selection after a network error; the response returns the same projects. Use a
+new request_id for an intentional new set. Initial framing preserves the whole
+shot; portrait format by itself does not imply AI reframing.
+
+`DELETE /api/highlights/{id}` removes a shared selection for everyone. Existing
+timelines keep their clips. A tombstone prevents regeneration from silently
+restoring it. Permanent video deletion is refused while shared Highlights,
+project analysis or timelines still use it.
+
 ## Highlights from existing library videos
 
 1. Reuse uploaded videos; never ask someone to upload the same video again.
@@ -54,7 +81,7 @@ back as `folders`); a search looks inside that folder only, never the subtree.
    analysis run in the background; selections are separate in each project.
 4. To stop using a library video for Highlights, delete its reference with
    `DELETE /api/projects/{id}/footage/assets/{assetId}`. This removes that
-   project's analysis and picks, leaving the library video and timeline intact.
+   project's analysis and picks, leaving shared Highlights, the video and timelines intact.
    Deleting a project also preserves library videos. Permanent asset deletion
    is refused while a timeline or library analysis reference still uses it.
 
@@ -72,7 +99,7 @@ POST /api/projects/{id}/footage/folders { "url": "<folder link>", "language"?: "
 Every video in the folder, and in every folder inside it, becomes the
 project's own footage (photos and other files are left out). It is listed with
 that project only (`GET /api/assets?project={id}`), and deleting the project
-deletes it. No Drive connection is needed: the folder only has to be shared
+deletes unused copies; media retained by shared Highlights or other edits stays in the library. No Drive connection is needed: the folder only has to be shared
 with the link, and one that isn't answers 422 `folder_unreadable`. The answer's
 `footage` says how many videos were found and how many were new.
 
