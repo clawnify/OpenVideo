@@ -937,7 +937,7 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
                     <div className="text-fine text-faint mt-0.5">
                       {removing?.id === p.id
                         ? `Deleting${removing.left ? `, ${removing.left} clips to go` : ""}`
-                        : `Edited ${fmtDate(p.updated_at)}${p.footage ? ` · ${p.footage} clips from Drive` : ""}`}
+                        : `Edited ${fmtDate(p.updated_at)}${p.footage ? ` · ${p.footage} source ${p.footage === 1 ? "video" : "videos"}` : ""}`}
                     </div>
                   </div>
                 </button>
