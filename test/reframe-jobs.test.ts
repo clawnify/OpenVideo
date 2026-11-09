@@ -21,6 +21,15 @@ beforeEach(()=>{
   vi.mocked(getVideoAnalysis).mockResolvedValue({status:"running",job_id:"job"});
 });
 describe("shared framing jobs",()=>{
+  it("asks without a shot-count cap the provider refuses, and shows the service's reason on failure",async()=>{
+    const started=await req(input);
+    const schema=vi.mocked(startVideoAnalysis).mock.calls[0][1].schema as any;
+    expect(schema.properties.shots.maxItems).toBeUndefined();
+    vi.mocked(getVideoAnalysis).mockResolvedValueOnce({job_id:"job",status:"failed",error:"analyze_failed",detail:"the analysis failed — try again"});
+    const after=await read(started.body.id);
+    expect(after).toMatchObject({status:"failed",job_id:"job"});
+    expect(after.error).toContain("the analysis failed — try again");
+  });
   it("claims a source interval once, including simultaneous clicks",async()=>{
     const results=await Promise.all([req(input),req(input)]);
     expect(startVideoAnalysis).toHaveBeenCalledTimes(1);

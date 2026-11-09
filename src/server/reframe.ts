@@ -15,7 +15,10 @@ const view = (r:Row) => ({id:r.id,status:r.status,shots:r.result ? JSON.parse(r.
 /** The service's own words for a failure, kept short: it names no provider (apps/services analyze.ts). */
 const why = (detail: unknown) => typeof detail === "string" && detail.trim() ? ` (${detail.trim().slice(0, 200)})` : "";
 const region = {type:"object",additionalProperties:false,properties:Object.fromEntries(["x","y","width","height"].map(k=>[k,{type:"number",minimum:0,maximum:1}])),required:["x","y","width","height"]};
-const schema = {type:"object",additionalProperties:false,properties:{shots:{type:"array",maxItems:40,items:{type:"object",additionalProperties:false,
+// No maxItems on shots: the provider refused the request outright with it (HTTP 400
+// INVALID_ARGUMENT, 2026-11-09, three times on the talk; without it the same
+// request had succeeded). normalizeShots refuses more than 40 shots instead.
+const schema = {type:"object",additionalProperties:false,properties:{shots:{type:"array",items:{type:"object",additionalProperties:false,
   properties:{from:{type:"string"},to:{type:"string"},layout:{type:"string",enum:["whole","speaker","split"]},confidence:{type:"string",enum:["high","low"]},reason:{type:"string"},
     subjects:{type:"array",maxItems:3,items:{type:"object",additionalProperties:false,properties:{label:{type:"string"},region},required:["label","region"]}}},
   required:["from","to","layout","confidence","reason","subjects"]}}},required:["shots"]};
