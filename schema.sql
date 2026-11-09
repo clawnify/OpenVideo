@@ -384,3 +384,24 @@ CREATE TABLE IF NOT EXISTS video_reframes (
 -- Which of the project's formats an export renders (src/shared/formats.ts):
 -- a ratio such as '9:16', or NULL for the project's main format.
 ALTER TABLE export_jobs ADD COLUMN format TEXT;
+
+-- Whether people watching the share link can leave comments: 0 (watch only)
+-- until someone on the team turns it on for that link.
+ALTER TABLE share_links ADD COLUMN comments INTEGER NOT NULL DEFAULT 0;
+
+-- A comment left on a shared video. `export_id` is the cut it was made on, and
+-- `at` the seconds into that export (NULL: about the whole video). `author` is
+-- the name the viewer typed: share-link viewers are not signed in, so it is
+-- what they say, not who they are. Resolved by someone on the team.
+CREATE TABLE IF NOT EXISTS review_comments (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  project_id TEXT NOT NULL,
+  export_id INTEGER NOT NULL,
+  at REAL,
+  body TEXT NOT NULL,
+  author TEXT NOT NULL,
+  resolved_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_comments_project ON review_comments(project_id, created_at);
