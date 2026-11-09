@@ -18,6 +18,12 @@ function storage() {
     db,
     binding: {
       async query(sql, params = []) {
+        // Production D1 rejects the UNION-based batch insert even though
+        // node:sqlite accepts it. Keep the regression inside the real routes.
+        if (sql.includes('INSERT INTO footage_highlights') && (sql.match(/UNION ALL/gi)?.length ?? 0) >= 7) {
+          throw new Error('D1_ERROR: too many terms in compound SELECT: SQLITE_ERROR');
+        }
+        assert.ok(params.length <= 100, 'D1 allows at most 100 bound parameters');
         if (sql.includes('INSERT INTO footage_highlights') && sql.includes("'person'") && world.beforePersonPick) {
           const before = world.beforePersonPick; world.beforePersonPick = null; await before();
         }
@@ -286,6 +292,7 @@ globalThis.fetch = async (input, init = {}) => {
               use: true,
               skip_reason: "",
               highlights: [
+                ...Array.from({ length: world.extraHighlights ?? 0 }, (_, i) => ({ kind: "broll", start: 30 + i * 10, end: 35 + i * 10, text: `Additional moment ${i}`, speaker: "", score: 3, reason: "distinct moment" })),
                 { kind: "broll", start: "0:20", end: "0:26", text: `Crowd at the booth (${name})`, speaker: "", score: 3, reason: "energy" },
                 ...(prompt.includes("Transcript:") ? [{ kind: "soundbite", start: "0:05.2", end: "0:09", text: "We made it.", speaker: "woman in a red jacket", score: 5, reason: "the day in three words" }] : []),
               ],
@@ -1219,12 +1226,14 @@ console.log("ALL OK");
   assert.ok((await call('GET', '/api/assets')).data.some(a => a.id === assetId), 'reference remains in shared library');
   assert.ok((await call('GET', `/api/assets?project=${projectB}`)).data.some(a => a.id === assetId), 'available to another project');
   assert.equal((await call('DELETE', `/api/assets/${assetId}`)).status, 409, 'active reference protects permanent asset deletion');
+  world.extraHighlights = 9; // Cross the eight-row batch boundary on a long upload.
   await call('POST', `/api/projects/${projectA}/highlights`, { brief: 'Best moments from this talk' });
   for (let i = 0; i < 10 && row(projectA).highlights_status !== 'done'; i++) await delivery(projectA);
   assert.equal(row(projectA).log_status, 'done');
   assert.equal(row(projectA).highlights_status, 'done');
   x = await call('GET', `/api/projects/${projectA}/highlights`);
-  assert.ok(x.data.highlights.length, JSON.stringify(x));
+  assert.equal(x.data.highlights.length, 11, 'all picks survive multiple D1-safe batches');
+  world.extraHighlights = 0;
   const picked = x.data.highlights[0];
   await call('PATCH', `/api/projects/${projectA}/highlights/${picked.id}`, { pick: 'keep' });
   const jobsBeforeReuse = world.jobs.size;
