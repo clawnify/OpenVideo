@@ -10,6 +10,7 @@
 // array — reordering is a splice, splitting is two trims), saved with a
 // debounced PUT; validation errors surface with their JSON pointer.
 
+import { SharedHighlights, highlightAsset } from "./library-highlights";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { keepEdgeFades, splitClip } from "../shared/split";
@@ -25,6 +26,8 @@ import {
 import { parseVtt, type Cue } from "../shared/transcript";
 import { fadeGain, heardFor } from "../shared/fade";
 import { sharedPrefix } from "../shared/names";
+import { repeatPasses } from "../shared/passes";
+import { playbackVerdict } from "../shared/playback";
 import {
   DEFAULT_TRANSITION_SECONDS,
   MAX_TRANSITION_SECONDS,
@@ -140,6 +143,7 @@ export interface Asset {
 
 /** A clip from one of the project's Drive folders. The log here is its short form. */
 interface FootageItem {
+  source_kind?: "drive" | "library";
   id: string;
   name: string;
   /** Where it sits, the shared folder's own name first: "Day 1/Cam B". */
@@ -148,6 +152,8 @@ interface FootageItem {
   error: string | null;
   /** Set while it waits on Google Drive: when it is tried again. */
   retry_at?: string | null;
+  /** Set while a file Drive won't hand over whole comes in a piece at a time. */
+  received?: { bytes: number; size: number } | null;
   asset: Asset | null;
   log_status: "preparing" | "running" | "done" | "failed" | null;
   log_error: string | null;
@@ -286,7 +292,7 @@ export interface Edl {
   captions?: ProjectCaptions;
 }
 
-type RailTab = "media" | "audio" | "text" | "captions" | "comments";
+type RailTab = "media" | "highlights" | "audio" | "text" | "captions" | "comments";
 
 export interface EditProject {
   id: string;
@@ -321,7 +327,12 @@ async function errJson(r: Response): Promise<{ error?: string; detail?: string; 
 export const api = {
   async get<T>(url: string): Promise<T> {
     const r = await fetch(url);
-    if (!r.ok) throw new Error((await errJson(r)).error || r.statusText);
+    if (!r.ok) {
+      const e = await errJson(r);
+      // The status and the service's own code go with the error, so a caller
+      // can tell something gone for good from a hiccup.
+      throw Object.assign(new Error(e.error || r.statusText), { status: r.status, code: e.error });
+    }
     return r.json();
   },
   async send<T>(method: string, url: string, body?: unknown): Promise<T> {
@@ -928,7 +939,7 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
                     <div className="text-fine text-faint mt-0.5">
                       {removing?.id === p.id
                         ? `Deleting${removing.left ? `, ${removing.left} clips to go` : ""}`
-                        : `Edited ${fmtDate(p.updated_at)}${p.footage ? ` · ${p.footage} clips from Drive` : ""}`}
+                        : `Edited ${fmtDate(p.updated_at)}${p.footage ? ` · ${p.footage} source ${p.footage === 1 ? "video" : "videos"}` : ""}`}
                     </div>
                   </div>
                 </button>
@@ -951,7 +962,7 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
             title={`Delete “${confirmDel.name}”?`}
             body={
               confirmDel.footage
-                ? `The project, its export history and its ${confirmDel.footage} clips from Drive go with it. The originals in Google Drive are not touched, and footage from your media library stays there.`
+                ? "The project and its export history are deleted. Shared highlights and videos used by them or other projects are kept. Unused Drive-folder copies are removed; originals in Google Drive are kept."
                 : "The project and its export history go with it. Your footage stays in the media library."
             }
             onConfirm={() => remove(confirmDel)}
@@ -1014,7 +1025,7 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
         setProject(p);
         // The project's own clips from Drive sit beside the library's, so
         // the timeline can play them.
-        setAssets([...a, ...readyFootage(f)]);
+        setAssets([...new Map([...a, ...readyFootage(f)].map((asset) => [asset.id, asset])).values()]);
         setFootage(f);
       })
       .catch((e) => current && setErr(String(e.message || e)));
@@ -1439,7 +1450,7 @@ export function EditEditor({
     <div className="flex-1 flex flex-col min-h-0">
       {/* Project bar. The name edits in place — there is no edit mode and no
           pencil: the value itself is the control. */}
-      <div className="flex items-center gap-3 px-4 h-12 border-b border-border bg-surface shrink-0">
+      <div className="flex items-center gap-1 sm:gap-3 px-4 h-12 border-b border-border bg-surface shrink-0">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -1757,13 +1768,13 @@ function LeftPanel({
   // of a shoot's hundreds of clips one by one is what this avoids.
   const footage = useFootage(projectId, initialFootage, setAssets);
   const footageIds = useMemo(
-    () => new Set(footage.list.items.flatMap((i) => (i.asset ? [i.asset.id] : []))),
+    () => new Set(footage.list.items.flatMap((i) => (i.asset && i.source_kind !== "library" ? [i.asset.id] : []))),
     [footage.list],
   );
-  const hasFootage = footage.list.sources.length > 0;
+  const hasFootage = footage.list.counts.total > 0;
   const [view, setView] = useState<"project" | "library">(hasFootage ? "project" : "library");
   const library = useMemo(() => assets.filter((a) => !footageIds.has(a.id)), [assets, footageIds]);
-  const { ready: mediaReady, ingesting: mediaIngesting } = useMediaReady(library);
+  const { ready: mediaReady, ingesting: mediaIngesting, failed: mediaFailed } = useMediaReady(library);
   const [deleting, setDeleting] = useState<Asset | null>(null);
   const [deleteErr, setDeleteErr] = useState("");
 
@@ -1795,6 +1806,7 @@ function LeftPanel({
         {(
           [
             ["media", Film, "Media"],
+            ["highlights", Sparkles, "Highlights"],
             ["audio", Music, "Audio"],
             ["text", TypeIcon, "Text"],
             ["captions", CaptionsIcon, "Captions"],
@@ -1824,7 +1836,11 @@ function LeftPanel({
       <div className="flex-1 min-w-0 overflow-y-auto p-3">
         {tab === "comments" ? (
           <CommentsPanel comments={comments} onShow={onShowComment} />
-        ) : tab === "captions" ? (
+        ) : tab === "highlights" ? <SharedHighlights onAdd={h => {
+          const asset = highlightAsset(h);
+          setAssets(prev => prev.some(a => a.id === asset.id) ? prev : [...prev, asset]);
+          update(d => d.main.elements.push({ id: rid(), type: "video", src: `asset:${asset.id}`, trimStart: h.src_in, duration: h.src_out - h.src_in }));
+        }} /> : tab === "captions" ? (
           <CaptionsPanel
             edl={edl}
             update={update}
@@ -1842,6 +1858,11 @@ function LeftPanel({
           </button>
         ) : (
           <>
+            {tab === "media" && onOpenHighlights && (
+              <button onClick={onOpenHighlights} className={`${btnSecondary} w-full justify-center mb-3`}>
+                <Sparkles className="w-4 h-4" /> Find highlights
+              </button>
+            )}
             {tab === "media" && hasFootage && (
               <div className="grid grid-cols-2 gap-0.5 p-0.5 mb-3 rounded-sm bg-surface shadow-edge">
                 {(
@@ -1898,9 +1919,8 @@ function LeftPanel({
                 projectId={projectId}
                 footage={footage}
                 onAdd={onAdd}
-                onDelete={setDeleting}
+                onDelete={(a) => { if (footageIds.has(a.id)) setDeleting(a); }}
                 onAddFolder={() => setFolderOpen(true)}
-                onOpenHighlights={onOpenHighlights}
               />
             ) : (
           <>
@@ -1927,7 +1947,7 @@ function LeftPanel({
             {driveOpen && (
               <DriveDialog
                 kind={tab === "audio" ? "audio" : "media"}
-                onImported={(a) => setAssets((prev) => [a, ...prev])}
+                onImported={(a) => setAssets((prev) => [a, ...prev.filter((item) => item.id !== a.id)])}
                 onClose={closeDrive}
               />
             )}
@@ -1954,7 +1974,7 @@ function LeftPanel({
                 <button
                   onClick={() => !preparing && onAdd(a)}
                   disabled={preparing}
-                  title={preparing ? "Still being prepared" : "Add to timeline"}
+                  title={mediaFailed.has(a.id) ? "This clip could not be prepared. Delete it and upload it again." : preparing ? "Still being prepared" : "Add to timeline"}
                   aria-label={`Add ${a.name} to the timeline`}
                   className="block w-full text-left rounded-sm bg-surface shadow-edge overflow-hidden hover:bg-surface-sunken group disabled:hover:bg-surface"
                 >
@@ -1967,6 +1987,7 @@ function LeftPanel({
                             Preparing
                           </>
                         )}
+                        {mediaFailed.has(a.id) && <span className="text-danger">Could not be prepared</span>}
                       </div>
                     ) : a.media_uid ? (
                       <img src={frameUrl(a, 1)} alt="" className="w-full h-20 object-cover bg-black" />
@@ -2030,7 +2051,7 @@ function useFootage(
   const refresh = useCallback(() => setTick((t) => t + 1), []);
 
   useEffect(() => {
-    if (tick === 0 && initial.sources.length === 0) return;
+    if (tick === 0 && initial.counts.total === 0) return;
     let dead = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const read = async () => {
@@ -2082,6 +2103,9 @@ function footageLine(i: FootageItem): string {
     return `Waiting for Google Drive, which is limiting downloads of this file. Trying again at ${at}`;
   }
   if (i.status === "waiting") return "Waiting to import";
+  if (i.status === "importing" && i.received) {
+    return `Importing: ${Math.floor((i.received.bytes / i.received.size) * 100)}% of ${fmtBytes(i.received.size)}`;
+  }
   if (i.status === "importing") return "Importing";
   if (i.status === "failed") return `Not imported: ${i.error ?? "unknown error"}`;
   if (i.log_status === "done" && i.log) return i.log.summary;
@@ -2095,14 +2119,12 @@ function FootagePanel({
   onAdd,
   onDelete,
   onAddFolder,
-  onOpenHighlights,
 }: {
   projectId: string;
   footage: { list: FootageList; refresh: () => void };
   onAdd: (a: Asset) => void;
   onDelete: (a: Asset) => void;
   onAddFolder: () => void;
-  onOpenHighlights?: () => void;
 }) {
   const { list, refresh } = footage;
   const c = list.counts;
@@ -2114,7 +2136,7 @@ function FootagePanel({
     const single = list.sources.length === 1 ? `${list.sources[0].name}/` : null;
     const by = new Map<string, FootageItem[]>();
     for (const i of list.items) {
-      const k = (single && i.folder.startsWith(single) ? i.folder.slice(single.length) : i.folder) || list.sources[0]?.name || "Drive folder";
+      const k = i.source_kind === "library" ? "From your library" : (single && i.folder.startsWith(single) ? i.folder.slice(single.length) : i.folder) || list.sources[0]?.name || "Drive folder";
       by.set(k, [...(by.get(k) ?? []), i]);
     }
     return [...by].map(([folder, items]) => ({ folder, items, prefix: sharedPrefix(items.map((i) => i.name)) }));
@@ -2144,10 +2166,10 @@ function FootagePanel({
     <div>
       <div className="mb-2 text-fine text-muted">
         <div className="text-foreground truncate" title={list.sources.map((s) => s.name).join(", ")}>
-          {list.sources.map((s) => s.name).join(", ")} · {c.total} {c.total === 1 ? "clip" : "clips"}
+          {list.sources.map((s) => s.name).join(", ") || "This project"} · {c.total} {c.total === 1 ? "clip" : "clips"}
         </div>
         <div className="tabular-nums">
-          {coming > 0 ? `${c.ready} of ${c.total} imported` : "All imported"}
+          {coming > 0 ? `${c.ready} of ${c.total} imported` : "Ready to edit"}
           {c.ready > 0 && ` · ${c.logged} logged`}
         </div>
       </div>
@@ -2163,9 +2185,9 @@ function FootagePanel({
         </div>
       )}
       <div className="flex flex-wrap gap-x-1 gap-y-0.5 mb-3 -ml-1.5">
-        <button onClick={() => act("sync")} disabled={busy !== null} className={railAction} title="Look in the folders again for files added since">
+        {list.sources.length > 0 && <button onClick={() => act("sync")} disabled={busy !== null} className={railAction} title="Look in the folders again for files added since">
           {busy === "sync" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} Check for new files
-        </button>
+        </button>}
         {failed > 0 && (
           <button onClick={() => act("retry")} disabled={busy !== null} className={railAction}>
             {busy === "retry" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Redo2 className="w-3.5 h-3.5" />} Retry {failed} failed
@@ -2175,19 +2197,6 @@ function FootagePanel({
           <Plus className="w-3.5 h-3.5" /> Add folder
         </button>
       </div>
-      {onOpenHighlights && c.logged > 0 && (
-        <button
-          onClick={onOpenHighlights}
-          className="w-full mb-3 p-2 rounded-sm bg-surface shadow-raised hover:bg-surface-sunken text-left flex items-start gap-2"
-        >
-          <Sparkles className="w-4 h-4 mt-0.5 shrink-0 text-muted" />
-          <span className="min-w-0">
-            <span className="block text-body-sm text-foreground">Highlights</span>
-            <span className="block text-fine text-muted">The soundbites and b-roll worth a look in every clip, and why</span>
-          </span>
-          <ChevronRight className="w-4 h-4 mt-0.5 ml-auto shrink-0 text-faint" />
-        </button>
-      )}
       {note && <p className="text-fine text-muted mb-2">{note}</p>}
       {groups.map(({ folder, items, prefix }) => (
         <details key={folder} open className="group/folder mb-2">
@@ -2255,7 +2264,7 @@ function FootageRow({
           {line}
         </div>
       </button>
-      {asset && (
+      {asset && item.source_kind !== "library" && (
         // On the thumbnail, so it takes no width from the name beside it.
         <button
           onClick={() => onDelete(asset)}
@@ -2502,42 +2511,48 @@ function fmtBytes(n: number | null): string {
  * the library says so and the clip stays out of the timeline until it is.
  * Polls only while something is still pending.
  */
-function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<string> } {
+function useMediaReady(assets: Asset[]): { ready: Set<string>; ingesting: Set<string>; failed: Set<string> } {
   const [ready, setReady] = useState<Set<string>>(new Set());
   // Only what the service has actually reported as not ready yet. Until the
   // first answer a clip is merely unknown, and calling it "Preparing" flashed
   // that label on every page load for footage that had long been ready.
   const [ingesting, setIngesting] = useState<Set<string>>(new Set());
-  const pending = assets.filter((a) => a.media_uid && !ready.has(a.id)).map((a) => a.id);
+  // Footage the service gave up on never becomes ready, so it is not asked
+  // about again; otherwise an open editor asks every 5 s for as long as it is open.
+  const [failed, setFailed] = useState<Set<string>>(new Set());
+  const pending = assets.filter((a) => a.media_uid && !ready.has(a.id) && !failed.has(a.id)).map((a) => a.id);
   const key = pending.join(",");
 
+  // One pass at a time, 5 s apart, and none left running once the set changes:
+  // a pass over hundreds of clips takes minutes, and a fixed interval stacked
+  // them up, every one asking about every clip.
   useEffect(() => {
     if (!key) return;
-    let dead = false;
-    const check = async () => {
+    return repeatPasses(async (stopped) => {
       const done: string[] = [];
       const waiting: string[] = [];
+      const broken: string[] = [];
       for (const id of key.split(",")) {
+        if (stopped()) return;
+        let verdict: ReturnType<typeof playbackVerdict>;
         try {
-          const r = await api.get<{ ready: boolean }>(`/api/assets/${id}/playback`);
-          (r.ready ? done : waiting).push(id);
-        } catch {
-          /* a hiccup: ask again on the next pass */
+          verdict = playbackVerdict(await api.get<{ ready: boolean; state?: string }>(`/api/assets/${id}/playback`));
+        } catch (err) {
+          verdict = playbackVerdict(err as { status?: number; code?: string });
         }
+        // A retry is a hiccup: asked again on the next pass.
+        if (verdict === "ready") done.push(id);
+        else if (verdict === "failed") broken.push(id);
+        else if (verdict === "waiting") waiting.push(id);
       }
-      if (dead) return;
+      if (stopped()) return;
       if (done.length) setReady((cur) => new Set([...cur, ...done]));
+      if (broken.length) setFailed((cur) => new Set([...cur, ...broken]));
       setIngesting(new Set(waiting));
-    };
-    check();
-    const t = setInterval(check, 5000);
-    return () => {
-      dead = true;
-      clearInterval(t);
-    };
+    }, 5000);
   }, [key]);
 
-  return { ready, ingesting };
+  return { ready, ingesting, failed };
 }
 
 // ── captions ────────────────────────────────────────────────────────────────
@@ -2760,6 +2775,18 @@ function CaptionsPanel({
   );
 }
 
+interface DriveImportJob {
+  id: string; file_id: string; name: string;
+  state: "queued" | "uploading" | "processing" | "ready" | "failed" | "cancelling" | "cancelled";
+  received: number; size: number; asset_id: string | null;
+  error: { code: string; message: string } | null;
+}
+const IMPORT_LABEL: Record<DriveImportJob["state"], string> = {
+  queued: "Queued", uploading: "Importing", processing: "Processing video", ready: "In your library",
+  failed: "Import failed", cancelling: "Cancelling", cancelled: "Cancelled",
+};
+const importActive = (j: DriveImportJob) => ["queued", "uploading", "processing", "cancelling"].includes(j.state);
+
 /** Search the org's Google Drive and copy picked files into the library. */
 function DriveDialog({
   kind,
@@ -2781,6 +2808,32 @@ function DriveDialog({
   const [picked, setPicked] = useState<DriveFile | null>(null);
   const [importing, setImporting] = useState<string | null>(null);
   const [imported, setImported] = useState<Set<string>>(new Set());
+  const [imports, setImports] = useState<DriveImportJob[]>([]);
+  const delivered = useRef(new Set<string>());
+  const onAsset = useRef(onImported);
+  onAsset.current = onImported;
+  const refreshImports = useCallback(async () => {
+    const r = await api.get<{ imports: DriveImportJob[] }>("/api/drive/imports");
+    setImports(r.imports);
+    const ready = r.imports.filter((j) => j.state === "ready" && j.asset_id && !delivered.current.has(j.id));
+    if (ready.length) {
+      const assets = await api.get<Asset[]>("/api/assets");
+      for (const j of ready) {
+        const asset = assets.find((a) => a.id === j.asset_id);
+        if (asset) { onAsset.current(asset); delivered.current.add(j.id); setImported((cur) => new Set(cur).add(j.file_id)); }
+      }
+    }
+  }, []);
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try { await refreshImports(); } catch { /* a transient poll failure does not stop the import */ }
+      if (!stopped) timer = setTimeout(poll, 5000);
+    };
+    void poll();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [refreshImports]);
   const [savingFolder, setSavingFolder] = useState(false);
   const [err, setErr] = useState("");
 
@@ -2859,17 +2912,29 @@ function DriveDialog({
     setImporting(f.id);
     setErr("");
     try {
-      const asset = await api.send<Asset>("POST", "/api/drive/import", {
+      const result = await api.send<Asset | { import: DriveImportJob }>("POST", "/api/drive/import", {
         fileId: f.id,
         ...(f.duration ? { duration: f.duration } : {}),
       });
-      onImported(asset);
-      setImported((cur) => new Set(cur).add(f.id));
+      if ("import" in result) {
+        setImports((cur) => [result.import, ...cur.filter((j) => j.id !== result.import.id)]);
+      } else {
+        onImported(result);
+        setImported((cur) => new Set(cur).add(f.id));
+      }
     } catch (e) {
       setErr(`${f.name}: ${String((e as Error).message)}`);
     } finally {
       setImporting(null);
     }
+  };
+
+  const actOnImport = async (job: DriveImportJob, action: "cancel" | "retry") => {
+    setErr("");
+    try {
+      await api.send("POST", `/api/drive/imports/${job.id}/${action}`);
+      await refreshImports();
+    } catch (e) { setErr(String((e as Error).message)); }
   };
 
   const kindIcon = (t: string) =>
@@ -2905,6 +2970,31 @@ function DriveDialog({
         </p>
       ) : (
         <div className="mt-4">
+          {imports.length > 0 && (
+            <section aria-label="Drive imports" className="mb-3 space-y-2">
+              <p className="text-fine text-muted">Imports continue when you close this window.</p>
+              {imports.filter((j) => j.state !== "cancelled").slice(0, 8).map((job) => (
+                <div key={job.id} className="rounded-sm bg-surface-sunken p-2 space-y-1">
+                  <div className="flex items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-fine break-words">{job.name}</div>
+                      <div className={job.state === "failed" ? "text-fine text-danger" : "text-fine text-muted"}>
+                        {IMPORT_LABEL[job.state]}{job.state === "uploading" ? ` · ${fmtBytes(job.received)} of ${fmtBytes(job.size)}` : ""}
+                      </div>
+                    </div>
+                    {importActive(job) && job.state !== "cancelling" && (
+                      <button className={btnGhost} onClick={() => actOnImport(job, "cancel")} aria-label={`Cancel import of ${job.name}`}>Cancel</button>
+                    )}
+                    {job.state === "failed" && (
+                      <button className={btnGhost} onClick={() => actOnImport(job, "retry")} aria-label={`Retry import of ${job.name}`}>Retry</button>
+                    )}
+                  </div>
+                  {job.state === "uploading" && <progress className="w-full h-1" value={job.received} max={job.size} aria-label={`Import progress for ${job.name}`} />}
+                  {job.error && <p className="text-fine text-danger break-words">{job.error.message}</p>}
+                </div>
+              ))}
+            </section>
+          )}
           {/* Where you are, and the org's one folder rule. */}
           <div className="flex items-center gap-2 mb-2 min-h-7">
             <nav className="flex items-center gap-1 min-w-0 flex-1 text-fine text-muted">
@@ -3052,7 +3142,7 @@ function DriveDialog({
                   ) : (
                     <button
                       onClick={() => importFile(picked)}
-                      disabled={importing !== null}
+                      disabled={importing !== null || imports.some((j) => j.file_id === picked.id && importActive(j))}
                       className={`${btnPrimary} ${stretch}`}
                     >
                       {importing === picked.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
@@ -3060,7 +3150,7 @@ function DriveDialog({
                     </button>
                   )}
                   {importing === picked.id && (
-                    <div className="text-fine text-muted">Copying from Drive, this takes a moment for long videos…</div>
+                    <div className="text-fine text-muted">Starting the import…</div>
                   )}
                 </div>
               </>

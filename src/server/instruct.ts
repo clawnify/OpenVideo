@@ -51,6 +51,8 @@ export interface InstructHighlight {
   speaker: string;
   score: number;
   kept: boolean;
+  /** One of the best the project asked for a number of (src/server/highlights.ts). */
+  best?: boolean;
 }
 
 export interface InstructFailure {
@@ -449,9 +451,10 @@ function describeHighlights(list: InstructHighlight[]): string {
   if (!list.length) return "";
   const lines = list.slice(0, MAX_LISTED).map((h) => {
     const what = h.kind === "soundbite" ? `${h.speaker ? `${h.speaker}: ` : ""}"${h.text.slice(0, 160)}"` : h.text.slice(0, 120);
-    return `  ${h.id}: ${h.kind}, score ${h.score}${h.kept ? ", kept" : ""}, ${(h.end - h.start).toFixed(1)}s, ${what}`;
+    return `  ${h.id}: ${h.kind}, score ${h.score}${h.kept ? ", kept" : ""}${h.best ? ", best" : ""}, ${(h.end - h.start).toFixed(1)}s, ${what}`;
   });
-  return `\n\nHighlights from the footage (picked and scored from every clip; kept means a person chose it):\n${lines.join("\n")}`;
+  const best = list.some((h) => h.best) ? "; best means one of the best set the person asked for" : "";
+  return `\n\nHighlights from the footage (picked and scored from every clip; kept means a person chose it${best}):\n${lines.join("\n")}`;
 }
 
 const SYSTEM = [
@@ -461,7 +464,7 @@ const SYSTEM = [
   "Positions on the main track are the order the clips play in.",
   "Make the smallest set of changes that does what was asked, then stop and say in one sentence what you changed.",
   "If the request cannot be done with these operations, say so plainly instead of guessing.",
-  "When highlights are listed, they are the best parts of the footage: to build or extend a cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then higher scores, and keep to the length asked for.",
+  "When highlights are listed, they are the best parts of the footage: to build or extend a cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then ones marked best, then higher scores, and keep to the length asked for.",
 ].join(" ");
 
 /**

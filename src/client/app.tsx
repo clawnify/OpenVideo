@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ArrowLeft, Film } from "lucide-react";
 import { AppNav, embedded, reportLocation } from "@clawnify/app/client";
 import { EditRoute, ProjectsHome, type EditProject } from "./edit";
+import { SharedHighlightsRoute } from "./library-highlights";
 import { HighlightsRoute } from "./highlights";
 import { btnGhost } from "./ui";
 
@@ -42,7 +43,7 @@ function HostNav({ active, path, navigate }: { active: string; path: string; nav
       icon="video"
       active={active || "home"}
       groups={[
-        { items: [{ id: "home", label: "Projects", icon: "video", href: "/", home: true }] },
+        { items: [{ id: "home", label: "Projects", icon: "video", href: "/", home: true }, { id: "highlights", label: "Highlights", icon: "sparkles", href: "/highlights" }] },
         {
           label: "Projects",
           items: projects.map((p) => ({ id: `edits/${p.id}`, label: p.name, icon: "camera", href: `/edits/${p.id}` })),
@@ -77,11 +78,11 @@ export function App() {
           <Film className="w-4 h-4" />
         </span>
         <span className="text-heading-3">OpenVideo</span>
-        <span className="text-fine text-faint hidden sm:inline">cut &amp; export video</span>
+        <button className={`${btnGhost} ml-auto`} onClick={() => navigate("/highlights")}>Highlights</button>
       </header>
       )}
 
-      {editId && highlights ? (
+      {id === "highlights" ? <SharedHighlightsRoute navigate={navigate} /> : editId && highlights ? (
         <HighlightsRoute id={editId} navigate={navigate} />
       ) : editId ? (
         <EditRoute id={editId} navigate={navigate} />
