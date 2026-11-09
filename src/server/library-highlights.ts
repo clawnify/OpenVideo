@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { get, query, run } from "./db";
 import { starterEdl, MAX_OUTPUT_SECONDS } from "./edl";
+import { addFormat } from "../shared/formats";
 
 /** Existing installations get their selections once. INSERT is atomic and
  * idempotent; the marker follows it, so interruption is safe to retry. New
@@ -63,8 +64,9 @@ libraryHighlights.post("/projects", async (c) => {
   }
   const clips = b.ids.map((hid: string) => {
     const h = rows.find(r => r.id === hid)!;
-    const edl = starterEdl();
-    edl.output.width = 1080; edl.output.height = 1920;
+    // One cut, delivered wide and tall: each shot starts whole in 9:16, for a
+    // person (or AI reframe) to frame (shared/formats.ts).
+    const edl = addFormat({ ...starterEdl(), output: { width: 1920, height: 1080, fps: 30, background: "#000000" } }, "9:16");
     edl.main.elements = [{ id: crypto.randomUUID(), type: "video", src: `asset:${h.asset_id}`,
       trimStart: h.src_in, duration: h.src_out - h.src_in, fit: "contain" }];
     return [crypto.randomUUID(), (h.text.trim() || h.name).slice(0, 100), JSON.stringify(edl), b.request_id, h.id];

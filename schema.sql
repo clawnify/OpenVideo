@@ -380,3 +380,7 @@ CREATE TABLE IF NOT EXISTS video_reframes (
   updated_at INTEGER NOT NULL,
   UNIQUE(asset_id, revision, source_start, source_end)
 );
+
+-- Which of the project's formats an export renders (src/shared/formats.ts):
+-- a ratio such as '9:16', or NULL for the project's main format.
+ALTER TABLE export_jobs ADD COLUMN format TEXT;

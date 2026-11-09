@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MIN_CROP, cropRatio, cropToRatio, croppedShape, isFull, moveCrop, placeClip, resizeCrop, tidyCrop } from "../src/shared/crop";
+import { MIN_CROP, cropRatio, cropToRatio, croppedShape, isFull, moveCrop, placeClip, resizeCrop, sideBySide, stackHalves, tidyCrop } from "../src/shared/crop";
 
 const HD = { width: 1920, height: 1080 };
 const FRAME = { width: 1280, height: 720 };
@@ -121,5 +121,28 @@ describe("tidyCrop", () => {
 describe("croppedShape", () => {
   it("is the source's pixels inside the crop", () => {
     expect(croppedShape(HD, { x: 0, y: 0, width: 0.5, height: 0.5 })).toEqual({ width: 960, height: 540 });
+  });
+});
+
+describe("sideBySide", () => {
+  it("stacks the left and right halves of a wide shot, each the shape of its half of a 9:16 frame", () => {
+    const tall = { width: 1080, height: 1920 };
+    expect(stackHalves(tall)).toEqual([{ width: 1080, height: 960 }, { width: 1080, height: 960 }]);
+    const { top, bottom } = sideBySide(HD, tall);
+    // 1080x960 is 9:8: from a 1920x1080 source, half its width (960px) by 853px.
+    close(top, { x: 0, width: 0.5, height: (960 * 8) / 9 / 1080 });
+    close(bottom, { x: 0.5, width: 0.5 });
+    expect(cropRatio(top, HD)).toBeCloseTo(9 / 8, 3);
+    expect(cropRatio(bottom, HD)).toBeCloseTo(9 / 8, 3);
+    // Heads, not legs: both start at the top of the picture.
+    expect([top.y, bottom.y]).toEqual([0, 0]);
+  });
+
+  it("keeps each view inside its side when the halves are wider than a side allows", () => {
+    // A 1:1 frame's halves are 1080x540 (2:1), wider than half a 4:3 source: each view is as wide as its side.
+    const { top, bottom } = sideBySide({ width: 1440, height: 1080 }, { width: 1080, height: 1080 });
+    expect(top.x + top.width).toBeLessThanOrEqual(0.5 + 1e-9);
+    expect(bottom.x).toBeGreaterThanOrEqual(0.5 - 1e-9);
+    expect(top.height).toBeLessThanOrEqual(1);
   });
 });
