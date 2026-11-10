@@ -409,3 +409,21 @@ CREATE INDEX IF NOT EXISTS idx_review_comments_project ON review_comments(projec
 -- The model's own reply to a framing analysis, kept so a suggestion that fell
 -- back to the whole shot can be traced (src/server/reframe.ts).
 ALTER TABLE video_reframes ADD COLUMN answer TEXT;
+
+-- A long clip's analysis for clean-up or Auto-cut (src/server/long-analysis.ts),
+-- one per clip, stretch and question (a hash of prompt and schema). Asking again
+-- collects a job still running, or the answer already given, instead of paying
+-- for another.
+CREATE TABLE IF NOT EXISTS video_analyses (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  source_start REAL NOT NULL,
+  source_end REAL NOT NULL,
+  question TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempt TEXT NOT NULL,
+  job_id TEXT,
+  result TEXT,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(asset_id, source_start, source_end, question)
+);
