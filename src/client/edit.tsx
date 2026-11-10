@@ -1,5 +1,5 @@
 import { ReframeDialog } from "./reframe";
-import { AssistantPanel } from "./assistant";
+import { AssistantPanel, useAsk } from "./assistant";
 // Footage edit projects — the timeline editor over EDL documents.
 //
 // Layout (the classic four-region editor grid): left rail (Media / Audio /
@@ -1213,6 +1213,17 @@ export function EditEditor({
     bumpHistory((n) => n + 1);
   }, []);
 
+  // The AI conversation and its background jobs: a result lands as one undo
+  // step even when it finishes while the panel is closed.
+  const applyAi = useCallback(
+    (next: Edl) => {
+      commit(next);
+      setSel(null);
+    },
+    [commit],
+  );
+  const ask = useAsk(initial.id, () => edlRef.current, applyAi);
+
   /** Edit the cut as the format on screen sees it; framing lands on that format, the rest on the cut. */
   const update = useCallback(
     (fn: (draft: Edl) => void, coalesce = false) => {
@@ -1543,7 +1554,8 @@ export function EditEditor({
           title="Ask AI to change the cut, in your own words"
           aria-label="AI"
         >
-          <Sparkles className="w-4 h-4" /> <span className="hidden md:inline">AI</span>
+          {ask.active ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}{" "}
+          <span className="hidden md:inline">AI</span>
         </button>
         <ShareControl projectId={initial.id} />
         <ExportControls
@@ -1663,14 +1675,11 @@ export function EditEditor({
         {aiOpen ? (
           <AssistantPanel
             projectId={initial.id}
+            ask={ask}
             pane={pane}
             saving={saveState === "saving"}
             canReframe={edl.main.elements.some((e) => e.type === "video")}
-            onApplied={(next) => {
-              // One step for the whole request, like Auto-cut.
-              commit(next);
-              setSel(null);
-            }}
+            onApplied={applyAi}
             onAutocut={() => setAutocutOpen(true)}
             onReframe={() => {
               setPlaying(false);

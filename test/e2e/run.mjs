@@ -1354,11 +1354,111 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
   assert.equal(r.data.edl.main.elements[0].duration, 3);
   assert.equal((await call("GET", `/api/projects/${pe}`)).data.edl.main.elements.length, 1, "saved");
   await call("DELETE", `/api/projects/${pe}`);
+  // A request that would watch more than a quick answer allows is proposed,
+  // changes nothing, and runs in the background on a yes.
+  const longCut = (n) => ({ version: 1, output: { width: 1280, height: 720, fps: 30 }, main: { elements: [
+    { id: "a", type: "video", src: `asset:${one.id}`, duration: n }, { id: "b", type: "video", src: `asset:${two.id}`, duration: n }] }, overlays: [], audio: [] });
+  assert.equal((await call("PUT", `/api/projects/${pa}`, { edl: longCut(150) })).status, 200);
+  const watchBoth = { tool_calls: ["0", "1"].map((n) => ({ id: n, function: { name: "clean_up_clip", arguments: JSON.stringify({ clip: Number(n) }) } })) };
+  const deleteSecond = { tool_calls: [{ id: "d", function: { name: "delete_clip", arguments: JSON.stringify({ clip: 1 }) } }] };
+  const stepJob = async (id, headers) => {
+    const body = JSON.stringify({ job_id: id });
+    const res = await app.request("https://open-video.apps.clawnify.com/api/ask/step", { method: "POST", headers: { "content-type": "application/json", ...(headers ?? (await signed(body))) }, body }, env, ctx);
+    return { status: res.status, data: await res.json() };
+  };
+  world.askReplies = [watchBoth];
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "tighten both clips" });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.asked, true);
+  assert.equal(r.data.job.status, "proposed");
+  assert.match(r.data.said, /watch 2 clips, about 5 minutes of footage/);
+  const proposed = r.data.job.id;
+  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements.length, 2, "a proposal changes nothing");
+  // A newer request replaces it.
+  world.askReplies = [watchBoth];
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "tighten both clips, please" });
+  const job = r.data.job.id;
+  assert.equal((await call("POST", `/api/projects/${pa}/ask/jobs/${proposed}/run`)).status, 409, "the replaced proposal cannot run");
+  r = await call("POST", `/api/projects/${pa}/ask/jobs/${job}/run`);
+  assert.equal(r.status, 202, JSON.stringify(r.data));
+  assert.equal(world.lastEnqueue.target_url, "https://open-video.apps.clawnify.com/api/ask/step");
+  assert.equal((await stepJob(job, { "X-Queue-Signature": "x", "X-Queue-Timestamp": "1", "X-Queue-Key-Id": "test" })).status, 401, "unsigned");
+  world.askReplies = [deleteSecond, { content: "Kept the first clip." }];
+  r = await stepJob(job);
+  assert.equal(r.data.status, "applied", JSON.stringify(r.data));
+  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements.length, 1, "applied to the cut");
+  assert.equal((await stepJob(job)).data.status, "applied", "a second delivery does nothing");
+  r = await call("GET", `/api/projects/${pa}/ask`);
+  assert.equal(r.data.jobs.find((j) => j.id === job).status, "applied");
+  assert.deepEqual(r.data.messages.at(-1).job_id, job);
+  assert.equal(r.data.messages.at(-1).text, "Kept the first clip.");
+  // The cut changes while a job runs: its result is kept aside, applied only on request.
+  assert.equal((await call("PUT", `/api/projects/${pa}`, { edl: longCut(150) })).status, 200);
+  world.askReplies = [watchBoth];
+  const kept = (await call("POST", `/api/projects/${pa}/instruct`, { instruction: "tighten both again" })).data.job.id;
+  await call("POST", `/api/projects/${pa}/ask/jobs/${kept}/run`);
+  assert.equal((await call("PUT", `/api/projects/${pa}`, { edl: longCut(140) })).status, 200, "a person edits meanwhile");
+  world.askReplies = [deleteSecond, { content: "Kept the first clip." }];
+  // The edit lands between the job reading the cut and writing it.
+  world.beforeModel = async () => { await call("PUT", `/api/projects/${pa}`, { edl: longCut(130) }); };
+  assert.equal((await stepJob(kept)).data.status, "stale");
+  world.beforeModel = null;
+  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements[0].duration, 130, "the person's edit stays");
+  r = await call("GET", `/api/projects/${pa}/ask/jobs/${kept}`);
+  assert.equal(r.data.result_edl.main.elements.length, 1);
+  assert.equal(r.data.base_edl.main.elements[0].duration, 140);
+  r = await call("POST", `/api/projects/${pa}/ask/jobs/${kept}/apply`);
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements.length, 1, "applied on request");
+  assert.equal((await call("POST", `/api/projects/${pa}/ask/jobs/${kept}/apply`)).status, 200, "again, over an edit that was on its way");
+  assert.equal((await call("POST", `/api/projects/${pa}/ask/jobs/${proposed}/apply`)).status, 409, "a job with no result");
+  // Cancelled while queued: never runs. An agent can ask for the background at once.
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "make a 60 second cut", background: true });
+  assert.equal(r.status, 202, JSON.stringify(r.data));
+  assert.equal(r.data.job.status, "queued");
+  assert.equal((await call("POST", `/api/projects/${pa}/ask/jobs/${r.data.job.id}/cancel`)).status, 200);
+  assert.equal((await stepJob(r.data.job.id)).data.status, "cancelled", "a cancelled job never runs");
+  // A long request runs a few steps per delivery and books the next: four model
+  // calls at most per delivery, and what it is doing is readable while it runs.
+  const trimTo = (n) => ({ tool_calls: [{ id: `t${n}`, function: { name: "trim_clip", arguments: JSON.stringify({ clip: 0, seconds: n }) } }] });
+  assert.equal((await call("PUT", `/api/projects/${pa}`, { edl: longCut(150) })).status, 200);
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "tighten it in steps", background: true });
+  const stepped = r.data.job.id;
+  world.askReplies = [trimTo(100), trimTo(90), trimTo(80), trimTo(70), trimTo(60), { content: "Trimmed the first clip five times." }];
+  const booked = world.calls.filter((u) => u.includes("queue.test")).length;
+  assert.equal((await stepJob(stepped)).data.status, "running", "stops before a fifth model call");
+  assert.equal(world.calls.filter((u) => u.includes("queue.test")).length, booked + 1, "and books the next delivery");
+  assert.equal(world.lastEnqueue.payload.job_id, stepped);
+  r = await call("GET", `/api/projects/${pa}/ask`);
+  const mid = r.data.jobs.find((j) => j.id === stepped);
+  assert.equal(mid.status, "running");
+  assert.equal(mid.applied.length, 4, JSON.stringify(mid));
+  assert.ok(mid.doing, "says what it is doing");
+  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements[0].duration, 150, "nothing reaches the cut until it is done");
+  // A second delivery while one holds the job does nothing.
+  db.prepare("UPDATE ask_jobs SET leased_until = datetime('now', '+5 minutes') WHERE id = ?").run(stepped);
+  assert.equal((await stepJob(stepped)).data.status, "busy");
+  db.prepare("UPDATE ask_jobs SET leased_until = NULL WHERE id = ?").run(stepped);
+  assert.equal((await stepJob(stepped)).data.status, "applied", "the next delivery carries on and finishes");
+  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements[0].duration, 60);
+  // A job whose next delivery was lost is booked again when read; one that has
+  // not moved for 20 minutes is marked failed, never left "working".
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "lost", background: true });
+  const lost = r.data.job.id;
+  db.prepare("UPDATE ask_jobs SET status = 'running', step_booked_at = datetime('now', '-5 minutes') WHERE id = ?").run(lost);
+  const before = world.calls.filter((u) => u.includes("queue.test")).length;
+  await call("GET", `/api/projects/${pa}/ask`);
+  assert.equal(world.calls.filter((u) => u.includes("queue.test")).length, before + 1, "rebooked");
+  db.prepare("UPDATE ask_jobs SET updated_at = datetime('now', '-30 minutes') WHERE id = ?").run(lost);
+  r = await call("GET", `/api/projects/${pa}/ask`);
+  assert.equal(r.data.jobs.find((j) => j.id === lost).status, "failed");
+  assert.match(r.data.messages.at(-1).text, /stopped without finishing/);
   await call("POST", `/api/projects/${pa}/instruct`, { instruction: "one more" });
   await call("DELETE", `/api/projects/${pa}`);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_jobs WHERE project_id = ?").get(pa).n, 0, "jobs deleted with the project");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_messages WHERE project_id = ?").get(pa).n, 0, "deleted with the project");
   world.askReplies = null;
-  console.log("16 ok: Ask asks back without changing anything, a follow-up reads the question, a failure is shown but not read, start over and project delete clear it; from an empty timeline it places a library video");
+  console.log("16 ok: Ask asks back without changing anything, a follow-up reads the question, a failure is shown but not read, start over and project delete clear it; from an empty timeline it places a library video; long requests are proposed, run in the background on a yes, never over a change made meanwhile, and can be cancelled; a job runs a few steps per delivery, says what it is doing, is rebooked when its delivery is lost and marked failed when it stops");
 }
 console.log("ALL OK");
 
