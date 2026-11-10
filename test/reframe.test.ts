@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeShots, framedPieces, sourceTime, focusCrop, validCrop } from "../src/shared/reframe";
+import { normalizeShots, framedPieces, sourceTime, focusCrop, validCrop, analysisWindows } from "../src/shared/reframe";
 import { splitClip } from "../src/shared/split";
 const shape={width:1920,height:1080};
 const region={x:.3,y:.2,width:.1,height:.5};
@@ -56,5 +56,18 @@ describe("source-time framing",()=>{
     const [p]=framedPieces({id:"c",trimStart:123,duration:4,split:undefined},4,30,shots,()=>"new");
     expect(p.trimStart).toBe(123);expect(p.duration).toBe(4);expect(p.split).toBeTruthy();
     const halves=splitClip(p,2,4,"second")!;expect(halves[0].split).toEqual(halves[1].split);expect(halves[1].trimStart).toBe(125);
+  });
+  it("reads a long clip in contiguous parts the analysis accepts",()=>{
+    expect(analysisWindows(510,524)).toEqual([{from:510,to:524}]);
+    // The whole 25-minute talk: six parts of about four minutes, none over five.
+    const parts=analysisWindows(0,1506.16);
+    expect(parts).toHaveLength(6);
+    expect(parts[0].from).toBe(0);expect(parts.at(-1)!.to).toBe(1506.16);
+    for(const [i,p] of parts.entries()){
+      expect(p.to-p.from).toBeLessThanOrEqual(300);expect(p.to-p.from).toBeGreaterThan(200);
+      if(i)expect(p.from).toBe(parts[i-1].to);
+    }
+    // Exactly ten minutes from an odd start still never asks for more than five at once.
+    for(const p of analysisWindows(510.0004,1110.0004))expect(p.to-p.from).toBeLessThanOrEqual(300);
   });
 });

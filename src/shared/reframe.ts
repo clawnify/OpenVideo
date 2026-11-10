@@ -85,3 +85,15 @@ export function framedPieces<T extends SplittableClip & { crop?: Crop; split?: S
   }
   keepEdgeFades(pieces); return pieces;
 }
+
+/**
+ * The stretches a clip is read in. The analysis route takes at most five
+ * minutes at a time (server/reframe.ts), so a longer clip is cut into equal
+ * parts a little under that: rounding a boundary never pushes one over.
+ * Contiguous, in order, covering `start`..`end`.
+ */
+export function analysisWindows(start: number, end: number, max = 299.5): { from: number; to: number }[] {
+  const n = Math.max(1, Math.ceil((end - start) / max - 1e-9));
+  const at = (i: number) => (i === n ? end : Math.round((start + ((end - start) * i) / n) * 1000) / 1000);
+  return Array.from({ length: n }, (_, i) => ({ from: at(i), to: at(i + 1) }));
+}

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Sparkles, Loader2 } from "lucide-react";
 import { api, frameUrl, type Asset, type Edl } from "./edit";
 import { Dialog, btnPrimary, btnSecondary } from "./ui";
-import { framedPieces, focusCrop, type Shot, type Layout } from "../shared/reframe";
+import { analysisWindows, framedPieces, focusCrop, type Shot, type Layout } from "../shared/reframe";
 import { placeClip, sideBySide, type Crop, type Shape } from "../shared/crop";
 import { sameShape } from "../shared/format";
 import { addFormat, findFormat, formatView, liftView } from "../shared/formats";
@@ -19,6 +19,9 @@ function target(edl: Edl): { doc: Edl; id: string | null } | null {
 }
 
 type Result = {id?:string;status:string;shots?:Shot[];error?:string;shape?:Shape};
+/** One stretch of the clip, analysed on its own (analysisWindows). */
+type Part = {from:number;to:number;id?:string;status:string;error?:string;shots?:Shot[]};
+const BUSY=["starting","running","preparing"];
 const whole:Crop={x:0,y:0,width:1,height:1};
 const time=(t:number)=>`${Math.floor(t/60)}:${(t%60).toFixed(1).padStart(4,"0")}`;
 export function ReframeDialog({edl:doc,assets,selected,onApply,onClose}:{edl:Edl;assets:Asset[];selected:number;onApply:(next:Edl,shown:string|null)=>void;onClose:()=>void}) {
@@ -26,38 +29,60 @@ export function ReframeDialog({edl:doc,assets,selected,onApply,onClose}:{edl:Edl
   const tall=target(doc);
   const edl=tall?formatView(tall.doc,tall.id):doc;
   const [index,setIndex]=useState(selected), [shots,setShots]=useState<Shot[]>([]), [active,setActive]=useState(0);
-  const [shape,setShape]=useState<Shape>({width:1920,height:1080}), [status,setStatus]=useState("idle"), [error,setError]=useState("");
-  const [frame,setFrame]=useState(0), [job,setJob]=useState<string|null>(null);
+  const [shape,setShape]=useState<Shape>({width:1920,height:1080}), [error,setError]=useState("");
+  const [frame,setFrame]=useState(0);
   const generation=useRef(0);
   const [poll,setPoll]=useState(0);
   const element=edl.main.elements[index], clip=element?.type === "video" ? element : undefined, asset=assets.find(a=>clip?.src===`asset:${a.id}`);
   const start=clip?.trimStart ?? 0, duration=clip?.duration ?? Math.max(0,(asset?.duration ?? 0)-start-(clip?.trimEnd ?? 0));
-  const busy=["starting","running","preparing"].includes(status);
+  // A long clip is read in parts of up to five minutes; the shots are joined once every part is done.
+  const [parts,setParts]=useState<Part[]>([]);
+  const busy=parts.some(p=>BUSY.includes(p.status));
+  const failed=parts.filter(p=>p.status==="failed"||p.status==="error");
+  const done=parts.filter(p=>p.status==="done").length;
   useEffect(()=>{
-    ++generation.current;setJob(null);setStatus("idle");setError("");setActive(0);setFrame(start);
+    ++generation.current;setActive(0);setFrame(start);
+    setParts(duration>0?analysisWindows(start,start+duration).map(w=>({...w,status:"idle"})):[]);
     setShots(clip?.type === "video" ? [{from:start,to:start+duration,layout:clip.split?"split":clip.crop?"speaker":"whole",review:false,reason:"Current framing",subjects:[],top:clip.split?.top ?? clip.crop ?? whole,bottom:clip.split?.bottom ?? whole}] : []);
     return ()=>{++generation.current;};
   },[index]);
-  const accept=(r:Result)=>{
-    setPoll(v=>v+1);setStatus(r.status);setJob(r.id ?? null);setError(r.error ?? "");if(r.shape)setShape(r.shape);
-    if(r.shots){setShots(r.shots.filter(s=>s.to>start && s.from<start+duration));setActive(0);setFrame(start);}
+  const settle=(i:number,r:Result)=>{
+    if(r.shape)setShape(r.shape);
+    setParts(ps=>ps.map((p,k)=>k===i?{...p,id:r.id ?? p.id,status:r.status,error:r.error ?? undefined,shots:r.shots ?? p.shots}:p));
   };
-  const analyze=async(retry=false)=>{
-    const seq=++generation.current;setError("");setStatus("starting");
-    try{const r=await api.send<Result>("POST","/api/reframe",{asset_id:asset?.id,start,end:start+duration,retry});if(seq===generation.current)accept(r);}
-    catch(e){if(seq===generation.current){setStatus("error");setError((e as Error).message);}}
+  const fail=(i:number,message:string)=>setParts(ps=>ps.map((p,k)=>k===i?{...p,status:"error",error:message}:p));
+  const ask=(p:Part,retry:boolean)=>api.send<Result>("POST","/api/reframe",{asset_id:asset?.id,start:p.from,end:p.to,retry});
+  const analyze=async()=>{
+    const seq=++generation.current;
+    await Promise.all(parts.map(async(p,i)=>{
+      if(p.status==="done"||BUSY.includes(p.status))return;
+      // Checking on an analysis that could not be read starts nothing new.
+      if(p.status==="error"&&p.id){setParts(ps=>ps.map((q,k)=>k===i?{...q,status:"running",error:undefined}:q));return;}
+      setParts(ps=>ps.map((q,k)=>k===i?{...q,status:"starting",error:undefined}:q));
+      try{const r=await ask(p,p.status==="failed");if(seq===generation.current)settle(i,r);}
+      catch(e){if(seq===generation.current)fail(i,(e as Error).message);}
+    }));
+    setPoll(v=>v+1);
   };
   useEffect(()=>{
     if(!busy)return;
     const seq=generation.current;
     const timer=setTimeout(async()=>{
-      try{
-        const r=job ? await api.get<Result>(`/api/reframe/${job}`) : await api.send<Result>("POST","/api/reframe",{asset_id:asset?.id,start,end:start+duration});
-        if(seq===generation.current)accept(r);
-      }catch(e){if(seq===generation.current){setStatus("error");setError((e as Error).message);}}
+      await Promise.all(parts.map(async(p,i)=>{
+        if(!BUSY.includes(p.status)||p.status==="starting"&&!p.id)return;
+        try{const r=p.id ? await api.get<Result>(`/api/reframe/${p.id}`) : await ask(p,false);if(seq===generation.current)settle(i,r);}
+        catch(e){if(seq===generation.current)fail(i,(e as Error).message);}
+      }));
+      setPoll(v=>v+1);
     },4000);
     return()=>clearTimeout(timer);
-  },[status,job,poll,busy]);
+  },[busy,poll]);
+  // Every part read: its shots, in order, become the clip's.
+  useEffect(()=>{
+    if(!parts.length||parts.some(p=>p.status!=="done"))return;
+    setShots(parts.flatMap(p=>p.shots ?? []).filter(s=>s.to>start && s.from<start+duration).sort((a,b)=>a.from-b.from));
+    setActive(0);setFrame(start);
+  },[parts]);
   const shot=shots[active];
   const change=(patch:Partial<Shot>)=>setShots(v=>v.map((s,i)=>i===active?{...s,...patch,review:false}:s));
   // Without detected people, two stacked views start from the shot's left and right halves.
@@ -79,11 +104,12 @@ export function ReframeDialog({edl:doc,assets,selected,onApply,onClose}:{edl:Edl
       <label className="block text-body-sm">Video clip<select className="field w-full mt-1" disabled={busy} value={index} onChange={e=>setIndex(Number(e.target.value))}>
         {edl.main.elements.map((el,i)=>el.type==="video"?<option key={el.id} value={i}>{i+1}. {assets.find(a=>el.src===`asset:${a.id}`)?.name??"Video"} · {time(el.trimStart??0)}</option>:null)}
       </select></label>
-      <div className="flex flex-wrap gap-3 items-center"><button className={btnSecondary} disabled={busy||!asset?.media_uid||duration<=0} onClick={()=>void analyze(status==="failed")}>
-        {busy?<Loader2 className="w-4 h-4 animate-spin"/>:<Sparkles className="w-4 h-4"/>}{status==="failed"?"Retry analysis":"Analyze framing"}</button>
-        <span className="text-fine text-muted" role="status">{status==="preparing"?"Preparing video…":busy?"Reading camera shots… You can close this and return later.":"Existing analysis is reused. New analysis uses your workspace’s AI credits."}</span>
+      <div className="flex flex-wrap gap-3 items-center"><button className={btnSecondary} disabled={busy||!asset?.media_uid||duration<=0} onClick={()=>void analyze()}>
+        {busy?<Loader2 className="w-4 h-4 animate-spin"/>:<Sparkles className="w-4 h-4"/>}{failed.length?"Retry analysis":"Analyze framing"}</button>
+        <span className="text-fine text-muted" role="status">{parts.some(p=>p.status==="preparing")?"Preparing video…":busy?`Reading camera shots…${parts.length>1?` ${done} of ${parts.length} parts done.`:""} You can close this and return later.`:parts.length>1?`This clip is read in ${parts.length} parts of up to five minutes. Parts already read are reused; new ones use your workspace’s AI credits.`:"Existing analysis is reused. New analysis uses your workspace’s AI credits."}</span>
       </div>
-      {error&&<p role="alert" className="text-body-sm text-danger">{error} {job&&status==="error"&&<button className={btnSecondary} onClick={()=>{setError("");setStatus("running");}}>Check again</button>}</p>}
+      {failed.length>0&&!busy&&<p role="alert" className="text-body-sm text-danger">{parts.length>1?`${failed.length} of ${parts.length} parts could not be read. `:""}{failed[0].error}</p>}
+      {error&&<p role="alert" className="text-body-sm text-danger">{error}</p>}
       {shot&&asset&&<div className="grid sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-5">
         <div className="space-y-3 min-w-0">
           <label className="block text-body-sm">Shot<select className="field w-full mt-1" value={active} onChange={e=>{const i=Number(e.target.value);setActive(i);setFrame(Math.max(start,shots[i].from));}}>{shots.map((s,i)=><option key={i} value={i}>{time(s.from)}–{time(s.to)}{s.review?" · Review":""}</option>)}</select></label>
@@ -92,7 +118,7 @@ export function ReframeDialog({edl:doc,assets,selected,onApply,onClose}:{edl:Edl
           {shot.layout==="split"&&<p className="text-fine text-muted">After applying, select the clip and choose Adjust views to move either view, or Swap to change which is on top.</p>}
         </div>
         <div className="space-y-2 min-w-0">
-          <div className="relative aspect-[9/16] max-h-[380px] mx-auto overflow-hidden bg-inverse rounded-md" style={{width:"min(100%, 214px)"}}>
+          <div className="relative aspect-[9/16] max-h-[380px] mx-auto overflow-hidden bg-black rounded-md" style={{width:"min(100%, 214px)"}}>
             {(shot.layout==="split"?[shot.top??whole,shot.bottom??whole]:[shot.layout==="speaker"?shot.top??whole:undefined]).map((crop,i)=>{
               const height=shot.layout==="split"?960:1920;
               const place=placeClip(shape,crop,{width:1080,height},shot.layout==="whole"?"contain":"cover");
