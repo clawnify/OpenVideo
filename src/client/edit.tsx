@@ -1,5 +1,6 @@
 import { ReframeDialog } from "./reframe";
-import { AssistantPanel, useAsk } from "./assistant";
+import { AssistantPanel, JobStrip, canonical, useAsk } from "./assistant";
+import { embedded, openChat, useChatCommands, useChatContext, useHostChanges } from "@clawnify/app/client";
 // Footage edit projects — the timeline editor over EDL documents.
 //
 // Layout (the classic four-region editor grid): left rail (Media / Audio /
@@ -1089,6 +1090,7 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
       initialAssets={assets}
       initialFootage={footage}
       onOpenHighlights={() => navigate(`/edits/${id}/highlights`)}
+      onOpenProject={(other) => navigate(`/edits/${other}`)}
     />
   );
 }
@@ -1098,12 +1100,15 @@ export function EditEditor({
   initialAssets,
   initialFootage,
   onOpenHighlights,
+  onOpenProject,
 }: {
   initial: EditProject;
   initialAssets: Asset[];
   initialFootage: FootageList;
   /** Opens the footage's highlights. */
   onOpenHighlights?: () => void;
+  /** Opens another project, such as a clip the AI made. */
+  onOpenProject?: (id: string) => void;
 }) {
   const [name, setName] = useState(initial.name);
   const [brief, setBrief] = useState(initial.brief ?? "");
@@ -1223,6 +1228,36 @@ export function EditEditor({
     [commit],
   );
   const ask = useAsk(initial.id, () => edlRef.current, applyAi);
+
+  // Inside Clawnify the conversation is the dashboard's chat. It knows which
+  // project is open, offers its requests in the "/" menu, and calls this app's
+  // /instruct: the same planner as the panel, so the work is the same.
+  useChatContext({ label: "Video project", record: { type: "project", id: initial.id, label: name } });
+  useChatCommands(
+    useMemo(() => {
+      const here = `In the video project open beside this chat (OpenVideo project id ${initial.id}),`;
+      return [
+        { id: "clips", label: "Vertical clips from a talk", description: "Short 9:16 clips, each opening on a hook", prompt: `${here} make 5 vertical clips of about 45 seconds from its long video, each opening on a strong hook.` },
+        { id: "assemble", label: "Video from my clips", description: "A 30 second cut from the clips added", prompt: `${here} make a 30 second video from the clips I added.` },
+        { id: "clean", label: "Remove the pauses", description: "Dead air, false starts and filler", prompt: `${here} remove the pauses and dead air from every clip.` },
+        { id: "frame", label: "Frame for vertical", description: "Keep the speaker in a 9:16 frame", prompt: `${here} frame the cut for vertical 9:16, keeping the speaker in frame.` },
+      ];
+    }, [initial.id]),
+  );
+  // The chat changed this project: take the cut it wrote as one undo step.
+  // A change typed here in the last moment before is not lost: undo has it.
+  useHostChanges((paths) => {
+    if (!paths.some((p) => p.startsWith(`/api/projects/${initial.id}`))) return;
+    void ask.refresh();
+    void api
+      .get<EditProject>(`/api/projects/${initial.id}`)
+      .then((p) => {
+        if (canonical(p.edl) === canonical(saved.current.edl) || canonical(p.edl) === canonical(edlRef.current)) return;
+        saved.current = { ...saved.current, edl: p.edl };
+        applyAi(p.edl);
+      })
+      .catch(() => {});
+  });
 
   /** Edit the cut as the format on screen sees it; framing lands on that format, the rest on the cut. */
   const update = useCallback(
@@ -1544,6 +1579,7 @@ export function EditEditor({
         </button>
         <button
           onClick={() => {
+            if (embedded && openChat()) return;
             const open = !aiOpen;
             setAiOpen(open);
             // On a phone the conversation is its own pane.
@@ -1639,6 +1675,7 @@ export function EditEditor({
           onShowComment={showComment}
         />
         <div className={`${pane === "canvas" ? "flex" : "hidden"} lg:flex flex-1 flex-col min-w-0 min-h-0`}>
+        {embedded && <JobStrip ask={ask} onOpen={(id) => onOpenProject?.(id)} />}
         <FormatBar
           edl={edl}
           active={format}
@@ -1689,6 +1726,7 @@ export function EditEditor({
               setAiOpen(false);
               setPane("canvas");
             }}
+            onOpenProject={(id) => onOpenProject?.(id)}
           />
         ) : (
           <Inspector

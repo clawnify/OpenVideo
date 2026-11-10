@@ -6,11 +6,14 @@
 // asks back instead of guessing. A request that would watch a lot of footage
 // says so first and, on a yes, runs in the background (src/server/ask-jobs.ts):
 // the editor keeps working, the tab can close, and the result never lands on
-// top of a change made meanwhile. Auto-cut and AI reframe still run in their
-// own dialogs, opened from here, until the conversation can run them itself.
+// top of a change made meanwhile.
+//
+// Inside Clawnify the conversation is the dashboard's chat, which calls the
+// same /instruct: the editor then shows only the background work in a strip
+// (JobStrip). This panel is the chat when the app runs on its own.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Crop, Loader2, RotateCcw, Send, Sparkles, X } from "lucide-react";
+import { Crop, Film, Loader2, RotateCcw, Send, Sparkles, X } from "lucide-react";
 import { api, type Edl } from "./edit";
 import { btnGhost, btnIcon, btnPrimary, btnSecondary } from "./ui";
 
@@ -23,6 +26,13 @@ export interface AskMessage {
   asked: boolean;
   failed: boolean;
   job_id?: string | null;
+  /** Projects it made: clips cut from a long video. */
+  made?: Made[];
+}
+
+export interface Made {
+  id: string;
+  name: string;
 }
 
 export type AskJobStatus = "proposed" | "queued" | "running" | "applied" | "stale" | "failed" | "cancelled";
@@ -30,10 +40,13 @@ export type AskJobStatus = "proposed" | "queued" | "running" | "applied" | "stal
 export interface AskJob {
   id: string;
   status: AskJobStatus;
+  instruction: string;
   applied: string[];
   /** What it is doing now, while it runs. */
   doing?: string | null;
   error: string | null;
+  /** Clip projects made so far, while it runs. */
+  made?: Made[];
 }
 
 const ACTIVE: AskJobStatus[] = ["queued", "running"];
@@ -41,13 +54,14 @@ const ACTIVE: AskJobStatus[] = ["queued", "running"];
 /** Requests that show what it can do, sent as written. */
 const SUGGESTIONS = [
   "Make a 30 second video from my clips",
+  "Make 5 vertical clips with a strong hook from my talk",
   "Remove the pauses and dead air from every clip",
-  "Add a vertical 9:16 version for Reels",
+  "Frame it for vertical, keeping the speaker in frame",
   "Add a title for the first 3 seconds",
 ];
 
 /** JSON with keys in order: the server stores a cut with its keys in another order. */
-function canonical(v: unknown): string {
+export function canonical(v: unknown): string {
   if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
   if (v && typeof v === "object") {
     return `{${Object.keys(v as object)
@@ -137,6 +151,103 @@ export function useAsk(projectId: string, getEdl: () => Edl, onApplied: (edl: Ed
 
 export type Ask = ReturnType<typeof useAsk>;
 
+/** Links to the projects a request made. */
+function MadeLinks({ made, onOpen }: { made: Made[]; onOpen: (id: string) => void }) {
+  return (
+    <div className="mt-2 flex flex-col gap-1">
+      {made.map((p) => (
+        <button key={p.id} onClick={() => onOpen(p.id)} className={`${btnGhost} justify-start text-fine min-w-0`}>
+          <Film className="w-3.5 h-3.5 shrink-0" /> <span className="truncate">{p.name}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The background work, when the conversation is the dashboard's chat: what a
+ * job is doing, its controls, and the clips it made. Nothing shows while
+ * nothing needs the person.
+ */
+export function JobStrip({ ask, onOpen }: { ask: Ask; onOpen: (id: string) => void }) {
+  const { jobs, messages, notTaken, act } = ask;
+  const [acting, setActing] = useState<string | null>(null);
+  const [err, setErr] = useState("");
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  const doAct = async (id: string, action: "run" | "cancel" | "apply") => {
+    setActing(`${id}:${action}`);
+    setErr("");
+    try {
+      await act(id, action);
+    } catch (e) {
+      setErr(String((e as Error).message));
+    } finally {
+      setActing(null);
+    }
+  };
+  // The newest message of each finished job that made clips, until dismissed.
+  const madeBy = new Map<string, Made[]>();
+  for (const m of messages ?? []) if (m.job_id && m.made?.length) madeBy.set(m.job_id, m.made);
+  const shown = jobs.filter(
+    (j) =>
+      !dismissed.has(j.id) &&
+      (j.status === "proposed" || ACTIVE.includes(j.status) || j.status === "stale" || notTaken.has(j.id) || (j.status === "applied" && madeBy.has(j.id))),
+  );
+  if (!shown.length && !err) return null;
+  const close = (id: string) => setDismissed((d) => new Set(d).add(id));
+  return (
+    <div className="border-b border-border bg-surface px-3 py-2 space-y-2" aria-live="polite">
+      {shown.map((j) => {
+        const busy = acting !== null;
+        return (
+          <div key={j.id} className="text-fine">
+            <div className="flex items-center gap-2 min-w-0">
+              {ACTIVE.includes(j.status) ? <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" /> : <Sparkles className="w-3.5 h-3.5 shrink-0 text-muted" />}
+              <span className="flex-1 min-w-0 truncate" title={j.instruction}>
+                {j.status === "proposed"
+                  ? `Waiting for a yes: ${j.instruction}`
+                  : j.status === "queued"
+                    ? "Starting in the background…"
+                    : j.status === "running"
+                      ? `${j.doing ?? "Working"}…`
+                      : j.status === "applied"
+                        ? `Made ${madeBy.get(j.id)!.length} clips`
+                        : "A change from the chat is waiting: the cut changed while it ran"}
+              </span>
+              {j.status === "proposed" && (
+                <>
+                  <button onClick={() => doAct(j.id, "run")} disabled={busy} className={`${btnPrimary} h-7 text-fine`}>Run</button>
+                  <button onClick={() => doAct(j.id, "cancel")} disabled={busy} className={`${btnGhost} h-7 text-fine`}>Not now</button>
+                </>
+              )}
+              {ACTIVE.includes(j.status) && (
+                <button onClick={() => doAct(j.id, "cancel")} disabled={busy} className={`${btnGhost} h-7 text-fine`}>Cancel</button>
+              )}
+              {(j.status === "stale" || notTaken.has(j.id)) && (
+                <>
+                  <button onClick={() => doAct(j.id, "apply")} disabled={busy} className={`${btnSecondary} h-7 text-fine`}>Apply anyway</button>
+                  {j.status === "stale" && (
+                    <button onClick={() => doAct(j.id, "cancel")} disabled={busy} className={`${btnGhost} h-7 text-fine`}>Discard</button>
+                  )}
+                </>
+              )}
+              {j.status === "applied" && (
+                <button onClick={() => close(j.id)} className={btnIcon} aria-label="Dismiss">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+            {(j.status === "applied" ? madeBy.get(j.id) : j.made)?.length ? (
+              <MadeLinks made={(j.status === "applied" ? madeBy.get(j.id) : j.made)!} onOpen={onOpen} />
+            ) : null}
+          </div>
+        );
+      })}
+      {err && <p className="text-fine text-danger break-words">{err}</p>}
+    </div>
+  );
+}
+
 export function AssistantPanel({
   projectId,
   ask,
@@ -147,6 +258,7 @@ export function AssistantPanel({
   onAutocut,
   onReframe,
   onClose,
+  onOpenProject,
 }: {
   projectId: string;
   ask: Ask;
@@ -158,6 +270,7 @@ export function AssistantPanel({
   onAutocut: () => void;
   onReframe: () => void;
   onClose: () => void;
+  onOpenProject: (id: string) => void;
 }) {
   const { messages, setMessages, jobs, notTaken, loadErr, refresh, act } = ask;
   const [draft, setDraft] = useState("");
@@ -250,6 +363,7 @@ export function AssistantPanel({
               Cancel
             </button>
           </div>
+          {job.made?.length ? <MadeLinks made={job.made} onOpen={onOpenProject} /> : null}
           {job.applied.length > 0 && (
             <ul className="mt-1.5 space-y-0.5 text-faint">
               {job.applied.map((a, i) => (
@@ -343,6 +457,7 @@ export function AssistantPanel({
                   ))}
                 </ul>
               )}
+              {m.made?.length ? <MadeLinks made={m.made} onOpen={onOpenProject} /> : null}
               {job && controls(job)}
             </div>
           );
