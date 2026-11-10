@@ -44,7 +44,8 @@ import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { findFormat, renderDoc } from "../shared/formats";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
-import { instructEdit, type InstructHighlight } from "./instruct";
+import { HISTORY_TURNS, instructEdit, type InstructHighlight, type InstructTurn } from "./instruct";
+import { caller, user } from "@clawnify/app";
 import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
 import { COMMENTS_PER_MINUTE, MAX_PROJECT_COMMENTS, parseComment, type PublicComment } from "./comments";
@@ -778,6 +779,42 @@ async function instructHighlights(projectId: string): Promise<InstructHighlight[
   }));
 }
 
+/** Who asked, as the conversation shows it: a person's name, or what kind of caller. */
+function askAuthor(c: Context): string | null {
+  const u = user(c);
+  if (u) return u.name ?? u.email ?? null;
+  const who = caller(c);
+  return who === "agent" || who === "agent-browser" ? "Agent" : null;
+}
+
+/** The project's AI conversation, oldest first: the last 100 messages. */
+app.get("/api/projects/:id/ask", async (c) => {
+  const id = c.req.param("id");
+  const rows = await query<{ id: string; role: string; text: string; author: string | null; applied: string | null; asked: number; failed: number; created_at: string }>(
+    `SELECT * FROM (SELECT id, role, text, author, applied, asked, failed, created_at, rowid AS r FROM ask_messages
+      WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 100) ORDER BY created_at, r`,
+    [id],
+  );
+  return c.json({
+    messages: rows.map((m) => ({
+      id: m.id,
+      role: m.role,
+      text: m.text,
+      author: m.author,
+      applied: m.applied ? (JSON.parse(m.applied) as string[]) : [],
+      asked: m.asked === 1,
+      failed: m.failed === 1,
+      created_at: m.created_at,
+    })),
+  });
+});
+
+/** Start the conversation over: the cut and its undo history are untouched. */
+app.delete("/api/projects/:id/ask", async (c) => {
+  await run("DELETE FROM ask_messages WHERE project_id = ?", [c.req.param("id")]);
+  return c.json({ ok: true });
+});
+
 app.post("/api/projects/:id/instruct", async (c) => {
   const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
   if (!project) return c.json({ error: "Project not found" }, 404);
@@ -788,6 +825,15 @@ app.post("/api/projects/:id/instruct", async (c) => {
 
   const current = validateEdl(JSON.parse(project.edl));
   if ("invalid" in current) return c.json(current.invalid, 422);
+
+  // The conversation so far, so a follow-up knows what it refers to.
+  const history: InstructTurn[] = (
+    await query<{ role: "user" | "assistant"; text: string }>(
+      `SELECT role, text FROM (SELECT role, text, created_at, rowid AS r FROM ask_messages
+        WHERE project_id = ? AND failed = 0 ORDER BY created_at DESC, rowid DESC LIMIT ?) ORDER BY created_at, r`,
+      [project.id, HISTORY_TURNS],
+    )
+  ).map((m) => ({ role: m.role, text: m.text }));
 
   // The model reads clip names, not asset ids; lengths say where a clip ends.
   const names = new Map<string, string>();
@@ -821,14 +867,35 @@ app.post("/api/projects/:id/instruct", async (c) => {
       };
     },
     await instructHighlights(project.id),
+    history,
   );
-  if ("failure" in out) return c.json(out.failure, 422);
+  const author = askAuthor(c);
+  // A failed exchange stays on screen but out of what the model reads next.
+  await run("INSERT INTO ask_messages (project_id, role, text, author, failed) VALUES (?, 'user', ?, ?, ?)", [
+    project.id,
+    instruction,
+    author,
+    "failure" in out ? 1 : 0,
+  ]);
+  if ("failure" in out) {
+    await run("INSERT INTO ask_messages (project_id, role, text, failed) VALUES (?, 'assistant', ?, 1)", [
+      project.id,
+      out.failure.detail,
+    ]);
+    return c.json(out.failure, 422);
+  }
+  await run("INSERT INTO ask_messages (project_id, role, text, applied, asked) VALUES (?, 'assistant', ?, ?, ?)", [
+    project.id,
+    out.said,
+    JSON.stringify(out.applied),
+    out.asked ? 1 : 0,
+  ]);
 
   await run("UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ?", [
     JSON.stringify(out.edl),
     project.id,
   ]);
-  return c.json({ edl: out.edl, said: out.said, applied: out.applied });
+  return c.json({ edl: out.edl, said: out.said, applied: out.applied, asked: out.asked === true });
 });
 
 app.post("/api/projects/:id/autocut", async (c) => {
@@ -996,6 +1063,7 @@ app.delete("/api/projects/:id", async (c) => {
   if (keys.length) await deleteUpload(keys).catch(() => {});
   await run("DELETE FROM share_links WHERE project_id = ?", [id]);
   await run("DELETE FROM review_comments WHERE project_id = ?", [id]);
+  await run("DELETE FROM ask_messages WHERE project_id = ?", [id]);
   await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM edit_projects WHERE id = ?", [id]);
   return c.json({ ok: true });

@@ -274,6 +274,11 @@ globalThis.fetch = async (input, init = {}) => {
     world.prompts.push(prompt);
     if (world.beforeModel) { const before = world.beforeModel; world.beforeModel = null; await before(); }
     if (world.modelRefusal) return new Response(world.modelRefusal.body, { status: world.modelRefusal.status });
+    // Ask: the editor's operations are offered as tools; answer from the queue.
+    if (body.tools && world.askReplies) {
+      world.askBodies.push(body);
+      return json(200, { choices: [{ message: world.askReplies.shift() ?? { content: "Done." } }] });
+    }
     // Choosing the best: the b-roll, last listed first, then the soundbites as
     // stand-ins. By score alone the soundbites (5) would come first.
     if (/^PICK 1: /m.test(prompt)) {
@@ -1298,6 +1303,49 @@ assert.equal((await call("GET", `/api/projects/${pc}/comments`)).data.comments.l
 await call("DELETE", `/api/projects/${pc}`);
 assert.equal(db.prepare("SELECT COUNT(*) AS n FROM review_comments WHERE project_id = ?").get(pc).n, 0, "deleting the project deletes its comments");
 console.log("14 ok: review comments off by default, on per link, pinned to an export, resolved, rate-limited, deleted with the project");
+// Ask is a conversation: a question back changes nothing, a follow-up reads
+// what came before, a failed exchange is shown but not read, and starting over
+// or deleting the project clears it.
+{
+  r = await call("POST", "/api/projects", { name: "Ask" });
+  const pa = r.data.id;
+  const [one, two] = (await call("GET", "/api/assets")).data.filter((a) => a.content_type.startsWith("video/")).slice(0, 2);
+  assert.ok(one && two, "two library videos to edit");
+  r = await call("PUT", `/api/projects/${pa}`, { name: "Ask", edl: { version: 1, output: { width: 1280, height: 720, fps: 30 },
+    main: { elements: [{ id: "a", type: "video", src: `asset:${one.id}`, duration: 1 }, { id: "b", type: "video", src: `asset:${two.id}`, duration: 1 }] }, overlays: [], audio: [] } });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  world.askBodies = [];
+  world.askReplies = [{ tool_calls: [{ id: "q", function: { name: "ask_user", arguments: JSON.stringify({ question: "Which talk, the keynote or the panel?" }) } }] }];
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "make clips from the talk" });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.deepEqual([r.data.asked, r.data.said, r.data.applied], [true, "Which talk, the keynote or the panel?", []]);
+  assert.equal(r.data.edl.main.elements.length, 2, "a question changes nothing");
+  world.askReplies = [{ tool_calls: [{ id: "d", function: { name: "delete_clip", arguments: JSON.stringify({ clip: 1 }) } }] }, { content: "Kept the keynote." }];
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "the keynote" });
+  assert.equal(r.data.edl.main.elements.length, 1);
+  const turns = world.askBodies[1].messages.slice(1, 3).map((m) => [m.role, m.content]);
+  assert.deepEqual(turns, [["user", "make clips from the talk"], ["assistant", "Which talk, the keynote or the panel?"]], "the follow-up reads the question it answers");
+  world.modelRefusal = { status: 500, body: "{}" };
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "now make it pink" });
+  world.modelRefusal = null;
+  assert.equal(r.status, 422);
+  r = await call("GET", `/api/projects/${pa}/ask`);
+  assert.deepEqual(r.data.messages.map((m) => [m.role, m.asked, m.failed]), [
+    ["user", false, false], ["assistant", true, false], ["user", false, false], ["assistant", false, false], ["user", false, true], ["assistant", false, true],
+  ]);
+  assert.ok(r.data.messages[3].applied.length === 1, JSON.stringify(r.data.messages[3]));
+  world.askBodies = [];
+  world.askReplies = [{ content: "Nothing to change." }];
+  await call("POST", `/api/projects/${pa}/instruct`, { instruction: "and again" });
+  assert.ok(!world.askBodies[0].messages.some((m) => m.content === "now make it pink"), "a failed exchange is not read");
+  assert.equal((await call("DELETE", `/api/projects/${pa}/ask`)).status, 200);
+  assert.equal((await call("GET", `/api/projects/${pa}/ask`)).data.messages.length, 0, "starting over clears the conversation");
+  await call("POST", `/api/projects/${pa}/instruct`, { instruction: "one more" });
+  await call("DELETE", `/api/projects/${pa}`);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_messages WHERE project_id = ?").get(pa).n, 0, "deleted with the project");
+  world.askReplies = null;
+  console.log("16 ok: Ask asks back without changing anything, a follow-up reads the question, a failure is shown but not read, start over and project delete clear it");
+}
 console.log("ALL OK");
 
 // 14. Library footage: an existing upload can be analysed by any project,

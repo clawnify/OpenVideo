@@ -409,3 +409,22 @@ CREATE INDEX IF NOT EXISTS idx_review_comments_project ON review_comments(projec
 -- The model's own reply to a framing analysis, kept so a suggestion that fell
 -- back to the whole shot can be traced (src/server/reframe.ts).
 ALTER TABLE video_reframes ADD COLUMN answer TEXT;
+
+-- The project's AI conversation: what people (and agents) asked and what the
+-- editor answered, oldest first. The model reads the last few turns so a
+-- follow-up ("shorter", "a square one too") knows what it refers to. `applied`
+-- is a JSON list of the changes made; `asked` is 1 when the answer was a
+-- question back instead of a change (src/server/instruct.ts).
+CREATE TABLE IF NOT EXISTS ask_messages (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  project_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+  text TEXT NOT NULL,
+  author TEXT,
+  applied TEXT,
+  asked INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ask_messages_project ON ask_messages(project_id, created_at);

@@ -218,3 +218,42 @@ describe("highlights in Ask", () => {
     expect(bodies[0].messages[0].content).toContain("Prefer kept ones, then ones marked best, then higher scores");
   });
 });
+
+describe("Ask as a conversation", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("reads the last turns before the request, oldest first", async () => {
+    const bodies: { messages: { role: string; content: string }[] }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(init.body as string));
+      return new Response(JSON.stringify({ choices: [{ message: { content: "Done." } }] }));
+    }));
+    const history = Array.from({ length: 20 }, (_, i) => ({ role: (i % 2 ? "assistant" : "user") as "user" | "assistant", text: `turn ${i}` }));
+    await instructEdit(edl(), "shorter", new Map(), { openrouterKey: "k" }, new Map(), undefined, [], history);
+    const m = bodies[0].messages;
+    expect(m[0].role).toBe("system");
+    expect(m.slice(1, -1).map((x) => x.content)).toEqual(history.slice(-12).map((t) => t.text));
+    expect(m.at(-1)!.content).toContain("What to change: shorter");
+  });
+
+  it("stops at a question and changes nothing", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { tool_calls: [
+      { id: "1", function: { name: "ask_user", arguments: JSON.stringify({ question: "Which of the two talks?" }) } },
+      { id: "2", function: { name: "delete_clip", arguments: JSON.stringify({ clip: 0 }) } },
+    ] } }] }))));
+    const out = await instructEdit(edl(), "make clips from the talk", new Map(), { openrouterKey: "k" });
+    expect(out).toMatchObject({ said: "Which of the two talks?", asked: true, applied: [] });
+    if ("edl" in out) expect(out.edl.main.elements).toHaveLength(2);
+  });
+
+  it("keeps a change made before the question", async () => {
+    let round = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: round++ === 0
+      ? { tool_calls: [{ id: "1", function: { name: "delete_clip", arguments: JSON.stringify({ clip: 1 }) } }] }
+      : { tool_calls: [{ id: "2", function: { name: "ask_user", arguments: "{}" } }] } }] }))));
+    const out = await instructEdit(edl(), "drop the second clip, then ask", new Map(), { openrouterKey: "k" });
+    expect(out).toMatchObject({ asked: true, said: "Could you say a little more about what you want?" });
+    if ("edl" in out) expect(out.edl.main.elements).toHaveLength(1);
+  });
+});
+
