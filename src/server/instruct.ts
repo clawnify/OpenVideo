@@ -456,6 +456,31 @@ export function apply(
 }
 
 /** Run the clip analysis on one clip's window and keep only what it keeps. */
+/**
+ * Seconds of footage clean_up_clip would watch for this call: the clip's
+ * window in its source. Infinity when the end is unknown, so it never counts
+ * as quick.
+ */
+export function watchSeconds(draft: Edl, args: Record<string, unknown>, sourceSeconds: Map<string, number>): number {
+  const el = draft.main.elements[Number(args.clip)];
+  if (!el || el.type !== "video") return 0;
+  const start = el.trimStart ?? 0;
+  const length = sourceSeconds.get(el.src);
+  const end = el.duration !== undefined ? start + el.duration : length !== undefined ? length - (el.trimEnd ?? 0) : undefined;
+  return end === undefined ? Infinity : Math.max(0, end - start);
+}
+
+/** What a request answered inline may watch; past it, the request runs in the background. */
+export const QUICK_WATCH_SECONDS = 180;
+
+/** A request that needs more watching than a quick answer allows: nothing was changed. */
+export interface NeedsBackground {
+  /** Clips the model asked to watch so far: at least this many. */
+  clips: number;
+  /** Seconds of footage those clips hold (Infinity when one's length is unknown). */
+  seconds: number;
+}
+
 export async function cleanUp(
   draft: Edl,
   args: Record<string, unknown>,
@@ -583,7 +608,14 @@ export async function instructEdit(
   highlights: InstructHighlight[] = [],
   /** The conversation so far, oldest first; only the last HISTORY_TURNS are read. */
   history: InstructTurn[] = [],
-): Promise<{ edl: Edl; said: string; applied: AppliedOp[]; asked?: true } | { failure: InstructFailure | EdlInvalid }> {
+  /** Seconds of footage this run may watch. Past it, it stops with `background`
+   *  and changes nothing. Omitted in a background job: no limit. */
+  watchBudget?: number,
+): Promise<
+  | { edl: Edl; said: string; applied: AppliedOp[]; asked?: true }
+  | { background: NeedsBackground }
+  | { failure: InstructFailure | EdlInvalid }
+> {
   if (!cfg.openrouterKey) {
     return {
       failure: {
@@ -604,6 +636,8 @@ export async function instructEdit(
     },
   ];
   const byId = new Map(highlights.map((h) => [h.id, h]));
+  let watched = 0;
+  let watchedClips = 0;
   // Offered only when there are highlights to place.
   const ops = highlights.length ? OPS : OPS.filter((op) => op.name !== "add_highlight");
 
@@ -652,6 +686,27 @@ export async function instructEdit(
       const checked = validateEdl(draft);
       if ("invalid" in checked) return { failure: checked.invalid };
       return { edl: checked.edl, said: text || "Could you say a little more about what you want?", applied, asked: true };
+    }
+
+    // Watching footage takes a while. A quick answer may watch a little; past
+    // that the whole request moves to the background, starting over there, so
+    // nothing half-done reaches the cut.
+    if (watchBudget !== undefined) {
+      const watching = calls.filter((call) => call.function?.name === "clean_up_clip");
+      if (watching.length) {
+        const seconds = watching.reduce((sum, call) => {
+          let args: Record<string, unknown> = {};
+          try {
+            args = JSON.parse(call.function?.arguments ?? "{}") as Record<string, unknown>;
+          } catch {
+            /* counted as nothing; the run reports it */
+          }
+          return sum + watchSeconds(draft, args, sourceSeconds);
+        }, watched);
+        if (seconds > watchBudget) return { background: { clips: watchedClips + watching.length, seconds } };
+        watched = seconds;
+        watchedClips += watching.length;
+      }
     }
 
     messages.push(message as Record<string, unknown>);

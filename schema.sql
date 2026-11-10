@@ -428,3 +428,33 @@ CREATE TABLE IF NOT EXISTS ask_messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ask_messages_project ON ask_messages(project_id, created_at);
+
+-- A request that watches more footage than a quick answer allows runs in the
+-- background (src/server/ask-jobs.ts). `proposed`: told what it would watch,
+-- waiting for a yes. `queued` -> `running` -> `applied` (the cut was changed),
+-- `stale` (the cut changed while it ran, so it was kept aside: `result_edl`,
+-- applied only on request), `failed` or `cancelled`. `base_edl` is the cut it
+-- started from, so it never overwrites an edit made meanwhile.
+CREATE TABLE IF NOT EXISTS ask_jobs (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  project_id TEXT NOT NULL,
+  instruction TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('proposed', 'queued', 'running', 'applied', 'stale', 'failed', 'cancelled')),
+  clips INTEGER NOT NULL DEFAULT 0,
+  seconds REAL,
+  base_edl TEXT,
+  result_edl TEXT,
+  said TEXT,
+  applied TEXT,
+  error TEXT,
+  author TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ask_jobs_project ON ask_jobs(project_id, created_at);
+
+-- The background job an AI message belongs to, when it does.
+ALTER TABLE ask_messages ADD COLUMN job_id TEXT;

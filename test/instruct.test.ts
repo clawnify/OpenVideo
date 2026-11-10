@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { apply, cleanUp, instructEdit, type InstructHighlight } from "../src/server/instruct";
+import { apply, cleanUp, instructEdit, watchSeconds, type InstructHighlight } from "../src/server/instruct";
 import type { Edl } from "../src/server/edl";
 
 const edl = (): Edl => ({
@@ -254,6 +254,36 @@ describe("Ask as a conversation", () => {
     const out = await instructEdit(edl(), "drop the second clip, then ask", new Map(), { openrouterKey: "k" });
     expect(out).toMatchObject({ asked: true, said: "Could you say a little more about what you want?" });
     if ("edl" in out) expect(out.edl.main.elements).toHaveLength(1);
+  });
+});
+
+describe("Watching more than a quick answer allows", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const cleanUpBoth = () => vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { tool_calls: [
+    { id: "1", function: { name: "clean_up_clip", arguments: JSON.stringify({ clip: 0 }) } },
+    { id: "2", function: { name: "clean_up_clip", arguments: JSON.stringify({ clip: 1 }) } },
+  ] } }] }))));
+
+  it("measures a clip's window, and an unknown end as too long", () => {
+    expect(watchSeconds(edl(), { clip: 0 }, new Map())).toBe(20);
+    expect(watchSeconds(edl(), { clip: 1 }, new Map([["asset:two", 300]]))).toBe(300);
+    expect(watchSeconds(edl(), { clip: 1 }, new Map())).toBe(Infinity);
+  });
+
+  it("stops before watching anything, and changes nothing", async () => {
+    cleanUpBoth();
+    const analyze = vi.fn();
+    const out = await instructEdit(edl(), "tighten everything", new Map(), { openrouterKey: "k" }, new Map([["asset:two", 300]]), analyze, [], [], 180);
+    expect(out).toEqual({ background: { clips: 2, seconds: 320 } });
+    expect(analyze).not.toHaveBeenCalled();
+  });
+
+  it("watches inline within the limit, and without one in the background", async () => {
+    cleanUpBoth();
+    const analyze = vi.fn(async () => ({ keeps: [{ start: 0, end: 1 }], notes: "" }));
+    const lengths = new Map([["asset:two", 60]]);
+    expect(await instructEdit(edl(), "tighten", new Map(), { openrouterKey: "k" }, lengths, analyze, [], [], 180)).not.toHaveProperty("background");
+    expect(await instructEdit(edl(), "tighten", new Map(), { openrouterKey: "k" }, new Map(), analyze, [], [])).not.toHaveProperty("background");
   });
 });
 

@@ -44,7 +44,8 @@ import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { findFormat, renderDoc } from "../shared/formats";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
-import { HISTORY_TURNS, instructEdit, type InstructHighlight, type InstructTurn } from "./instruct";
+import { HISTORY_TURNS, QUICK_WATCH_SECONDS, instructEdit, type InstructHighlight, type InstructTurn } from "./instruct";
+import { applyKept, bookJob, createJob, dropProposals, jobView, listJobs, proposalText, runJob, type AskJobRow, type RunInstruction } from "./ask-jobs";
 import { caller, user } from "@clawnify/app";
 import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
@@ -787,11 +788,11 @@ function askAuthor(c: Context): string | null {
   return who === "agent" || who === "agent-browser" ? "Agent" : null;
 }
 
-/** The project's AI conversation, oldest first: the last 100 messages. */
+/** The project's AI conversation, oldest first (the last 100 messages), and its recent background jobs. */
 app.get("/api/projects/:id/ask", async (c) => {
   const id = c.req.param("id");
-  const rows = await query<{ id: string; role: string; text: string; author: string | null; applied: string | null; asked: number; failed: number; created_at: string }>(
-    `SELECT * FROM (SELECT id, role, text, author, applied, asked, failed, created_at, rowid AS r FROM ask_messages
+  const rows = await query<{ id: string; role: string; text: string; author: string | null; applied: string | null; asked: number; failed: number; job_id: string | null; created_at: string }>(
+    `SELECT * FROM (SELECT id, role, text, author, applied, asked, failed, job_id, created_at, rowid AS r FROM ask_messages
       WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 100) ORDER BY created_at, r`,
     [id],
   );
@@ -804,85 +805,129 @@ app.get("/api/projects/:id/ask", async (c) => {
       applied: m.applied ? (JSON.parse(m.applied) as string[]) : [],
       asked: m.asked === 1,
       failed: m.failed === 1,
+      job_id: m.job_id,
       created_at: m.created_at,
     })),
+    jobs: (await listJobs(id)).map((j) => jobView(j)),
   });
 });
 
-/** Start the conversation over: the cut and its undo history are untouched. */
+/** Start the conversation over: the cut and its undo history are untouched. Running jobs carry on. */
 app.delete("/api/projects/:id/ask", async (c) => {
   await run("DELETE FROM ask_messages WHERE project_id = ?", [c.req.param("id")]);
+  await dropProposals(c.req.param("id"));
   return c.json({ ok: true });
 });
+
+/** The last turns the model reads, oldest first; `before` limits them to what came before a job. */
+async function askHistory(projectId: string, before?: string): Promise<InstructTurn[]> {
+  return (
+    await query<{ role: "user" | "assistant"; text: string }>(
+      `SELECT role, text FROM (SELECT role, text, created_at, rowid AS r FROM ask_messages
+        WHERE project_id = ? AND failed = 0 ${before ? "AND created_at < ?" : ""}
+        ORDER BY created_at DESC, rowid DESC LIMIT ?) ORDER BY created_at, r`,
+      before ? [projectId, before, HISTORY_TURNS] : [projectId, HISTORY_TURNS],
+    )
+  ).map((m) => ({ role: m.role, text: m.text }));
+}
+
+/** One request against a cut, with everything the model needs from this app. */
+function instructionRunner(env: Bindings, projectId: string, watchBudget?: number): RunInstruction {
+  return async (edl, instruction, history) => {
+    // The model reads clip names, not asset ids; lengths say where a clip ends.
+    const names = new Map<string, string>();
+    const lengths = new Map<string, number>();
+    for (const row of await query<Asset>("SELECT id, name, duration FROM assets")) {
+      names.set(`asset:${row.id}`, row.name);
+      if (row.duration) lengths.set(`asset:${row.id}`, row.duration);
+    }
+    const analysisCfg = { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN ?? "", openrouterKey: env.OPENROUTER_API_KEY };
+    return instructEdit(
+      edl,
+      instruction,
+      names,
+      { openrouterKey: env.OPENROUTER_API_KEY, servicesUrl: env.SERVICES_URL },
+      lengths,
+      // What the model uses to act on what is in the footage.
+      async (assetId, window, focus) => {
+        const r = await analyzeAsset(assetId, { mode: "cuts", prompt: focus, window }, analysisCfg);
+        if ("failure" in r) return { error: r.failure.detail };
+        return {
+          keeps: r.result.cuts
+            .filter((cut) => cut.keep)
+            .sort((a, b) => a.start_ms - b.start_ms)
+            .map((cut) => ({ start: cut.start_ms / 1000, end: cut.end_ms / 1000 })),
+          notes: r.result.notes,
+        };
+      },
+      await instructHighlights(projectId),
+      history,
+      watchBudget,
+    );
+  };
+}
+
+/** Queue a job; with no queue to take it (local development), run it after the response. */
+async function startJob(c: Context<{ Bindings: Bindings }>, job: AskJobRow): Promise<boolean> {
+  if (await bookJob(c.env, new URL(c.req.url).origin, job)) return true;
+  if (c.env.CLAWNIFY_TOKEN) return false;
+  c.executionCtx.waitUntil(runJob(job.id, instructionRunner(c.env, job.project_id), askHistory).then(() => {}));
+  return true;
+}
 
 app.post("/api/projects/:id/instruct", async (c) => {
   const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
   if (!project) return c.json({ error: "Project not found" }, 404);
 
-  const b = await c.req.json<{ instruction?: string }>().catch(() => ({}) as { instruction?: string });
+  const b = await c.req
+    .json<{ instruction?: string; background?: boolean }>()
+    .catch(() => ({}) as { instruction?: string; background?: boolean });
   const instruction = b.instruction?.trim();
   if (!instruction) return c.json({ error: "invalid_request", detail: "instruction is required" }, 422);
 
   const current = validateEdl(JSON.parse(project.edl));
   if ("invalid" in current) return c.json(current.invalid, 422);
 
-  // The conversation so far, so a follow-up knows what it refers to.
-  const history: InstructTurn[] = (
-    await query<{ role: "user" | "assistant"; text: string }>(
-      `SELECT role, text FROM (SELECT role, text, created_at, rowid AS r FROM ask_messages
-        WHERE project_id = ? AND failed = 0 ORDER BY created_at DESC, rowid DESC LIMIT ?) ORDER BY created_at, r`,
-      [project.id, HISTORY_TURNS],
-    )
-  ).map((m) => ({ role: m.role, text: m.text }));
+  const author = askAuthor(c);
+  // A new request replaces a proposal nobody answered.
+  await dropProposals(project.id);
+  const userSays = (failed: boolean) =>
+    run("INSERT INTO ask_messages (project_id, role, text, author, failed) VALUES (?, 'user', ?, ?, ?)", [
+      project.id,
+      instruction,
+      author,
+      failed ? 1 : 0,
+    ]);
 
-  // The model reads clip names, not asset ids; lengths say where a clip ends.
-  const names = new Map<string, string>();
-  const lengths = new Map<string, number>();
-  for (const row of await query<Asset>("SELECT id, name, duration FROM assets")) {
-    names.set(`asset:${row.id}`, row.name);
-    if (row.duration) lengths.set(`asset:${row.id}`, row.duration);
+  // A caller that already knows it wants the background (an agent) skips the proposal.
+  if (b.background === true) {
+    await userSays(false);
+    const job = await createJob(project.id, instruction, author, "queued", null);
+    if (!(await startJob(c, job))) {
+      await run("UPDATE ask_jobs SET status = 'failed', error = ? WHERE id = ?", ["the queue could not take it", job.id]);
+      return c.json({ error: "queue_unavailable", detail: "The background queue could not take this request. Try again in a minute." }, 503);
+    }
+    const said = "Running this in the background. It applies as one step you can undo when it is done.";
+    await run("INSERT INTO ask_messages (project_id, role, text, job_id) VALUES (?, 'assistant', ?, ?)", [project.id, said, job.id]);
+    return c.json({ edl: current.edl, said, applied: [], asked: false, job: jobView(job) }, 202);
   }
 
-  const analysisCfg = {
-    servicesUrl: c.env.SERVICES_URL,
-    token: c.env.CLAWNIFY_TOKEN ?? "",
-    openrouterKey: c.env.OPENROUTER_API_KEY,
-  };
-  const out = await instructEdit(
-    current.edl,
-    instruction,
-    names,
-    { openrouterKey: c.env.OPENROUTER_API_KEY, servicesUrl: c.env.SERVICES_URL },
-    lengths,
-    // What the model uses to act on what is in the footage.
-    async (assetId, window, focus) => {
-      const r = await analyzeAsset(assetId, { mode: "cuts", prompt: focus, window }, analysisCfg);
-      if ("failure" in r) return { error: r.failure.detail };
-      return {
-        keeps: r.result.cuts
-          .filter((cut) => cut.keep)
-          .sort((a, b) => a.start_ms - b.start_ms)
-          .map((cut) => ({ start: cut.start_ms / 1000, end: cut.end_ms / 1000 })),
-        notes: r.result.notes,
-      };
-    },
-    await instructHighlights(project.id),
-    history,
-  );
-  const author = askAuthor(c);
+  const out = await instructionRunner(c.env, project.id, QUICK_WATCH_SECONDS)(current.edl, instruction, await askHistory(project.id));
   // A failed exchange stays on screen but out of what the model reads next.
-  await run("INSERT INTO ask_messages (project_id, role, text, author, failed) VALUES (?, 'user', ?, ?, ?)", [
-    project.id,
-    instruction,
-    author,
-    "failure" in out ? 1 : 0,
-  ]);
+  await userSays("failure" in out);
   if ("failure" in out) {
     await run("INSERT INTO ask_messages (project_id, role, text, failed) VALUES (?, 'assistant', ?, 1)", [
       project.id,
       out.failure.detail,
     ]);
     return c.json(out.failure, 422);
+  }
+  // Too much to watch for a quick answer: say what it would take, change nothing.
+  if ("background" in out) {
+    const job = await createJob(project.id, instruction, author, "proposed", out.background);
+    const said = proposalText(out.background);
+    await run("INSERT INTO ask_messages (project_id, role, text, asked, job_id) VALUES (?, 'assistant', ?, 1, ?)", [project.id, said, job.id]);
+    return c.json({ edl: current.edl, said, applied: [], asked: true, job: jobView(job) });
   }
   await run("INSERT INTO ask_messages (project_id, role, text, applied, asked) VALUES (?, 'assistant', ?, ?, ?)", [
     project.id,
@@ -896,6 +941,68 @@ app.post("/api/projects/:id/instruct", async (c) => {
     project.id,
   ]);
   return c.json({ edl: out.edl, said: out.said, applied: out.applied, asked: out.asked === true });
+});
+
+/** One background job, with the cut it started from and its result. */
+app.get("/api/projects/:id/ask/jobs/:job", async (c) => {
+  const job = await get<AskJobRow>("SELECT * FROM ask_jobs WHERE id = ? AND project_id = ?", [c.req.param("job"), c.req.param("id")]);
+  if (!job) return c.json({ error: "not_found" }, 404);
+  return c.json(jobView(job, true));
+});
+
+/** Yes to a proposal: queue it. */
+app.post("/api/projects/:id/ask/jobs/:job/run", async (c) => {
+  const job = await get<AskJobRow>(
+    "UPDATE ask_jobs SET status = 'queued', updated_at = datetime('now') WHERE id = ? AND project_id = ? AND status = 'proposed' RETURNING *",
+    [c.req.param("job"), c.req.param("id")],
+  );
+  if (!job) return c.json({ error: "not_proposed", detail: "This request is no longer waiting for a yes. Ask again." }, 409);
+  if (!(await startJob(c, job))) {
+    await run("UPDATE ask_jobs SET status = 'proposed', updated_at = datetime('now') WHERE id = ?", [job.id]);
+    return c.json({ error: "queue_unavailable", detail: "The background queue could not take this request. Try again in a minute." }, 503);
+  }
+  return c.json(jobView(job), 202);
+});
+
+/** Stop a job: a proposal is dropped, a running one finishes but is not applied, a kept result is let go. */
+app.post("/api/projects/:id/ask/jobs/:job/cancel", async (c) => {
+  const job = await get<AskJobRow>(
+    `UPDATE ask_jobs SET status = 'cancelled', updated_at = datetime('now')
+      WHERE id = ? AND project_id = ? AND status IN ('proposed', 'queued', 'running', 'stale') RETURNING *`,
+    [c.req.param("job"), c.req.param("id")],
+  );
+  if (!job) return c.json({ error: "not_running", detail: "This request has already finished." }, 409);
+  return c.json(jobView(job));
+});
+
+/** Apply a result that was kept aside because the cut changed while it ran. */
+app.post("/api/projects/:id/ask/jobs/:job/apply", async (c) => {
+  const out = await applyKept(c.req.param("id"), c.req.param("job"));
+  if ("refused" in out) return c.json({ error: out.refused, detail: "There is no kept result to apply." }, out.refused === "not_found" ? 404 : 409);
+  return c.json(jobView(out.job, true));
+});
+
+// The platform queue's call to run a background AI request. Public, because
+// the queue calls from outside the app's sign-in; the signature is the check.
+app.post("/api/ask/step", async (c) => {
+  const body = await c.req.text();
+  const signed = await verifyDelivery(body, {
+    signature: c.req.header("X-Queue-Signature") ?? null,
+    timestamp: c.req.header("X-Queue-Timestamp") ?? null,
+    keyId: c.req.header("X-Queue-Key-Id") ?? null,
+  }).catch(() => false);
+  if (!signed) return c.json({ error: "unauthorized" }, 401);
+  let jobId = "";
+  try {
+    jobId = String((JSON.parse(body) as { job_id?: unknown }).job_id ?? "");
+  } catch {
+    /* answered below */
+  }
+  const job = await get<AskJobRow>("SELECT project_id FROM ask_jobs WHERE id = ?", [jobId]);
+  // A job that is gone, or already claimed: a 2xx so the queue does not try again.
+  if (!job) return c.json({ ok: true });
+  const done = await runJob(jobId, instructionRunner(c.env, job.project_id), askHistory);
+  return c.json({ ok: true, status: done?.status ?? "not_claimed" });
 });
 
 app.post("/api/projects/:id/autocut", async (c) => {
@@ -1064,6 +1171,7 @@ app.delete("/api/projects/:id", async (c) => {
   await run("DELETE FROM share_links WHERE project_id = ?", [id]);
   await run("DELETE FROM review_comments WHERE project_id = ?", [id]);
   await run("DELETE FROM ask_messages WHERE project_id = ?", [id]);
+  await run("DELETE FROM ask_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM edit_projects WHERE id = ?", [id]);
   return c.json({ ok: true });
