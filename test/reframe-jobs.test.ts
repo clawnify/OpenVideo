@@ -25,6 +25,8 @@ describe("shared framing jobs",()=>{
     const started=await req(input);
     const schema=vi.mocked(startVideoAnalysis).mock.calls[0][1].schema as any;
     expect(schema.properties.shots.maxItems).toBeUndefined();
+    // Room for the thinking a part of nearly five minutes needs.
+    expect(vi.mocked(startVideoAnalysis).mock.calls[0][1].max_output_tokens).toBeGreaterThanOrEqual(32000);
     expect(vi.mocked(startVideoAnalysis).mock.calls[0][1].prompt).toContain("from 0:02:00.000 to 0:02:20.000 of the whole video");
     vi.mocked(getVideoAnalysis).mockResolvedValueOnce({job_id:"job",status:"failed",error:"analyze_failed",detail:"the analysis failed — try again"});
     const after=await read(started.body.id);
