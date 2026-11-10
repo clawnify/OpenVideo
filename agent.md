@@ -413,7 +413,9 @@ seconds (0..30) of ramp from and to silence. The fade-out ends where the clip
 is last heard, which is the end of the video when the clip runs past it, so
 music laid under a shorter cut needs no trimming to end cleanly: set
 `fadeOut: 2` and leave its length alone. Output duration (sum of the main
-track) maxes at 5 minutes.
+track) maxes at 60 minutes, and so does any one clip, title or sound. A long
+export takes a while: at High quality about as long as the video itself, half
+that at Standard. Keep reading `GET /api/exports/{id}` until it settles.
 
 **Format** (the video's shape) is `output.width` x `output.height`: even
 numbers, at most 3840x2160. At the default resolution the presets are 1280x720

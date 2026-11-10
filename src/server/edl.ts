@@ -21,7 +21,8 @@ import { MAX_FORMATS } from "../shared/formats";
 
 export const MAX_ELEMENTS = 100;
 export const MAX_SOURCES = 20;
-export const MAX_OUTPUT_SECONDS = 300; // 5 minutes
+/** An hour: what the render service accepts for a background export. */
+export const MAX_OUTPUT_SECONDS = 3600;
 export const MAX_TEXT_CHARS = 500;
 export const MAX_TRACKS = 10;
 export const MAX_STROKE_PX = 80; // a fifth of the largest fontSize; drawn at most a fifth of its own (shared/outline.ts)

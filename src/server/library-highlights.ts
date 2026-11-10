@@ -60,7 +60,7 @@ libraryHighlights.post("/projects", async (c) => {
      WHERE h.id IN (${b.ids.map(() => "?").join(",")}) AND h.deleted_at IS NULL AND a.deleting = 0`, b.ids);
   if (rows.length !== b.ids.length) return c.json({ error: "source_unavailable", detail: "A selected highlight or its video is no longer available." }, 409);
   if (rows.some(h => !Number.isFinite(h.duration) || h.src_in < 0 || h.src_out > h.duration + 0.05 || h.src_out - h.src_in < 0.2 || h.src_out - h.src_in > MAX_OUTPUT_SECONDS)) {
-    return c.json({ error: "invalid_range", detail: "Each highlight must be within its video and no longer than five minutes." }, 422);
+    return c.json({ error: "invalid_range", detail: "Each highlight must be within its video and no longer than an hour." }, 422);
   }
   const clips = b.ids.map((hid: string) => {
     const h = rows.find(r => r.id === hid)!;
