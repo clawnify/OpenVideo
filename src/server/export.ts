@@ -756,6 +756,49 @@ const AUTOCUT_MAX_CLIPS = 8;
  * judged one clip at a time) and returns the sequence for the brief. Runs on
  * the org's OpenRouter key; clips reach the model as presigned URLs.
  */
+/**
+ * Put an Auto-cut result into a cut: its sequence becomes the main track
+ * (each piece plays its window, no source length needed) and its captions one
+ * overlay track, timed on the output. Other tracks are left as they are.
+ */
+export function autocutEdl(edl: Edl, clipIds: string[], result: AutocutResult): Edl {
+  const next = structuredClone(edl);
+  const rid = () => Math.random().toString(36).slice(2, 10);
+  next.main.elements = result.sequence.map((s) => ({
+    id: rid(),
+    type: "video" as const,
+    src: `asset:${clipIds[s.clip_index]}`,
+    trimStart: Math.round(s.start_ms) / 1000,
+    duration: Math.max(0.05, Math.round(s.end_ms - s.start_ms) / 1000),
+  }));
+  let at = 0;
+  const captions = [];
+  for (const s of result.sequence) {
+    const dur = Math.max(0.05, (s.end_ms - s.start_ms) / 1000);
+    if (s.caption.trim()) {
+      captions.push({
+        id: rid(),
+        type: "text" as const,
+        text: s.caption.trim(),
+        fontSize: Math.round(next.output.height * 0.055),
+        startTime: Math.round(at * 100) / 100,
+        duration: Math.min(dur, 6),
+        x: 0.5,
+        y: 0.82,
+        align: "center" as const,
+        color: "#ffffff",
+        background: "#000000a0",
+      });
+    }
+    at += dur;
+  }
+  if (captions.length) {
+    next.overlays = next.overlays ?? [];
+    next.overlays.push({ id: rid(), elements: captions });
+  }
+  return next;
+}
+
 export async function autocutAssets(
   assets: { id: string; name: string }[],
   brief: string,

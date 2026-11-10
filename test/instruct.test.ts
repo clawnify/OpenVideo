@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { apply, cleanUp, instructEdit, type InstructHighlight } from "../src/server/instruct";
+import { addClip, apply, cleanUp, instructEdit, type InstructHighlight, type InstructVideo } from "../src/server/instruct";
 import type { Edl } from "../src/server/edl";
 
 const edl = (): Edl => ({
@@ -254,6 +254,59 @@ describe("Ask as a conversation", () => {
     const out = await instructEdit(edl(), "drop the second clip, then ask", new Map(), { openrouterKey: "k" });
     expect(out).toMatchObject({ asked: true, said: "Could you say a little more about what you want?" });
     if ("edl" in out) expect(out.edl.main.elements).toHaveLength(1);
+  });
+});
+
+describe("Videos added but not in the cut", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const vids: InstructVideo[] = [
+    { id: "v1", src: "asset:new1", name: "Booth.mp4", seconds: 42, inProject: true },
+    { id: "v2", src: "asset:new2", name: "Interview.mp4", seconds: 300, inProject: false },
+  ];
+  const byId = new Map(vids.map((v) => [v.id, v]));
+  const empty = (): Edl => ({ version: 1, output: { width: 1080, height: 1920, fps: 30 }, main: { elements: [] }, overlays: [], audio: [] });
+
+  it("places a whole video, or a window of it, and refuses one outside it", () => {
+    const d = empty();
+    expect(addClip(d, { video: "v1" }, byId)).toEqual({ said: 'Added "Booth.mp4" at position 0' });
+    expect(addClip(d, { video: "v2", start: 10, seconds: 999, at: 0 }, byId)).toHaveProperty("said");
+    expect(d.main.elements.map((e) => [e.src, e.trimStart, "duration" in e ? e.duration : undefined])).toEqual([
+      ["asset:new2", 10, 290],
+      ["asset:new1", undefined, undefined],
+    ]);
+    expect(addClip(d, { video: "v9" }, byId)).toHaveProperty("error");
+    expect(addClip(d, { video: "v1", start: 50 }, byId)).toHaveProperty("error");
+  });
+
+  it("lists them, and offers add_clip and assemble only when there are some", async () => {
+    const bodies: { messages: { content: string }[]; tools: { function: { name: string } }[] }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_u: string, init: RequestInit) => {
+      bodies.push(JSON.parse(init.body as string));
+      return new Response(JSON.stringify({ choices: [{ message: { content: "Done." } }] }));
+    }));
+    const assemble = vi.fn();
+    await instructEdit(empty(), "make a reel", new Map(), { openrouterKey: "k" }, new Map(), undefined, [], [], { videos: vids, assemble });
+    await instructEdit(empty(), "make a reel", new Map(), { openrouterKey: "k" });
+    expect(bodies[0].messages.at(-1)!.content).toContain('v1: "Booth.mp4", 42.0s, in this project');
+    expect(bodies[0].messages.at(-1)!.content).toContain('v2: "Interview.mp4", 300.0s');
+    expect(bodies[0].tools.map((t) => t.function.name)).toEqual(expect.arrayContaining(["add_clip", "assemble"]));
+    expect(bodies[1].tools.map((t) => t.function.name)).not.toContain("add_clip");
+    expect(bodies[1].tools.map((t) => t.function.name)).not.toContain("assemble");
+  });
+
+  it("builds the cut from several videos in one step", async () => {
+    let round = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: round++ === 0
+      ? { tool_calls: [{ id: "a", function: { name: "assemble", arguments: JSON.stringify({ videos: ["v1", "v2", "v1"], brief: "30s reel" }) } }] }
+      : { content: "Built a 30 second reel." } }] }))));
+    const assemble = vi.fn(async (clips: { id: string; name: string }[]) => ({
+      edl: (cur: Edl) => ({ ...cur, main: { elements: clips.map((c, i) => ({ id: `p${i}`, type: "video" as const, src: `asset:${c.id}`, duration: 5 })) } }),
+      notes: "best moments",
+    }));
+    const out = await instructEdit(empty(), "make a 30s reel from my clips", new Map(), { openrouterKey: "k" }, new Map(), undefined, [], [], { videos: vids, assemble });
+    expect(assemble).toHaveBeenCalledWith([{ id: "new1", name: "Booth.mp4" }, { id: "new2", name: "Interview.mp4" }], "30s reel");
+    expect(out).toMatchObject({ said: "Built a 30 second reel.", applied: ["Built the cut from 2 videos: 2 pieces (best moments)"] });
+    if ("edl" in out) expect(out.edl.main.elements.map((e) => e.src)).toEqual(["asset:new1", "asset:new2"]);
   });
 });
 

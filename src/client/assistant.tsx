@@ -23,8 +23,8 @@ export interface AskMessage {
 
 /** Requests that show what it can do, sent as written. */
 const SUGGESTIONS = [
+  "Make a 30 second video from my clips",
   "Remove the pauses and dead air from every clip",
-  "Make a 60 second cut from the best moments",
   "Add a vertical 9:16 version for Reels",
   "Add a title for the first 3 seconds",
 ];
@@ -138,8 +138,8 @@ export function AssistantPanel({
         {empty && (
           <div>
             <p className="text-body-sm text-muted">
-              Say what you want in your own words. It edits the cut you have, and every request is one step you can
-              undo.
+              Add your clips, then say what you want in your own words: it can build the cut from them, or change the
+              one you have. Every request is one step you can undo.
             </p>
             <div className="mt-3 flex flex-col gap-1.5">
               {SUGGESTIONS.map((s) => (

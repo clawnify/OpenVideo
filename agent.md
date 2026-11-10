@@ -211,6 +211,12 @@ each file's Drive link.
 `POST /api/projects/{id}/instruct` sees the highlights too: "make a 60 second
 cut from the kept soundbites" places them with its `add_highlight` operation.
 
+`/instruct` also sees the videos that are not in the cut yet: this project's
+footage first, then the library, newest first (40 at most). "Make a 30 second
+video from my clips" works from an empty timeline: it places a video with
+`add_clip`, or builds the whole main track from up to 8 of them with
+`assemble` (Auto-cut's pass, which replaces the main track).
+
 `/instruct` is the same conversation people see in the editor's AI panel: it
 reads the last few turns, so a follow-up ("shorter") works, and your requests
 show there beside theirs. When a request could mean two things, or would watch

@@ -1340,11 +1340,25 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
   assert.ok(!world.askBodies[0].messages.some((m) => m.content === "now make it pink"), "a failed exchange is not read");
   assert.equal((await call("DELETE", `/api/projects/${pa}/ask`)).status, 200);
   assert.equal((await call("GET", `/api/projects/${pa}/ask`)).data.messages.length, 0, "starting over clears the conversation");
+  // From an empty timeline: the request sees the library's videos and places one.
+  r = await call("POST", "/api/projects", { name: "From my clips" });
+  const pe = r.data.id;
+  world.askBodies = [];
+  world.askReplies = [{ tool_calls: [{ id: "c", function: { name: "add_clip", arguments: JSON.stringify({ video: "v1", seconds: 3 }) } }] }, { content: "Added your clip." }];
+  r = await call("POST", `/api/projects/${pe}/instruct`, { instruction: "use my newest clip" });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  const listed = world.askBodies[0].messages.at(-1).content;
+  assert.match(listed, /Videos that can be added/);
+  assert.ok(world.askBodies[0].tools.some((t) => t.function.name === "add_clip"));
+  assert.equal(r.data.edl.main.elements.length, 1);
+  assert.equal(r.data.edl.main.elements[0].duration, 3);
+  assert.equal((await call("GET", `/api/projects/${pe}`)).data.edl.main.elements.length, 1, "saved");
+  await call("DELETE", `/api/projects/${pe}`);
   await call("POST", `/api/projects/${pa}/instruct`, { instruction: "one more" });
   await call("DELETE", `/api/projects/${pa}`);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_messages WHERE project_id = ?").get(pa).n, 0, "deleted with the project");
   world.askReplies = null;
-  console.log("16 ok: Ask asks back without changing anything, a follow-up reads the question, a failure is shown but not read, start over and project delete clear it");
+  console.log("16 ok: Ask asks back without changing anything, a follow-up reads the question, a failure is shown but not read, start over and project delete clear it; from an empty timeline it places a library video");
 }
 console.log("ALL OK");
 
