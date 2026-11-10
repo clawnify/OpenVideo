@@ -44,9 +44,9 @@ import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { findFormat, renderDoc } from "../shared/formats";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
-import { HISTORY_TURNS, instructEdit, type InstructHighlight, type InstructTurn } from "./instruct";
+import { HISTORY_TURNS, instructEdit, type Assembler, type InstructHighlight, type InstructTurn, type InstructVideo } from "./instruct";
 import { caller, user } from "@clawnify/app";
-import { analyzeAsset, autocutAssets, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
+import { analyzeAsset, autocutAssets, autocutEdl, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
 import { COMMENTS_PER_MINUTE, MAX_PROJECT_COMMENTS, parseComment, type PublicComment } from "./comments";
 
@@ -779,6 +779,40 @@ async function instructHighlights(projectId: string): Promise<InstructHighlight[
   }));
 }
 
+/** How many videos the model is shown it may add. */
+const MAX_LISTED_VIDEOS = 40;
+
+/**
+ * Videos the model may add to the cut: this project's footage first, then the
+ * library, newest first. Reading only: nothing is attached or analysed here.
+ */
+async function instructVideos(projectId: string): Promise<InstructVideo[]> {
+  const rows = await query<{ id: string; name: string; duration: number | null; in_project: number }>(
+    `SELECT a.id, a.name, a.duration,
+            EXISTS (SELECT 1 FROM project_footage f WHERE f.project_id = ? AND f.asset_id = a.id AND f.status = 'ready') AS in_project
+       FROM assets a
+      WHERE a.content_type LIKE 'video/%' AND a.deleting = 0
+      ORDER BY in_project DESC, a.created_at DESC, a.id
+      LIMIT ?`,
+    [projectId, MAX_LISTED_VIDEOS],
+  );
+  return rows.map((r, i) => ({ id: `v${i + 1}`, src: `asset:${r.id}`, name: r.name, seconds: r.duration ?? null, inProject: r.in_project === 1 }));
+}
+
+/** Auto-cut, for the conversation: the project's brief comes first, the request's after it. */
+function assembler(env: Bindings, projectBrief: string | null): Assembler | undefined {
+  if (!env.CLAWNIFY_TOKEN) return undefined;
+  return async (clips, brief) => {
+    const cut = await autocutAssets(clips, [projectBrief, brief].filter((x) => x?.trim()).join(" — "), {
+      servicesUrl: env.SERVICES_URL,
+      token: env.CLAWNIFY_TOKEN!,
+      openrouterKey: env.OPENROUTER_API_KEY,
+    });
+    if ("failure" in cut) return { error: cut.failure.detail ?? cut.failure.error };
+    return { edl: (current) => autocutEdl(current, clips.map((x) => x.id), cut.result), notes: cut.result.notes };
+  };
+}
+
 /** Who asked, as the conversation shows it: a person's name, or what kind of caller. */
 function askAuthor(c: Context): string | null {
   const u = user(c);
@@ -868,6 +902,7 @@ app.post("/api/projects/:id/instruct", async (c) => {
     },
     await instructHighlights(project.id),
     history,
+    { videos: await instructVideos(project.id), assemble: assembler(c.env, project.brief) },
   );
   const author = askAuthor(c);
   // A failed exchange stays on screen but out of what the model reads next.
@@ -929,42 +964,7 @@ app.post("/api/projects/:id/autocut", async (c) => {
   });
   if ("failure" in cut) return c.json(cut.failure, 422);
 
-  // Sequence → main track (duration = play-window, no source length needed);
-  // captions → one overlay track with cumulative output-time offsets.
-  const edl = JSON.parse(project.edl) as Edl;
-  const rid = () => Math.random().toString(36).slice(2, 10);
-  edl.main.elements = cut.result.sequence.map((s) => ({
-    id: rid(),
-    type: "video" as const,
-    src: `asset:${clips[s.clip_index].id}`,
-    trimStart: Math.round(s.start_ms) / 1000,
-    duration: Math.max(0.05, Math.round(s.end_ms - s.start_ms) / 1000),
-  }));
-  let at = 0;
-  const captions = [];
-  for (const s of cut.result.sequence) {
-    const dur = Math.max(0.05, (s.end_ms - s.start_ms) / 1000);
-    if (s.caption.trim()) {
-      captions.push({
-        id: rid(),
-        type: "text" as const,
-        text: s.caption.trim(),
-        fontSize: Math.round(edl.output.height * 0.055),
-        startTime: Math.round(at * 100) / 100,
-        duration: Math.min(dur, 6),
-        x: 0.5,
-        y: 0.82,
-        align: "center" as const,
-        color: "#ffffff",
-        background: "#000000a0",
-      });
-    }
-    at += dur;
-  }
-  if (captions.length) {
-    edl.overlays = edl.overlays ?? [];
-    edl.overlays.push({ id: rid(), elements: captions });
-  }
+  const edl = autocutEdl(JSON.parse(project.edl) as Edl, clips.map((x) => x.id), cut.result);
 
   const v = validateEdl(edl);
   if ("invalid" in v) return c.json(v.invalid, 422);

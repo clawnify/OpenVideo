@@ -235,6 +235,34 @@ const OPS = [
     },
   },
   {
+    name: "add_clip",
+    description:
+      "Put one of the listed videos onto the main track: the whole video, or `seconds` of it from `start`. Use it when the person refers to videos they added that are not in the cut yet.",
+    parameters: {
+      type: "object",
+      properties: {
+        video: { type: "string", description: "the video's id as listed, e.g. v2" },
+        start: { type: "number", description: "seconds into the video to start from; 0 when left out" },
+        seconds: { type: "number", description: "how long to play; to its end when left out" },
+        at: { type: "integer", description: "0-based position on the main track to put it at; the end when left out" },
+      },
+      required: ["video"],
+    },
+  },
+  {
+    name: "assemble",
+    description:
+      "Watch up to 8 of the listed videos together and build the strongest cut from them for a brief: the best moments in order, trimmed, with captions. It REPLACES the main track. Use it for 'make a video/reel/cut from these clips'; you cannot see the footage yourself, so do not pick moments by guessing.",
+    parameters: {
+      type: "object",
+      properties: {
+        videos: { type: "array", items: { type: "string" }, description: "ids of the videos to use, as listed" },
+        brief: { type: "string", description: "what the cut is for, in the person's words: length, tone, audience" },
+      },
+      required: ["videos", "brief"],
+    },
+  },
+  {
     name: "ask_user",
     description:
       "Ask the person before changing anything: a question when the request could mean different things (which clip, which talk, how long), or your plan in a sentence or two when it would watch more than two clips. Call it alone, before any change; their answer comes back as their next message.",
@@ -493,6 +521,54 @@ export async function cleanUp(
   return { said: `Cleaned up clip ${i}: kept ${keeps.length} part${keeps.length > 1 ? "s" : ""}${removed}` };
 }
 
+/** Place a listed video on the main track. */
+export function addClip(draft: Edl, args: Record<string, unknown>, videos: Map<string, InstructVideo>): { said: string } | { error: string } {
+  const v = videos.get(String(args.video ?? ""));
+  if (!v) return { error: `there is no video "${args.video}"` };
+  const main = draft.main.elements;
+  const at = args.at === undefined ? main.length : Number(args.at);
+  if (!Number.isInteger(at) || at < 0 || at > main.length) return { error: `cannot put it at ${args.at}` };
+  const start = args.start === undefined ? 0 : Number(args.start);
+  if (!Number.isFinite(start) || start < 0 || (v.seconds !== null && start >= v.seconds)) return { error: `start ${args.start} is outside the video` };
+  let seconds = args.seconds === undefined ? undefined : Number(args.seconds);
+  if (seconds !== undefined && (!Number.isFinite(seconds) || seconds < 0.05)) return { error: `cannot play ${args.seconds} seconds` };
+  if (seconds !== undefined && v.seconds !== null) seconds = Math.min(seconds, v.seconds - start);
+  main.splice(at, 0, {
+    id: rid(),
+    type: "video",
+    src: v.src,
+    ...(start > 0 ? { trimStart: Math.round(start * 100) / 100 } : {}),
+    ...(seconds !== undefined ? { duration: Math.round(seconds * 100) / 100 } : {}),
+  });
+  return { said: `Added "${v.name}" at position ${at}` };
+}
+
+/** Build the main track from several listed videos (Auto-cut). */
+async function assembleCut(
+  draft: Edl,
+  args: Record<string, unknown>,
+  videos: Map<string, InstructVideo>,
+  assemble?: Assembler,
+): Promise<{ said: string } | { error: string }> {
+  if (!assemble) return { error: "building a cut from several videos is not available here" };
+  const ids = Array.isArray(args.videos) ? [...new Set(args.videos.map(String))] : [];
+  if (ids.length === 0) return { error: "name the videos to use" };
+  if (ids.length > MAX_ASSEMBLE) return { error: `use at most ${MAX_ASSEMBLE} videos at once` };
+  const picked = ids.map((id) => videos.get(id));
+  const missing = ids.filter((_, i) => !picked[i]);
+  if (missing.length) return { error: `there is no video ${missing.map((m) => `"${m}"`).join(", ")}` };
+  const out = await assemble(
+    picked.map((v) => ({ id: v!.src.slice(6), name: v!.name })),
+    String(args.brief ?? ""),
+  );
+  if ("error" in out) return { error: out.error };
+  const next = out.edl(draft);
+  draft.main.elements = next.main.elements;
+  draft.overlays = next.overlays;
+  const n = draft.main.elements.length;
+  return { said: `Built the cut from ${ids.length} video${ids.length > 1 ? "s" : ""}: ${n} piece${n === 1 ? "" : "s"}${out.notes ? ` (${out.notes.slice(0, 200)})` : ""}` };
+}
+
 function fades(el: { fadeIn?: number; fadeOut?: number }): string {
   const parts = [el.fadeIn && `fades in ${el.fadeIn.toFixed(1)}s`, el.fadeOut && `fades out ${el.fadeOut.toFixed(1)}s`].filter(Boolean);
   return parts.length ? `, ${parts.join(", ")}` : "";
@@ -546,6 +622,12 @@ function describeHighlights(list: InstructHighlight[]): string {
   return `\n\nHighlights from the footage (picked and scored from every clip; kept means a person chose it${best}):\n${lines.join("\n")}`;
 }
 
+function describeVideos(list: InstructVideo[]): string {
+  if (!list.length) return "";
+  const lines = list.map((v) => `  ${v.id}: "${v.name}"${v.seconds ? `, ${v.seconds.toFixed(1)}s` : ""}${v.inProject ? ", in this project" : ""}`);
+  return `\n\nVideos that can be added (this project's first, then the library, newest first):\n${lines.join("\n")}`;
+}
+
 const SYSTEM = [
   "You edit a video by calling the operations you are given. You never write the document yourself.",
   "You cannot see or hear the footage. For anything that depends on its content (pauses, dead air, filler, 'cut where needed'), call clean_up_clip on each clip concerned.",
@@ -555,8 +637,29 @@ const SYSTEM = [
   "If the request cannot be done with these operations, say so plainly instead of guessing.",
   "Earlier messages in this conversation are listed before the request; use them to resolve what 'it', 'that' or 'shorter' means. The cut shown is the current one, which may have been edited since.",
   "Call ask_user instead of guessing when the request is ambiguous, and to confirm your plan first when it would watch more than two clips. Never ask about something the request already says.",
+  "When videos are listed that are not in the cut and the person asks to make something from 'these clips' or 'my videos', build it from them: assemble for a cut that needs the best moments, add_clip to place a video as it is. If it is unclear which videos they mean, ask.",
   "When highlights are listed, they are the best parts of the footage: to build or extend a cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then ones marked best, then higher scores, and keep to the length asked for.",
 ].join(" ");
+
+/** A video the model may add: in this project's footage or in the library, newest first. */
+export interface InstructVideo {
+  /** Short id the model uses, e.g. "v1". */
+  id: string;
+  /** `asset:<id>`. */
+  src: string;
+  name: string;
+  seconds: number | null;
+  inProject: boolean;
+}
+
+/** Builds a cut from several videos (Auto-cut): their asset ids in, a sequence out. */
+export type Assembler = (
+  clips: { id: string; name: string }[],
+  brief: string,
+) => Promise<{ edl: (current: Edl) => Edl; notes: string } | { error: string }>;
+
+/** The most videos assemble watches at once, as Auto-cut. */
+export const MAX_ASSEMBLE = 8;
 
 /** One earlier turn of the conversation, as the model reads it. */
 export interface InstructTurn {
@@ -583,6 +686,8 @@ export async function instructEdit(
   highlights: InstructHighlight[] = [],
   /** The conversation so far, oldest first; only the last HISTORY_TURNS are read. */
   history: InstructTurn[] = [],
+  /** Videos it may add, and how to build a cut from several of them. */
+  more: { videos?: InstructVideo[]; assemble?: Assembler } = {},
 ): Promise<{ edl: Edl; said: string; applied: AppliedOp[]; asked?: true } | { failure: InstructFailure | EdlInvalid }> {
   if (!cfg.openrouterKey) {
     return {
@@ -600,12 +705,18 @@ export async function instructEdit(
     ...history.slice(-HISTORY_TURNS).map((t) => ({ role: t.role, content: t.text.slice(0, 2000) })),
     {
       role: "user",
-      content: `The cut right now:\n${describeEdl(draft, assetNames)}${describeHighlights(highlights)}\n\nWhat to change: ${instruction}`,
+      content: `The cut right now:\n${describeEdl(draft, assetNames)}${describeHighlights(highlights)}${describeVideos(more.videos ?? [])}\n\nWhat to change: ${instruction}`,
     },
   ];
   const byId = new Map(highlights.map((h) => [h.id, h]));
   // Offered only when there are highlights to place.
-  const ops = highlights.length ? OPS : OPS.filter((op) => op.name !== "add_highlight");
+  const videos = new Map((more.videos ?? []).map((v) => [v.id, v]));
+  const ops = OPS.filter(
+    (op) =>
+      (op.name !== "add_highlight" || highlights.length > 0) &&
+      (op.name !== "add_clip" || videos.size > 0) &&
+      (op.name !== "assemble" || (videos.size > 0 && !!more.assemble)),
+  );
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -673,7 +784,13 @@ export async function instructEdit(
         args = { ...args, clip: id === undefined ? args.clip : now };
       }
       const out =
-        name === "clean_up_clip" ? await cleanUp(draft, args, sourceSeconds, analyze) : apply(draft, name, args, byId);
+        name === "clean_up_clip"
+          ? await cleanUp(draft, args, sourceSeconds, analyze)
+          : name === "assemble"
+            ? await assembleCut(draft, args, videos, more.assemble)
+            : name === "add_clip"
+              ? addClip(draft, args, videos)
+              : apply(draft, name, args, byId);
       if ("said" in out) applied.push(out.said);
       // The model plans its next round from this, so the last answer carries
       // the cut as it now stands, positions included.
