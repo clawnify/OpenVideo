@@ -10,6 +10,7 @@
 import { get, run } from "./db";
 import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
 import { mediaState, prepareMedia } from "./media";
+import { LONG_ANALYSIS_MODEL, SHORT_ANALYSIS_SECONDS, analyzeLong, shiftToSource } from "./long-analysis";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { drawnStroke } from "../shared/outline";
 import { captionText, captionTimeline, type PlacedClip } from "../shared/captions";
@@ -516,6 +517,38 @@ export async function analyzeAsset(
   opts: { mode?: string; prompt?: string; window?: SourceWindow },
   cfg: ExportConfig,
 ): Promise<{ result: AnalyzeResult } | { failure: ExportFailure }> {
+  const mode = ["cuts", "captions", "both"].includes(opts.mode ?? "") ? opts.mode! : "both";
+
+  // Longer than the short path can carry: read on the media service (long-analysis.ts).
+  const source = await get<{ media_uid: string | null; duration: number | null }>(
+    "SELECT media_uid, duration FROM assets WHERE id = ?",
+    [assetId],
+  );
+  const span = opts.window ? opts.window.end - opts.window.start : (source?.duration ?? 0);
+  if (source?.media_uid && span > SHORT_ANALYSIS_SECONDS) {
+    const window = opts.window ?? { start: 0, end: source.duration! };
+    const long = await analyzeLong<Partial<AnalyzeResult>>(
+      cfg,
+      source.media_uid,
+      window,
+      analysisPrompt(mode, opts.prompt, window),
+      ANALYSIS_SCHEMA,
+      "analyze_failed",
+    );
+    if ("failure" in long) return long;
+    if (!long.result || !Array.isArray(long.result.cuts)) {
+      return { failure: { error: "analyze_failed", detail: "the analysis returned unparseable output — retry" } };
+    }
+    const cuts = long.result.cuts;
+    const captions = Array.isArray(long.result.captions) ? long.result.captions : [];
+    const times = [...cuts, ...captions].flatMap((c) => [c.start_ms, c.end_ms]);
+    const result = shiftResult(
+      { cuts, captions, notes: long.result.notes ?? "", model: LONG_ANALYSIS_MODEL },
+      shiftToSource(times, window),
+    );
+    return { result: withinWindow(result, window) };
+  }
+
   if (!cfg.openrouterKey) {
     return {
       failure: {
@@ -531,7 +564,6 @@ export async function analyzeAsset(
   // watching the whole source, it is told which part is in the edit.
   const cutToWindow = media.cut;
 
-  const mode = ["cuts", "captions", "both"].includes(opts.mode ?? "") ? opts.mode! : "both";
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${cfg.openrouterKey}`, "Content-Type": "application/json" },
@@ -761,6 +793,14 @@ export async function autocutAssets(
   brief: string,
   cfg: ExportConfig,
 ): Promise<{ result: AutocutResult } | { failure: ExportFailure }> {
+  if (assets.length === 0 || assets.length > AUTOCUT_MAX_CLIPS) {
+    return { failure: { error: "autocut_failed", detail: `select 1–${AUTOCUT_MAX_CLIPS} video clips` } };
+  }
+  const sources = await Promise.all(
+    assets.map((a) => get<{ media_uid: string | null; duration: number | null }>("SELECT media_uid, duration FROM assets WHERE id = ?", [a.id])),
+  );
+  if (sources.some((r) => (r?.duration ?? 0) > SHORT_ANALYSIS_SECONDS)) return autocutLong(assets, sources, brief, cfg);
+
   if (!cfg.openrouterKey) {
     return {
       failure: {
@@ -769,10 +809,6 @@ export async function autocutAssets(
       },
     };
   }
-  if (assets.length === 0 || assets.length > AUTOCUT_MAX_CLIPS) {
-    return { failure: { error: "autocut_failed", detail: `select 1–${AUTOCUT_MAX_CLIPS} video clips` } };
-  }
-
   const urls: string[] = [];
   let combined = 0;
   for (const a of assets) {
@@ -847,6 +883,89 @@ export async function autocutAssets(
     return { failure: { error: "autocut_failed", detail: "model returned an out-of-range segment — retry" } };
   }
   return { result: parsed };
+}
+
+const CLIP_CUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["segments", "notes"],
+  properties: {
+    segments: {
+      type: "array",
+      description: "The segments of this clip worth keeping, in the order they should play",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["start_ms", "end_ms", "label", "caption"],
+        properties: {
+          start_ms: { type: "integer" },
+          end_ms: { type: "integer" },
+          label: { type: "string", description: "what this segment contributes" },
+          caption: { type: "string", description: "short on-screen line for this segment, or empty" },
+        },
+      },
+    },
+    notes: { type: "string", description: "one short paragraph on the editorial choices" },
+  },
+};
+
+/**
+ * Auto-cut when a clip is longer than one combined pass can carry: each clip
+ * is read on its own on the media service, so the segments follow the clips'
+ * order. Choosing an order across clips needs them in one pass, which only
+ * the short path does. The notes say which happened.
+ */
+async function autocutLong(
+  assets: { id: string; name: string }[],
+  sources: ({ media_uid: string | null; duration: number | null } | null | undefined)[],
+  brief: string,
+  cfg: ExportConfig,
+): Promise<{ result: AutocutResult } | { failure: ExportFailure }> {
+  if (sources.some((r) => !r?.media_uid || !r.duration)) {
+    return {
+      failure: {
+        error: "autocut_failed",
+        detail: "a clip over five minutes is read on the media service, and one of these clips is stored in the app: Auto-cut fewer clips at a time",
+      },
+    };
+  }
+  const budget = Math.max(30, Math.round(240 / assets.length));
+  const read = await Promise.all(
+    assets.map((a, i) =>
+      analyzeLong<{ segments?: { start_ms: number; end_ms: number; label: string; caption: string }[]; notes?: string }>(
+        cfg,
+        sources[i]!.media_uid!,
+        { start: 0, end: sources[i]!.duration! },
+        `You are a video editor. Watch this raw clip ("${a.name}") and choose the segments worth keeping for the finished ` +
+          `video: tight in and out points, no dead air, false starts, filler or repetition, in the order they should play. ` +
+          `Give each segment an optional short on-screen caption (empty string for none; always empty if the footage already ` +
+          `shows subtitles on screen). Keep this clip's segments under ${budget} seconds in total unless the brief demands ` +
+          `otherwise. Give every timestamp in milliseconds from the start of the clip. ` +
+          (brief ? `The video's purpose: ${brief}` : "No brief was given: aim for a tight, watchable cut."),
+        CLIP_CUT_SCHEMA,
+        "autocut_failed",
+      ),
+    ),
+  );
+  const failed = read.find((r) => "failure" in r);
+  if (failed && "failure" in failed) return failed;
+  const sequence: AutocutSegment[] = read.flatMap((r, i) =>
+    "result" in r
+      ? (r.result.segments ?? [])
+          .filter((seg) => seg.end_ms > seg.start_ms && seg.start_ms >= 0 && seg.end_ms <= sources[i]!.duration! * 1000 + 500)
+          .map((seg) => ({ clip_index: i, start_ms: seg.start_ms, end_ms: seg.end_ms, label: seg.label, caption: seg.caption }))
+      : [],
+  );
+  if (sequence.length === 0) {
+    return { failure: { error: "autocut_failed", detail: "the analysis returned no usable segments — retry" } };
+  }
+  const notes = read.map((r) => ("result" in r ? (r.result.notes ?? "") : "")).filter(Boolean).join(" ");
+  return {
+    result: {
+      sequence,
+      notes: `Clips over five minutes are read one at a time, so the segments follow the clips' order. ${notes}`.trim(),
+    },
+  };
 }
 
 /** Copy the finished MP4 into this app's storage; returns the storage key. */

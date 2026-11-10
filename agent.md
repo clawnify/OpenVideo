@@ -531,7 +531,10 @@ One model pass watches **all** the clips together against the project brief
 and replaces the main track with the assembled sequence (using
 `trimStart`+`duration` windows) plus a captions overlay track. The response is
 the updated project (with `notes` on the editorial choices). Up to 8 clips.
-Review the result, adjust, export.
+When any clip is longer than five minutes, each clip is read on its own on the
+media service instead (up to 45 minutes each), so the segments follow the
+clips' order rather than one chosen across them; `notes` says so. The call
+waits for that, which takes minutes. Review the result, adjust, export.
 
 ### Analyzing footage (single-clip clean-up)
 
@@ -547,8 +550,10 @@ POST /api/assets/{id}/analyze
 
 `window` (optional, seconds into the source) is the part of the source the clip
 plays. Pass it: the model then watches only that part, which is also what lets a
-short clip cut from a long master be analysed at all (a clip that itself plays
-longer than 5 minutes is refused), and every returned timestamp stays inside it,
+short clip cut from a long master be analysed quickly. A part longer than five
+minutes is read on the media service instead (up to 45 minutes; the call waits
+for it, which takes minutes, and a video not yet prepared answers
+`analysis_preparing`: try again a few minutes later). Every returned timestamp stays inside it,
 so applying the result never brings back footage already trimmed away.
 Timestamps are always in source time, whether or not a window was given.
 
