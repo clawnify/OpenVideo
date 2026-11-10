@@ -1,4 +1,6 @@
-import { reframing } from "./reframe";
+import { reframing, readFraming, requestFraming } from "./reframe";
+import type { ClipDeps } from "./clips";
+import { parseVtt } from "../shared/transcript";
 import { backfillHighlights, libraryHighlights } from "./library-highlights";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { initDB, query, get, run } from "./db";
@@ -472,33 +474,44 @@ app.get("/api/assets/:id/source", async (c) => {
 app.get("/api/assets/:id/transcript", async (c) => {
   const asked = c.req.query("lang") ?? "en";
   const lang = /^[a-z]{2}(-[A-Z]{2})?$/.test(asked) ? asked : "en";
+  const out = await assetTranscript(c.env, c.req.param("id"), lang);
+  return "code" in out ? c.json(out.body, out.code) : c.json(out);
+});
+
+type TranscriptState =
+  | { status: "ready" | "no_speech"; vtt: string }
+  | { status: "unavailable" | "preparing" | "transcribing" }
+  | { code: 404 | 502; body: unknown };
+
+/** A video's transcript in `lang`, asked for the first time it is wanted and kept once ready. */
+async function assetTranscript(env: Bindings, assetId: string, lang: string): Promise<TranscriptState> {
   const asset = await get<Asset & { transcript: string | null; transcript_lang: string | null }>(
     "SELECT * FROM assets WHERE id = ?",
-    [c.req.param("id")],
+    [assetId],
   );
-  if (!asset) return c.json({ error: "Not found" }, 404);
+  if (!asset) return { code: 404, body: { error: "Not found" } };
 
   if (asset.transcript !== null && asset.transcript_lang === lang) {
-    return c.json({ status: asset.transcript ? "ready" : "no_speech", vtt: asset.transcript });
+    return { status: asset.transcript ? "ready" : "no_speech", vtt: asset.transcript };
   }
-  if (!asset.media_uid) return c.json({ status: "unavailable" });
+  if (!asset.media_uid) return { status: "unavailable" };
 
-  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const cfg = { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN };
   // Idempotent: asks for the transcript the first time, reports on it after.
   const prepared = await prepareMedia(cfg, asset.media_uid, lang);
   if ("failure" in prepared) {
-    if (prepared.failure.error === "not_ready") return c.json({ status: "preparing" });
-    return c.json(prepared.failure, 502);
+    if (prepared.failure.error === "not_ready") return { status: "preparing" };
+    return { code: 502, body: prepared.failure };
   }
   if (prepared.media.no_audio) {
     await run("UPDATE assets SET transcript = '', transcript_lang = ? WHERE id = ?", [lang, asset.id]);
-    return c.json({ status: "no_speech", vtt: "" });
+    return { status: "no_speech", vtt: "" };
   }
   const vtt = await mediaTranscript(cfg, asset.media_uid, lang);
-  if (vtt === null) return c.json({ status: "transcribing" });
+  if (vtt === null) return { status: "transcribing" };
   await run("UPDATE assets SET transcript = ?, transcript_lang = ? WHERE id = ?", [vtt, lang, asset.id]);
-  return c.json({ status: "ready", vtt });
-});
+  return { status: "ready", vtt };
+}
 
 /** One frame of a media-backed asset, for covers and the timeline. */
 app.get("/api/assets/:id/frame", async (c) => {
@@ -828,8 +841,8 @@ app.get("/api/projects/:id/ask", async (c) => {
   // again, and one that stopped is marked so (with its message).
   await reviveJobs(c.req.param("id"), (job) => bookJob(c.env, new URL(c.req.url).origin, job));
   const id = c.req.param("id");
-  const rows = await query<{ id: string; role: string; text: string; author: string | null; applied: string | null; asked: number; failed: number; job_id: string | null; created_at: string }>(
-    `SELECT * FROM (SELECT id, role, text, author, applied, asked, failed, job_id, created_at, rowid AS r FROM ask_messages
+  const rows = await query<{ id: string; role: string; text: string; author: string | null; applied: string | null; asked: number; failed: number; job_id: string | null; made: string | null; created_at: string }>(
+    `SELECT * FROM (SELECT id, role, text, author, applied, asked, failed, job_id, made, created_at, rowid AS r FROM ask_messages
       WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 100) ORDER BY created_at, r`,
     [id],
   );
@@ -843,6 +856,7 @@ app.get("/api/projects/:id/ask", async (c) => {
       asked: m.asked === 1,
       failed: m.failed === 1,
       job_id: m.job_id,
+      made: m.made ? (JSON.parse(m.made) as { id: string; name: string }[]) : [],
       created_at: m.created_at,
     })),
     jobs: (await listJobs(id)).map((j) => jobView(j)),
@@ -896,7 +910,67 @@ async function instructContext(env: Bindings, projectId: string): Promise<Instru
       };
     },
     assemble: assembler(env, brief),
+    clips: env.CLAWNIFY_TOKEN ? clipDeps(env) : undefined,
   };
+}
+
+/** What making clips and framing need from this app: transcripts, the model, projects, framing analysis. */
+function clipDeps(env: Bindings): ClipDeps {
+  return {
+    async transcript(assetId) {
+      // A transcript already made is used in whatever language it is in.
+      const kept = await get<{ transcript_lang: string | null }>("SELECT transcript_lang FROM assets WHERE id = ? AND transcript IS NOT NULL", [assetId]);
+      const lang = kept?.transcript_lang ?? "en";
+      const t = await assetTranscript(env, assetId, lang);
+      if ("code" in t) return { error: t.code === 404 ? "the video was removed" : "the transcript could not be read; try again" };
+      if (t.status === "unavailable") return { error: "only videos kept on the media service have a transcript; this one is in app storage" };
+      if (t.status === "preparing" || t.status === "transcribing") return { wait: t.status };
+      return { cues: t.status === "ready" ? parseVtt(t.vtt) : [], lang };
+    },
+    ask: (prompt, schema) => modelJson(env.OPENROUTER_API_KEY, prompt, schema),
+    async createProject(id, name, edl, brief) {
+      const checked = validateEdl(edl);
+      if ("invalid" in checked) throw new Error(checked.invalid.detail);
+      await run("INSERT OR IGNORE INTO edit_projects (id, name, edl, brief) VALUES (?, ?, ?, ?)", [id, name.slice(0, 100), JSON.stringify(checked.edl), brief.slice(0, 1000)]);
+    },
+    frame: async (assetId, start, end) => (await requestFraming(env, { asset_id: assetId, start, end })).body,
+    check: async (id) => (await readFraming(env, id)).body,
+    async saveFramed(projectId, before, after) {
+      const was = validateEdl(before);
+      const next = validateEdl(after);
+      if ("invalid" in was || "invalid" in next) return false;
+      // Only over the cut as it was made: a person who already edited it keeps their edit.
+      const written = await get<{ id: string }>(
+        "UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ? AND edl = ? RETURNING id",
+        [JSON.stringify(next.edl), projectId, JSON.stringify(was.edl)],
+      );
+      return !!written;
+    },
+    newId: () => crypto.randomUUID(),
+    now: () => Date.now(),
+  };
+}
+
+/** One model call that answers in JSON of `schema`, on the org's own key. */
+async function modelJson(key: string | undefined, prompt: string, schema: object): Promise<{ json: unknown } | { error: string }> {
+  if (!key) return { error: "no OpenRouter key available to this app — add one in the dashboard's API Keys settings" };
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "google/gemini-3.7-flash",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.3,
+      response_format: { type: "json_schema", json_schema: { name: "answer", strict: true, schema } },
+    }),
+  });
+  if (!res.ok) return { error: `the model call failed (${res.status})` };
+  const body = (await res.json().catch(() => null)) as { choices?: { message?: { content?: string } }[] } | null;
+  try {
+    return { json: JSON.parse(body?.choices?.[0]?.message?.content ?? "") };
+  } catch {
+    return { error: "the model's answer could not be read" };
+  }
 }
 
 /** What a background job needs from this app, and how it books its next delivery. */

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { ArrowLeft, Film } from "lucide-react";
-import { AppNav, embedded, reportLocation } from "@clawnify/app/client";
+import { AppNav, embedded, reportLocation, useHostNavigate } from "@clawnify/app/client";
 import { EditRoute, ProjectsHome, type EditProject } from "./edit";
 import { SharedHighlightsRoute } from "./library-highlights";
 import { HighlightsRoute } from "./highlights";
@@ -56,6 +56,8 @@ function HostNav({ active, path, navigate }: { active: string; path: string; nav
 
 export function App() {
   const { path, navigate } = useRouter();
+  // The dashboard's chat opens a page here (a clip it made) through this router, without a reload.
+  useHostNavigate(navigate);
   const id = decodeURIComponent(path.replace(/^\/+|\/+$/g, ""));
   const m = /^edits\/([^/]+)(\/highlights)?$/.exec(id);
   const editId = m ? m[1] : null;

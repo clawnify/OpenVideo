@@ -222,7 +222,8 @@ globalThis.fetch = async (input, init = {}) => {
       if (v.name === "HIGH.MP4") return json(200, { id: m[1], state: "error", ready: false, duration: null, error: "The video bitrate exceeded the maximum acceptable value of 200 Mbps." });
       const ready = v.polls >= 2;
       const length = v.name === "SHORT.MP4" ? 0.28 : 60;
-      return json(200, { id: m[1], state: ready ? "ready" : "inprogress", ready, duration: ready ? length : null, error: null });
+      return json(200, { id: m[1], state: ready ? "ready" : "inprogress", ready, duration: ready ? length : null, error: null,
+        ...(v.name === "TALK.MP4" ? { width: 1920, height: 1080, analysis: (v.prepares ?? 0) >= 1 ? "ready" : "none" } : {}) });
     }
     m = /^\/media\/([0-9a-f]{32})\/prepare$/.exec(u.pathname);
     if (m) {
@@ -240,7 +241,7 @@ globalThis.fetch = async (input, init = {}) => {
       if (world.analyzeRefusal) return json(world.analyzeRefusal.status, world.analyzeRefusal.body);
       const body = JSON.parse(init.body);
       const job = `job${world.jobs.size + 1}`;
-      world.jobs.set(job, { polls: 0, source: body.source });
+      world.jobs.set(job, { polls: 0, source: body.source, framing: body.schema?.properties?.shots ? body.window : null });
       return json(202, { job_id: job, status: "running" });
     }
     m = /^\/video\/analyze\/(job\d+)$/.exec(u.pathname);
@@ -248,6 +249,12 @@ globalThis.fetch = async (input, init = {}) => {
       const j = world.jobs.get(m[1]);
       j.polls++;
       if (j.polls < 2) return json(200, { status: "running" });
+      // Framing for 9:16 (server/reframe.ts): one person speaking through the stretch.
+      if (j.framing) {
+        const clock = (t) => `${Math.floor(t / 3600)}:${String(Math.floor((t % 3600) / 60)).padStart(2, "0")}:${(t % 60).toFixed(3).padStart(6, "0")}`;
+        return json(200, { status: "done", result: { shots: [{ from: clock(j.framing.start), to: clock(j.framing.end), layout: "speaker", confidence: "high", reason: "one person speaking",
+          subjects: [{ label: "guest", region: { x: 0.4, y: 0.1, width: 0.2, height: 0.6 } }] }] } });
+      }
       return json(200, {
         status: "done",
         result: {
@@ -277,7 +284,12 @@ globalThis.fetch = async (input, init = {}) => {
     // Ask: the editor's operations are offered as tools; answer from the queue.
     if (body.tools && world.askReplies) {
       world.askBodies.push(body);
-      return json(200, { choices: [{ message: world.askReplies.shift() ?? { content: "Done." } }] });
+      const next = world.askReplies.shift();
+      return json(200, { choices: [{ message: (typeof next === "function" ? next(body) : next) ?? { content: "Done." } }] });
+    }
+    // Clips from a long video (server/clips.ts): the moments to cut.
+    if (prompt.startsWith("You cut short vertical videos")) {
+      return json(200, { choices: [{ message: { content: JSON.stringify(world.clipPicks) } }] });
     }
     // Choosing the best: the b-roll, last listed first, then the soundbites as
     // stand-ins. By score alone the soundbites (5) would come first.
@@ -1458,6 +1470,61 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_jobs WHERE project_id = ?").get(pa).n, 0, "jobs deleted with the project");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_messages WHERE project_id = ?").get(pa).n, 0, "deleted with the project");
   world.askReplies = null;
+  // The client's request: clips with a hook from one long talk, made as their
+  // own 9:16 projects and framed on the speaker, in the background.
+  {
+    const uid = "7a1c".padEnd(32, "0");
+    world.media.set(uid, { polls: 5, name: "TALK.MP4" });
+    const lines = Array.from({ length: 120 }, (_, i) => {
+      const t = (n) => `00:${String(Math.floor(n / 60)).padStart(2, "0")}:${(n % 60).toFixed(3).padStart(6, "0")}`;
+      return `${t(i * 5)} --> ${t(i * 5 + 4.5)}\nline ${i}`;
+    });
+    db.prepare("INSERT INTO assets (id, key, name, content_type, size, duration, media_uid, transcript, transcript_lang) VALUES ('talk', 'media/talk', 'TALK.MP4', 'video/mp4', 100, 600, ?, ?, 'en')")
+      .run(uid, `WEBVTT\n\n${lines.join("\n\n")}`);
+    r = await call("POST", "/api/projects", { name: "Interview" });
+    const pi = r.data.id;
+    const before = JSON.stringify((await call("GET", `/api/projects/${pi}`)).data.edl);
+    world.askReplies = [
+      (body) => {
+        const v = /(v\d+): "TALK\.MP4"/.exec(body.messages.at(-1).content)[1];
+        return { tool_calls: [{ id: "c", function: { name: "make_clips", arguments: JSON.stringify({ video: v, count: 2, brief: "LinkedIn" }) } }] };
+      },
+      { content: "Made two clips from the interview." },
+    ];
+    world.clipPicks = { clips: [
+      { title: "Why we started", start: "1:40.0", end: "2:30.0", hook_start: "2:10.0", hook_end: "2:14.0", why: "a story" },
+      { title: "The number", start: "6:00.0", end: "6:45.0", hook_start: "6:00.0", hook_end: "6:03.0", why: "a surprise" },
+    ] };
+    r = await call("POST", `/api/projects/${pi}/instruct`, { instruction: "5 vertical clips with a strong hook for LinkedIn", background: true });
+    assert.equal(r.status, 202, JSON.stringify(r.data));
+    const cj = r.data.job.id;
+    let status = "queued";
+    const seen = new Set();
+    for (let i = 0; i < 12 && status !== "applied"; i++) {
+      status = (await stepJob(cj)).data.status;
+      const now = (await call("GET", `/api/projects/${pi}/ask`)).data.jobs.find((j) => j.id === cj);
+      if (now.doing) seen.add(now.doing);
+    }
+    assert.equal(status, "applied", [...seen].join(" | "));
+    assert.ok([...seen].some((d) => d.startsWith("Framing 2 clips for 9:16")), [...seen].join(" | "));
+    r = await call("GET", `/api/projects/${pi}/ask`);
+    const last = r.data.messages.at(-1);
+    assert.equal(last.text, "Made two clips from the interview.");
+    assert.equal(last.made.length, 2, JSON.stringify(last));
+    assert.match(last.made[0].name, /^1\. Why we started/);
+    assert.equal(JSON.stringify((await call("GET", `/api/projects/${pi}`)).data.edl), before, "the interview's own project is unchanged");
+    const clip = (await call("GET", `/api/projects/${last.made[0].id}`)).data;
+    assert.deepEqual([clip.edl.output.width, clip.edl.output.height], [1080, 1920]);
+    assert.equal(clip.edl.captions.enabled, true);
+    assert.equal(clip.brief, "LinkedIn");
+    // The hook first, then the moment, each framed on the speaker.
+    assert.deepEqual(clip.edl.main.elements.map((e) => [e.trimStart, e.fit, !!e.crop]), [[129.9, "cover", true], [99.9, "cover", true]]);
+    assert.equal((await call("GET", `/api/projects/${last.made[1].id}`)).data.edl.main.elements.length, 1, "a clip that opens on its hook plays it once");
+    for (const p of [pi, ...last.made.map((m) => m.id)]) await call("DELETE", `/api/projects/${p}`);
+    db.prepare("DELETE FROM assets WHERE id = 'talk'").run();
+    world.askReplies = null;
+    console.log("17 ok: clips with a hook from one long talk become 9:16 projects with captions, framed on the speaker, in the background; the project asked from is unchanged");
+  }
   console.log("16 ok: Ask asks back without changing anything, a follow-up reads the question, a failure is shown but not read, start over and project delete clear it; from an empty timeline it places a library video; long requests are proposed, run in the background on a yes, never over a change made meanwhile, and can be cancelled; a job runs a few steps per delivery, says what it is doing, is rebooked when its delivery is lost and marked failed when it stops");
 }
 console.log("ALL OK");

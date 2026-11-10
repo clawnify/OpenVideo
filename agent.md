@@ -217,6 +217,35 @@ video from my clips" works from an empty timeline: it places a video with
 `add_clip`, or builds the whole main track from up to 8 of them with
 `assemble` (Auto-cut's pass, which replaces the main track).
 
+### Asked in the Clawnify chat
+
+When a person asks you, in the dashboard's chat, to change a video project or
+make videos from footage, send their words to `POST
+/api/projects/{id}/instruct` rather than writing the document yourself: it
+watches the footage, picks the steps (cutting, assembling, clips, framing) and
+applies them as one step the person can undo, never over an edit they made
+meanwhile. The editor beside the chat tells you which project is open (a
+`project` record in your context). Send `background: true` when the request
+watches footage (clips, framing, clean-up, "make a video from my clips"), then
+tell the person it is running: the editor shows its progress. Read `GET
+/api/projects/{id}/ask` for how it ended, and pass on what `said` says,
+including any shot it was unsure how to frame.
+
+### Clips from a long video, and framing for vertical
+
+"5 vertical clips with a strong hook from this interview" is one request:
+`/instruct` reads the video's transcript, picks the moments that stand on
+their own (about 45 seconds unless asked otherwise, at most 8), opens each on
+its strongest line (played first when it comes later in the moment), and makes
+each one **its own project**: 1080×1920 with captions on, framed on the person
+speaking. The project the request was sent to is not changed. The finished
+message, and the job while it runs, list them in `made: [{ id, name }]`; open
+one at `/edits/{id}`. "Frame it for vertical" frames the project's own cut the
+same way, in its 9:16 version (added when missing). Shots the framing is unsure
+of keep the whole picture, and the message says how many: a person checks them
+in the editor's AI reframe. Both need the video on the media service (an
+upload from the editor or a Drive import) and always run in the background.
+
 `/instruct` is the same conversation people see in the editor's AI panel: it
 reads the last few turns, so a follow-up ("shorter") works, and your requests
 show there beside theirs. When a request could mean two things, or would watch
@@ -317,7 +346,7 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
 | POST | `/api/projects/{id}/instruct` | `{ instruction, background? }` — change the existing cut in words → `{ edl, said, applied, asked, job? }`; `asked: true` means `said` is a question back (or, with `job`, a proposal) and nothing was changed. `background: true` → `202` with a queued `job` |
-| GET  | `/api/projects/{id}/ask` | The project's AI conversation, oldest first, and its recent background jobs → `{ messages: [{ role, text, author, applied, asked, failed, job_id }], jobs }` |
+| GET  | `/api/projects/{id}/ask` | The project's AI conversation, oldest first, and its recent background jobs → `{ messages: [{ role, text, author, applied, asked, failed, job_id, made }], jobs }` (`made`: projects a request made) |
 | GET  | `/api/projects/{id}/ask/jobs/{job}` | One background job with `base_edl` (the cut it started from), `draft_edl` (its cut so far, while it runs) and `result_edl` |
 | POST | `/api/projects/{id}/ask/jobs/{job}/run` | Yes to a proposal: run it in the background → `202` |
 | POST | `/api/projects/{id}/ask/jobs/{job}/cancel` | Drop a proposal, stop a queued or running job (its result is not applied), or let go of a kept one |

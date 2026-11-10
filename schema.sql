@@ -466,3 +466,6 @@ CREATE INDEX IF NOT EXISTS idx_ask_jobs_project ON ask_jobs(project_id, created_
 
 -- The background job an AI message belongs to, when it does.
 ALTER TABLE ask_messages ADD COLUMN job_id TEXT;
+
+-- Projects an AI message made (clips cut from a long video), as JSON [{id, name}].
+ALTER TABLE ask_messages ADD COLUMN made TEXT;
