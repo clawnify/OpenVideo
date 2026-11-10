@@ -47,7 +47,7 @@ import { starterEdl, validateEdl, type Edl } from "./edl";
 import { findFormat, renderDoc } from "../shared/formats";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
 import { HISTORY_TURNS, QUICK_WATCH_SECONDS, instructEdit, type Assembler, type InstructContext, type InstructHighlight, type InstructTurn, type InstructVideo } from "./instruct";
-import { applyKept, bookJob, createJob, dropProposals, jobView, listJobs, proposalText, reviveJobs, runJobStep, type AskJobRow, type JobDeps } from "./ask-jobs";
+import { applyKept, bookJob, createJob, dropProposals, jobView, listJobs, proposalText, recordQuick, revertJob, reviveJobs, runJobStep, unchanged, type AskJobRow, type JobDeps } from "./ask-jobs";
 import { caller, user } from "@clawnify/app";
 import { analyzeAsset, autocutAssets, autocutEdl, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
@@ -1061,18 +1061,45 @@ app.post("/api/projects/:id/instruct", async (c) => {
     await run("INSERT INTO ask_messages (project_id, role, text, asked, job_id) VALUES (?, 'assistant', ?, 1, ?)", [project.id, said, job.id]);
     return c.json({ edl: current.edl, said, applied: [], asked: true, job: jobView(job) });
   }
-  await run("INSERT INTO ask_messages (project_id, role, text, applied, asked) VALUES (?, 'assistant', ?, ?, ?)", [
+  // A question back, or nothing changed: only the conversation records it.
+  if (out.asked || out.applied.length === 0 || unchanged(project.edl, JSON.stringify(out.edl))) {
+    await run("INSERT INTO ask_messages (project_id, role, text, applied, asked) VALUES (?, 'assistant', ?, ?, ?)", [
+      project.id,
+      out.said,
+      JSON.stringify(out.asked ? [] : out.applied),
+      out.asked ? 1 : 0,
+    ]);
+    return c.json({ edl: current.edl, said: out.said, applied: [], asked: out.asked === true });
+  }
+  // Written only over the cut it read, and kept with the cut before it, so it
+  // can be put back later from anywhere.
+  const job = await recordQuick(project.id, instruction, author, project.edl, out);
+  const stale = job.status === "stale";
+  const said = stale ? `${out.said} The cut changed while this ran, so it was kept aside instead of applied.` : out.said;
+  await run("INSERT INTO ask_messages (project_id, role, text, applied, asked, job_id) VALUES (?, 'assistant', ?, ?, 0, ?)", [
     project.id,
-    out.said,
+    said,
     JSON.stringify(out.applied),
-    out.asked ? 1 : 0,
+    job.id,
   ]);
+  return c.json(
+    stale
+      ? { edl: current.edl, said, applied: [], asked: false, job: jobView(job) }
+      : { edl: out.edl, said, applied: out.applied, asked: false, job: jobView(job) },
+  );
+});
 
-  await run("UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ?", [
-    JSON.stringify(out.edl),
-    project.id,
-  ]);
-  return c.json({ edl: out.edl, said: out.said, applied: out.applied, asked: out.asked === true });
+/** Put an AI change back: the cut before it returns, while the cut is still what the change made. */
+app.post("/api/projects/:id/ask/jobs/:job/revert", async (c) => {
+  const out = await revertJob(c.req.param("id"), c.req.param("job"));
+  if ("refused" in out) {
+    const detail =
+      out.refused === "changed"
+        ? "The cut has changed since this was applied, so putting it back would undo those changes too. Undo it in the editor instead."
+        : "There is no applied change to put back.";
+    return c.json({ error: out.refused, detail }, out.refused === "not_found" ? 404 : 409);
+  }
+  return c.json(jobView(out.job, true));
 });
 
 /** One background job, with the cut it started from and its result. */

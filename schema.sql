@@ -469,3 +469,6 @@ ALTER TABLE ask_messages ADD COLUMN job_id TEXT;
 
 -- Projects an AI message made (clips cut from a long video), as JSON [{id, name}].
 ALTER TABLE ask_messages ADD COLUMN made TEXT;
+
+-- When an applied AI change was put back to the cut before it (POST …/ask/jobs/{job}/revert).
+ALTER TABLE ask_jobs ADD COLUMN reverted_at TEXT;

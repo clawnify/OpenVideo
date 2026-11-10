@@ -1470,6 +1470,45 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_jobs WHERE project_id = ?").get(pa).n, 0, "jobs deleted with the project");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_messages WHERE project_id = ?").get(pa).n, 0, "deleted with the project");
   world.askReplies = null;
+  // A quick answer's change keeps the cut before it, can be put back from
+  // anywhere, and is never written over an edit made while the model worked.
+  {
+    r = await call("POST", "/api/projects", { name: "Safe" });
+    const ps = r.data.id;
+    const cut2 = (n) => ({ version: 1, output: { width: 1280, height: 720, fps: 30 }, main: { elements: [
+      { id: "a", type: "video", src: `asset:${one.id}`, duration: n }, { id: "b", type: "video", src: `asset:${two.id}`, duration: n }] }, overlays: [], audio: [] });
+    assert.equal((await call("PUT", `/api/projects/${ps}`, { edl: cut2(2) })).status, 200);
+    world.askReplies = [{ tool_calls: [{ id: "d", function: { name: "delete_clip", arguments: JSON.stringify({ clip: 1 }) } }] }, { content: "Dropped the second clip." }];
+    r = await call("POST", `/api/projects/${ps}/instruct`, { instruction: "drop the second clip" });
+    assert.equal(r.data.applied.length, 1, JSON.stringify(r.data));
+    assert.equal(r.data.job.status, "applied");
+    assert.equal(r.data.job.revertible, true);
+    const quick = r.data.job.id;
+    assert.equal((await call("GET", `/api/projects/${ps}`)).data.edl.main.elements.length, 1);
+    r = await call("POST", `/api/projects/${ps}/ask/jobs/${quick}/revert`);
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal((await call("GET", `/api/projects/${ps}`)).data.edl.main.elements.length, 2, "put back");
+    assert.equal((await call("POST", `/api/projects/${ps}/ask/jobs/${quick}/revert`)).status, 409, "once");
+    // Applied again, then edited by a person: putting it back would undo their edit too.
+    world.askReplies = [{ tool_calls: [{ id: "d", function: { name: "delete_clip", arguments: JSON.stringify({ clip: 1 }) } }] }, { content: "Dropped it." }];
+    const again = (await call("POST", `/api/projects/${ps}/instruct`, { instruction: "drop it again" })).data.job.id;
+    const edited = (await call("GET", `/api/projects/${ps}`)).data.edl;
+    edited.main.elements[0].duration = 1.5;
+    assert.equal((await call("PUT", `/api/projects/${ps}`, { edl: edited })).status, 200);
+    assert.equal((await call("POST", `/api/projects/${ps}/ask/jobs/${again}/revert`)).status, 409, "refused over a later edit");
+    // A person saves while the model is working: the answer is kept aside.
+    assert.equal((await call("PUT", `/api/projects/${ps}`, { edl: cut2(2) })).status, 200);
+    world.askReplies = [{ tool_calls: [{ id: "d", function: { name: "delete_clip", arguments: JSON.stringify({ clip: 1 }) } }] }, { content: "Dropped it." }];
+    world.beforeModel = async () => { await call("PUT", `/api/projects/${ps}`, { edl: cut2(3) }); };
+    r = await call("POST", `/api/projects/${ps}/instruct`, { instruction: "drop the second" });
+    world.beforeModel = null;
+    assert.equal(r.data.job.status, "stale", JSON.stringify(r.data));
+    assert.deepEqual(r.data.applied, []);
+    assert.equal((await call("GET", `/api/projects/${ps}`)).data.edl.main.elements[0].duration, 3, "the person's edit stays");
+    await call("DELETE", `/api/projects/${ps}`);
+    world.askReplies = null;
+    console.log("18 ok: a quick AI change is put back from anywhere, only over itself, and never written over an edit made meanwhile");
+  }
   // The client's request: clips with a hook from one long talk, made as their
   // own 9:16 projects and framed on the speaker, in the background.
   {

@@ -47,6 +47,9 @@ export interface AskJob {
   error: string | null;
   /** Clip projects made so far, while it runs. */
   made?: Made[];
+  /** An applied change that can still be put back. */
+  revertible?: boolean;
+  reverted_at?: string | null;
 }
 
 const ACTIVE: AskJobStatus[] = ["queued", "running"];
@@ -129,8 +132,12 @@ export function useAsk(projectId: string, getEdl: () => Edl, onApplied: (edl: Ed
   }, [active, refresh]);
 
   const act = useCallback(
-    async (jobId: string, action: "run" | "cancel" | "apply") => {
-      const out = await api.send<{ result_edl?: Edl | null }>("POST", `/api/projects/${projectId}/ask/jobs/${jobId}/${action}`);
+    async (jobId: string, action: "run" | "cancel" | "apply" | "revert") => {
+      const out = await api.send<{ result_edl?: Edl | null; base_edl?: Edl | null }>("POST", `/api/projects/${projectId}/ask/jobs/${jobId}/${action}`);
+      // Put back: the cut before the change returns, as one undo step here too.
+      if (action === "revert" && out.base_edl && canonical(latest.current.getEdl()) !== canonical(out.base_edl)) {
+        latest.current.onApplied(out.base_edl);
+      }
       if (action === "run") seenActive.current.add(jobId);
       if (action === "apply" && out.result_edl) {
         handled.current.add(jobId);
@@ -313,7 +320,7 @@ export function AssistantPanel({
     }
   };
 
-  const doAct = async (jobId: string, action: "run" | "cancel" | "apply") => {
+  const doAct = async (jobId: string, action: "run" | "cancel" | "apply" | "revert") => {
     setActing(`${jobId}:${action}`);
     setActErr("");
     try {
@@ -375,6 +382,14 @@ export function AssistantPanel({
         </div>
       );
     }
+    if (job.revertible && !saving) {
+      return (
+        <button onClick={() => doAct(job.id, "revert")} disabled={acting !== null} className={`${btnGhost} mt-1 h-7 text-fine`} title="Put the cut back as it was before this change">
+          {busy("revert") ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />} Put back
+        </button>
+      );
+    }
+    if (job.reverted_at) return <p className="mt-1 text-fine text-faint">Put back.</p>;
     if (job.status === "stale" || notTaken.has(job.id)) {
       return (
         <div className="mt-2 flex gap-1.5">
