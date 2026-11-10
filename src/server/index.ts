@@ -44,8 +44,8 @@ import { highlightsCsv, highlightsXml, rateOf } from "./nle";
 import { starterEdl, validateEdl, type Edl } from "./edl";
 import { findFormat, renderDoc } from "../shared/formats";
 import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
-import { HISTORY_TURNS, QUICK_WATCH_SECONDS, instructEdit, type Assembler, type InstructHighlight, type InstructTurn, type InstructVideo } from "./instruct";
-import { applyKept, bookJob, createJob, dropProposals, jobView, listJobs, proposalText, runJob, type AskJobRow, type RunInstruction } from "./ask-jobs";
+import { HISTORY_TURNS, QUICK_WATCH_SECONDS, instructEdit, type Assembler, type InstructContext, type InstructHighlight, type InstructTurn, type InstructVideo } from "./instruct";
+import { applyKept, bookJob, createJob, dropProposals, jobView, listJobs, proposalText, reviveJobs, runJobStep, type AskJobRow, type JobDeps } from "./ask-jobs";
 import { caller, user } from "@clawnify/app";
 import { analyzeAsset, autocutAssets, autocutEdl, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
 import { makeShareToken, notePage, sharePage } from "./share";
@@ -824,6 +824,9 @@ function askAuthor(c: Context): string | null {
 
 /** The project's AI conversation, oldest first (the last 100 messages), and its recent background jobs. */
 app.get("/api/projects/:id/ask", async (c) => {
+  // First, so what follows reads it: a job whose next step was lost is booked
+  // again, and one that stopped is marked so (with its message).
+  await reviveJobs(c.req.param("id"), (job) => bookJob(c.env, new URL(c.req.url).origin, job));
   const id = c.req.param("id");
   const rows = await query<{ id: string; role: string; text: string; author: string | null; applied: string | null; asked: number; failed: number; job_id: string | null; created_at: string }>(
     `SELECT * FROM (SELECT id, role, text, author, applied, asked, failed, job_id, created_at, rowid AS r FROM ask_messages
@@ -865,51 +868,57 @@ async function askHistory(projectId: string, before?: string): Promise<InstructT
   ).map((m) => ({ role: m.role, text: m.text }));
 }
 
-/** One request against a cut, with everything the model needs from this app. */
-function instructionRunner(env: Bindings, projectId: string, watchBudget?: number): RunInstruction {
-  return async (edl, instruction, history) => {
-    // The model reads clip names, not asset ids; lengths say where a clip ends.
-    const names = new Map<string, string>();
-    const lengths = new Map<string, number>();
-    for (const row of await query<Asset>("SELECT id, name, duration FROM assets")) {
-      names.set(`asset:${row.id}`, row.name);
-      if (row.duration) lengths.set(`asset:${row.id}`, row.duration);
-    }
-    const analysisCfg = { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN ?? "", openrouterKey: env.OPENROUTER_API_KEY };
-    return instructEdit(
-      edl,
-      instruction,
-      names,
-      { openrouterKey: env.OPENROUTER_API_KEY, servicesUrl: env.SERVICES_URL },
-      lengths,
-      // What the model uses to act on what is in the footage.
-      async (assetId, window, focus) => {
-        const r = await analyzeAsset(assetId, { mode: "cuts", prompt: focus, window }, analysisCfg);
-        if ("failure" in r) return { error: r.failure.detail };
-        return {
-          keeps: r.result.cuts
-            .filter((cut) => cut.keep)
-            .sort((a, b) => a.start_ms - b.start_ms)
-            .map((cut) => ({ start: cut.start_ms / 1000, end: cut.end_ms / 1000 })),
-          notes: r.result.notes,
-        };
-      },
-      await instructHighlights(projectId),
-      history,
-      {
-        videos: await instructVideos(projectId),
-        assemble: assembler(env, (await get<{ brief: string | null }>("SELECT brief FROM edit_projects WHERE id = ?", [projectId]))?.brief ?? null),
-        watchBudget,
-      },
-    );
+/** What a request needs from this app: clip names and lengths, the footage analysis, Auto-cut. */
+async function instructContext(env: Bindings, projectId: string): Promise<InstructContext & { assetNames: Map<string, string> }> {
+  // The model reads clip names, not asset ids; lengths say where a clip ends.
+  const assetNames = new Map<string, string>();
+  const sourceSeconds = new Map<string, number>();
+  for (const row of await query<Asset>("SELECT id, name, duration FROM assets")) {
+    assetNames.set(`asset:${row.id}`, row.name);
+    if (row.duration) sourceSeconds.set(`asset:${row.id}`, row.duration);
+  }
+  const analysisCfg = { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN ?? "", openrouterKey: env.OPENROUTER_API_KEY };
+  const brief = (await get<{ brief: string | null }>("SELECT brief FROM edit_projects WHERE id = ?", [projectId]))?.brief ?? null;
+  return {
+    cfg: { openrouterKey: env.OPENROUTER_API_KEY, servicesUrl: env.SERVICES_URL },
+    assetNames,
+    sourceSeconds,
+    // What the model uses to act on what is in the footage.
+    analyze: async (assetId, window, focus) => {
+      const r = await analyzeAsset(assetId, { mode: "cuts", prompt: focus, window }, analysisCfg);
+      if ("failure" in r) return { error: r.failure.detail };
+      return {
+        keeps: r.result.cuts
+          .filter((cut) => cut.keep)
+          .sort((a, b) => a.start_ms - b.start_ms)
+          .map((cut) => ({ start: cut.start_ms / 1000, end: cut.end_ms / 1000 })),
+        notes: r.result.notes,
+      };
+    },
+    assemble: assembler(env, brief),
   };
 }
 
-/** Queue a job; with no queue to take it (local development), run it after the response. */
+/** What a background job needs from this app, and how it books its next delivery. */
+function jobDeps(c: Context<{ Bindings: Bindings }>, book?: JobDeps["book"]): JobDeps {
+  return {
+    context: (projectId) => instructContext(c.env, projectId),
+    highlights: instructHighlights,
+    videos: instructVideos,
+    history: askHistory,
+    book: book ?? ((job) => bookJob(c.env, new URL(c.req.url).origin, job)),
+  };
+}
+
+/** Queue a job; with no queue to take it (local development), run its steps after the response. */
 async function startJob(c: Context<{ Bindings: Bindings }>, job: AskJobRow): Promise<boolean> {
   if (await bookJob(c.env, new URL(c.req.url).origin, job)) return true;
   if (c.env.CLAWNIFY_TOKEN) return false;
-  c.executionCtx.waitUntil(runJob(job.id, instructionRunner(c.env, job.project_id), askHistory).then(() => {}));
+  const local: JobDeps = jobDeps(c, async (next) => {
+    c.executionCtx.waitUntil(runJobStep(next.id, local).then(() => {}));
+    return true;
+  });
+  c.executionCtx.waitUntil(runJobStep(job.id, local).then(() => {}));
   return true;
 }
 
@@ -950,7 +959,18 @@ app.post("/api/projects/:id/instruct", async (c) => {
     return c.json({ edl: current.edl, said, applied: [], asked: false, job: jobView(job) }, 202);
   }
 
-  const out = await instructionRunner(c.env, project.id, QUICK_WATCH_SECONDS)(current.edl, instruction, await askHistory(project.id));
+  const ctx = await instructContext(c.env, project.id);
+  const out = await instructEdit(
+    current.edl,
+    instruction,
+    ctx.assetNames,
+    ctx.cfg,
+    ctx.sourceSeconds,
+    ctx.analyze,
+    await instructHighlights(project.id),
+    await askHistory(project.id),
+    { videos: await instructVideos(project.id), assemble: ctx.assemble, watchBudget: QUICK_WATCH_SECONDS },
+  );
   // A failed exchange stays on screen but out of what the model reads next.
   await userSays("failure" in out);
   if ("failure" in out) {
@@ -1036,11 +1056,10 @@ app.post("/api/ask/step", async (c) => {
   } catch {
     /* answered below */
   }
-  const job = await get<AskJobRow>("SELECT project_id FROM ask_jobs WHERE id = ?", [jobId]);
-  // A job that is gone, or already claimed: a 2xx so the queue does not try again.
-  if (!job) return c.json({ ok: true });
-  const done = await runJob(jobId, instructionRunner(c.env, job.project_id), askHistory);
-  return c.json({ ok: true, status: done?.status ?? "not_claimed" });
+  // Always a 2xx: a job that is gone, finished, or held by another delivery
+  // has nothing for this one to do, and a step that runs books the next.
+  const out = await runJobStep(jobId, jobDeps(c));
+  return c.json({ ok: true, status: out.status });
 });
 
 app.post("/api/projects/:id/autocut", async (c) => {

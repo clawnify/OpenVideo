@@ -1387,7 +1387,7 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
   r = await stepJob(job);
   assert.equal(r.data.status, "applied", JSON.stringify(r.data));
   assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements.length, 1, "applied to the cut");
-  assert.equal((await stepJob(job)).data.status, "not_claimed", "a second delivery does nothing");
+  assert.equal((await stepJob(job)).data.status, "applied", "a second delivery does nothing");
   r = await call("GET", `/api/projects/${pa}/ask`);
   assert.equal(r.data.jobs.find((j) => j.id === job).status, "applied");
   assert.deepEqual(r.data.messages.at(-1).job_id, job);
@@ -1417,13 +1417,48 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
   assert.equal(r.status, 202, JSON.stringify(r.data));
   assert.equal(r.data.job.status, "queued");
   assert.equal((await call("POST", `/api/projects/${pa}/ask/jobs/${r.data.job.id}/cancel`)).status, 200);
-  assert.equal((await stepJob(r.data.job.id)).data.status, "not_claimed");
+  assert.equal((await stepJob(r.data.job.id)).data.status, "cancelled", "a cancelled job never runs");
+  // A long request runs a few steps per delivery and books the next: two model
+  // calls at most per delivery, and what it is doing is readable while it runs.
+  const trimTo = (n) => ({ tool_calls: [{ id: `t${n}`, function: { name: "trim_clip", arguments: JSON.stringify({ clip: 0, seconds: n }) } }] });
+  assert.equal((await call("PUT", `/api/projects/${pa}`, { edl: longCut(150) })).status, 200);
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "tighten it in steps", background: true });
+  const stepped = r.data.job.id;
+  world.askReplies = [trimTo(100), trimTo(90), trimTo(80), { content: "Trimmed the first clip three times." }];
+  const booked = world.calls.filter((u) => u.includes("queue.test")).length;
+  assert.equal((await stepJob(stepped)).data.status, "running", "stops after two model calls");
+  assert.equal(world.calls.filter((u) => u.includes("queue.test")).length, booked + 1, "and books the next delivery");
+  assert.equal(world.lastEnqueue.payload.job_id, stepped);
+  r = await call("GET", `/api/projects/${pa}/ask`);
+  const mid = r.data.jobs.find((j) => j.id === stepped);
+  assert.equal(mid.status, "running");
+  assert.equal(mid.applied.length, 2, JSON.stringify(mid));
+  assert.ok(mid.doing, "says what it is doing");
+  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements[0].duration, 150, "nothing reaches the cut until it is done");
+  // A second delivery while one holds the job does nothing.
+  db.prepare("UPDATE ask_jobs SET leased_until = datetime('now', '+5 minutes') WHERE id = ?").run(stepped);
+  assert.equal((await stepJob(stepped)).data.status, "busy");
+  db.prepare("UPDATE ask_jobs SET leased_until = NULL WHERE id = ?").run(stepped);
+  assert.equal((await stepJob(stepped)).data.status, "applied", "the next delivery carries on and finishes");
+  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements[0].duration, 80);
+  // A job whose next delivery was lost is booked again when read; one that has
+  // not moved for 20 minutes is marked failed, never left "working".
+  r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "lost", background: true });
+  const lost = r.data.job.id;
+  db.prepare("UPDATE ask_jobs SET status = 'running', step_booked_at = datetime('now', '-5 minutes') WHERE id = ?").run(lost);
+  const before = world.calls.filter((u) => u.includes("queue.test")).length;
+  await call("GET", `/api/projects/${pa}/ask`);
+  assert.equal(world.calls.filter((u) => u.includes("queue.test")).length, before + 1, "rebooked");
+  db.prepare("UPDATE ask_jobs SET updated_at = datetime('now', '-30 minutes') WHERE id = ?").run(lost);
+  r = await call("GET", `/api/projects/${pa}/ask`);
+  assert.equal(r.data.jobs.find((j) => j.id === lost).status, "failed");
+  assert.match(r.data.messages.at(-1).text, /stopped without finishing/);
   await call("POST", `/api/projects/${pa}/instruct`, { instruction: "one more" });
   await call("DELETE", `/api/projects/${pa}`);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_jobs WHERE project_id = ?").get(pa).n, 0, "jobs deleted with the project");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ask_messages WHERE project_id = ?").get(pa).n, 0, "deleted with the project");
   world.askReplies = null;
-  console.log("16 ok: Ask asks back without changing anything, a follow-up reads the question, a failure is shown but not read, start over and project delete clear it; from an empty timeline it places a library video; long requests are proposed, run in the background on a yes, never over a change made meanwhile, and can be cancelled");
+  console.log("16 ok: Ask asks back without changing anything, a follow-up reads the question, a failure is shown but not read, start over and project delete clear it; from an empty timeline it places a library video; long requests are proposed, run in the background on a yes, never over a change made meanwhile, and can be cancelled; a job runs a few steps per delivery, says what it is doing, is rebooked when its delivery is lost and marked failed when it stops");
 }
 console.log("ALL OK");
 

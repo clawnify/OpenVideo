@@ -696,8 +696,236 @@ export interface InstructTurn {
 export const HISTORY_TURNS = 12;
 
 /**
- * Run one instruction against the cut. Returns the new document, whatever the
- * model says it did, and the operations that were actually applied.
+ * A request in progress, as plain data, so a background job can stop after any
+ * step and carry on in its next delivery. `videos` is kept here, not re-read:
+ * the model's messages name videos by the ids it was shown first.
+ */
+export interface InstructState {
+  messages: Record<string, unknown>[];
+  draft: Edl;
+  applied: AppliedOp[];
+  /** Model calls made so far. */
+  round: number;
+  /** The last model call's operations not yet run, in order. */
+  pending: { id?: string; name: string; args: Record<string, unknown> }[];
+  /** How many operations the last model call asked for. */
+  calls: number;
+  /** Clip ids as they were when the model asked: its clip numbers refer to these. */
+  idsThisRound: string[];
+  watched: number;
+  watchedClips: number;
+  videos: InstructVideo[];
+  /** What the next step will do, in words a person reads while it runs. */
+  doing: string;
+}
+
+/** Everything a step needs from the app that is not part of the request itself. */
+export interface InstructContext {
+  cfg: InstructConfig;
+  assetNames: Map<string, string>;
+  /** Source length in seconds by `asset:<id>`, to know where a clip's window ends. */
+  sourceSeconds?: Map<string, number>;
+  analyze?: ClipAnalyzer;
+  /** The project's highlights, kept first then best: what add_highlight places. */
+  highlights?: InstructHighlight[];
+  assemble?: Assembler;
+  /** Seconds of footage this run may watch. Past it, it stops with `background`
+   *  and changes nothing. Omitted in a background job: no limit. */
+  watchBudget?: number;
+}
+
+export type InstructDone =
+  | { edl: Edl; said: string; applied: AppliedOp[]; asked?: true }
+  | { background: NeedsBackground }
+  | { failure: InstructFailure | EdlInvalid };
+
+/** The start of a request: the conversation, the cut, what can be added. */
+export function startInstruction(
+  edl: Edl,
+  instruction: string,
+  assetNames: Map<string, string>,
+  highlights: InstructHighlight[] = [],
+  history: InstructTurn[] = [],
+  videos: InstructVideo[] = [],
+): InstructState {
+  return {
+    messages: [
+      { role: "system", content: SYSTEM },
+      ...history.slice(-HISTORY_TURNS).map((t) => ({ role: t.role, content: t.text.slice(0, 2000) })),
+      {
+        role: "user",
+        content: `The cut right now:\n${describeEdl(edl, assetNames)}${describeHighlights(highlights)}${describeVideos(videos)}\n\nWhat to change: ${instruction}`,
+      },
+    ],
+    draft: structuredClone(edl),
+    applied: [],
+    round: 0,
+    pending: [],
+    calls: 0,
+    idsThisRound: [],
+    watched: 0,
+    watchedClips: 0,
+    videos,
+    doing: "Working out what to do",
+  };
+}
+
+/** Operations that watch footage: slow, so a background job runs one per delivery. */
+export const SLOW_OPS = new Set(["clean_up_clip", "assemble"]);
+
+/** What a step about to run an operation is doing, for a person watching. */
+function doingFor(state: InstructState, call: { name: string; args: Record<string, unknown> }, names: Map<string, string>): string {
+  const clipName = () => {
+    const el = state.draft.main.elements[Number(call.args.clip)];
+    return el ? `"${names.get(el.src) ?? el.src}"` : "a clip";
+  };
+  switch (call.name) {
+    case "clean_up_clip":
+      return `Watching ${clipName()} for the parts worth keeping`;
+    case "assemble": {
+      const n = Array.isArray(call.args.videos) ? new Set(call.args.videos).size : 0;
+      return `Watching ${n} video${n === 1 ? "" : "s"} to build the cut`;
+    }
+    case "add_clip":
+      return "Placing a video";
+    default:
+      return "Changing the cut";
+  }
+}
+
+/**
+ * One step of a request: one model call, or one of the operations the last
+ * call asked for. Returns the state to carry on from, or how it ended. A
+ * request that never stops is not possible: MAX_ROUNDS model calls at most.
+ */
+export async function instructStep(state: InstructState, ctx: InstructContext): Promise<{ state: InstructState; slow: boolean } | { done: InstructDone }> {
+  const s = state;
+  const highlights = ctx.highlights ?? [];
+  const sourceSeconds = ctx.sourceSeconds ?? new Map<string, number>();
+  const videos = new Map(s.videos.map((v) => [v.id, v]));
+  const finish = (said: string, asked?: true): { done: InstructDone } => {
+    const checked = validateEdl(s.draft);
+    if ("invalid" in checked) return { done: { failure: checked.invalid } };
+    return { done: { edl: checked.edl, said, applied: s.applied, ...(asked ? { asked } : {}) } };
+  };
+
+  // An operation the model asked for, not run yet.
+  const call = s.pending.shift();
+  if (call) {
+    let args = call.args;
+    // Clip numbers refer to the cut as it was when the model asked. A split or
+    // clean-up inserts clips, so resolve each number to the clip itself and
+    // look up where it is now.
+    if (typeof args.clip === "number") {
+      const id = s.idsThisRound[args.clip];
+      const now = s.draft.main.elements.findIndex((el) => el.id === id);
+      args = { ...args, clip: id === undefined ? args.clip : now };
+    }
+    const out =
+      call.name === "clean_up_clip"
+        ? await cleanUp(s.draft, args, sourceSeconds, ctx.analyze)
+        : call.name === "assemble"
+          ? await assembleCut(s.draft, args, videos, ctx.assemble)
+          : call.name === "add_clip"
+            ? addClip(s.draft, args, videos)
+            : apply(s.draft, call.name, args, new Map(highlights.map((h) => [h.id, h])));
+    if ("said" in out) s.applied.push(out.said);
+    // The model plans its next round from this, so the last answer carries the
+    // cut as it now stands, positions included.
+    const last = s.pending.length === 0;
+    s.messages.push({
+      role: "tool",
+      tool_call_id: call.id,
+      content:
+        ("said" in out ? `done: ${out.said}` : `could not: ${out.error}`) +
+        (last ? `\n\nThe cut now:\n${describeEdl(s.draft, ctx.assetNames)}` : ""),
+    });
+    s.doing = s.pending[0] ? doingFor(s, s.pending[0], ctx.assetNames) : "Checking the result";
+    return { state: s, slow: SLOW_OPS.has(call.name) };
+  }
+
+  if (s.round >= MAX_ROUNDS) return finish("Stopped after several rounds.");
+  if (!ctx.cfg.openrouterKey) {
+    return {
+      done: {
+        failure: {
+          error: "ai_unavailable",
+          detail: "no OpenRouter key available to this app — add one in the dashboard's API Keys settings",
+        },
+      },
+    };
+  }
+  // Offered only when there is something for them to act on.
+  const ops = OPS.filter(
+    (op) =>
+      (op.name !== "add_highlight" || highlights.length > 0) &&
+      (op.name !== "add_clip" || videos.size > 0) &&
+      (op.name !== "assemble" || (videos.size > 0 && !!ctx.assemble)),
+  );
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ctx.cfg.openrouterKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: s.messages,
+      temperature: 0.1,
+      tools: ops.map((op) => ({ type: "function", function: op })),
+    }),
+  });
+  if (!res.ok) return { done: { failure: { error: "ai_failed", detail: `the model call failed (${res.status})` } } };
+  const body = (await res.json().catch(() => null)) as {
+    choices?: {
+      message?: {
+        content?: string;
+        tool_calls?: { id?: string; function?: { name?: string; arguments?: string } }[];
+      };
+    }[];
+  } | null;
+  const message = body?.choices?.[0]?.message;
+  if (!message) return { done: { failure: { error: "ai_failed", detail: "the model returned nothing" } } };
+  s.round++;
+
+  const calls = (message.tool_calls ?? []).map((c) => {
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(c.function?.arguments ?? "{}") as Record<string, unknown>;
+    } catch {
+      /* an unparsable argument is reported back by the operation */
+    }
+    return { id: c.id, name: c.function?.name ?? "", args };
+  });
+  if (calls.length === 0) return finish(message.content?.trim() || "Done.");
+
+  // A question ends the turn: whatever was changed before it stays, and the
+  // answer arrives as the next message.
+  const question = calls.find((c) => c.name === "ask_user");
+  if (question) return finish(String(question.args.question ?? "").trim() || "Could you say a little more about what you want?", true);
+
+  // Watching footage takes a while. A quick answer may watch a little; past
+  // that the whole request moves to the background, starting over there, so
+  // nothing half-done reaches the cut.
+  if (ctx.watchBudget !== undefined) {
+    const watching = calls.filter((c) => c.name === "clean_up_clip");
+    if (watching.length) {
+      const seconds = watching.reduce((sum, c) => sum + watchSeconds(s.draft, c.args, sourceSeconds), s.watched);
+      if (seconds > ctx.watchBudget) return { done: { background: { clips: s.watchedClips + watching.length, seconds } } };
+      s.watched = seconds;
+      s.watchedClips += watching.length;
+    }
+  }
+
+  s.messages.push(message as Record<string, unknown>);
+  s.pending = calls;
+  s.calls = calls.length;
+  s.idsThisRound = s.draft.main.elements.map((el) => el.id);
+  s.doing = doingFor(s, calls[0], ctx.assetNames);
+  return { state: s, slow: false };
+}
+
+/**
+ * Run one instruction against the cut to its end, inline. Returns the new
+ * document, whatever the model says it did, and the operations that were
+ * actually applied.
  */
 export async function instructEdit(
   edl: Edl,
@@ -715,11 +943,7 @@ export async function instructEdit(
    *  footage this run may watch: past it, it stops with `background` and
    *  changes nothing (omitted in a background job: no limit). */
   more: { videos?: InstructVideo[]; assemble?: Assembler; watchBudget?: number } = {},
-): Promise<
-  | { edl: Edl; said: string; applied: AppliedOp[]; asked?: true }
-  | { background: NeedsBackground }
-  | { failure: InstructFailure | EdlInvalid }
-> {
+): Promise<InstructDone> {
   if (!cfg.openrouterKey) {
     return {
       failure: {
@@ -728,138 +952,11 @@ export async function instructEdit(
       },
     };
   }
-
-  const draft = structuredClone(edl);
-  const applied: AppliedOp[] = [];
-  const messages: Record<string, unknown>[] = [
-    { role: "system", content: SYSTEM },
-    ...history.slice(-HISTORY_TURNS).map((t) => ({ role: t.role, content: t.text.slice(0, 2000) })),
-    {
-      role: "user",
-      content: `The cut right now:\n${describeEdl(draft, assetNames)}${describeHighlights(highlights)}${describeVideos(more.videos ?? [])}\n\nWhat to change: ${instruction}`,
-    },
-  ];
-  const byId = new Map(highlights.map((h) => [h.id, h]));
-  let watched = 0;
-  let watchedClips = 0;
-  // Offered only when there are highlights to place.
-  const videos = new Map((more.videos ?? []).map((v) => [v.id, v]));
-  const ops = OPS.filter(
-    (op) =>
-      (op.name !== "add_highlight" || highlights.length > 0) &&
-      (op.name !== "add_clip" || videos.size > 0) &&
-      (op.name !== "assemble" || (videos.size > 0 && !!more.assemble)),
-  );
-
-  for (let round = 0; round < MAX_ROUNDS; round++) {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${cfg.openrouterKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: MODEL,
-        messages,
-        temperature: 0.1,
-        tools: ops.map((op) => ({ type: "function", function: op })),
-      }),
-    });
-    if (!res.ok) {
-      return { failure: { error: "ai_failed", detail: `the model call failed (${res.status})` } };
-    }
-    const body = (await res.json().catch(() => null)) as {
-      choices?: {
-        message?: {
-          content?: string;
-          tool_calls?: { id?: string; function?: { name?: string; arguments?: string } }[];
-        };
-      }[];
-    } | null;
-    const message = body?.choices?.[0]?.message;
-    if (!message) return { failure: { error: "ai_failed", detail: "the model returned nothing" } };
-
-    const calls = message.tool_calls ?? [];
-    if (calls.length === 0) {
-      const checked = validateEdl(draft);
-      if ("invalid" in checked) return { failure: checked.invalid };
-      return { edl: checked.edl, said: message.content?.trim() || "Done.", applied };
-    }
-
-    // A question ends the turn: whatever was changed before it stays, and the
-    // answer arrives as the next message.
-    const question = calls.find((call) => call.function?.name === "ask_user");
-    if (question) {
-      let text = "";
-      try {
-        text = String((JSON.parse(question.function?.arguments ?? "{}") as { question?: unknown }).question ?? "").trim();
-      } catch {
-        /* falls through to the generic question */
-      }
-      const checked = validateEdl(draft);
-      if ("invalid" in checked) return { failure: checked.invalid };
-      return { edl: checked.edl, said: text || "Could you say a little more about what you want?", applied, asked: true };
-    }
-
-    // Watching footage takes a while. A quick answer may watch a little; past
-    // that the whole request moves to the background, starting over there, so
-    // nothing half-done reaches the cut.
-    if (more.watchBudget !== undefined) {
-      const watching = calls.filter((call) => call.function?.name === "clean_up_clip");
-      if (watching.length) {
-        const seconds = watching.reduce((sum, call) => {
-          let args: Record<string, unknown> = {};
-          try {
-            args = JSON.parse(call.function?.arguments ?? "{}") as Record<string, unknown>;
-          } catch {
-            /* counted as nothing; the run reports it */
-          }
-          return sum + watchSeconds(draft, args, sourceSeconds);
-        }, watched);
-        if (seconds > more.watchBudget) return { background: { clips: watchedClips + watching.length, seconds } };
-        watched = seconds;
-        watchedClips += watching.length;
-      }
-    }
-
-    messages.push(message as Record<string, unknown>);
-    // Clip numbers refer to the cut as it was when the model asked. A split or
-    // clean-up inserts clips, so resolve each number to the clip itself first
-    // and look up where it is now when its turn comes.
-    const idsThisRound = draft.main.elements.map((el) => el.id);
-    for (const [n, call] of calls.entries()) {
-      const name = call.function?.name ?? "";
-      let args: Record<string, unknown> = {};
-      try {
-        args = JSON.parse(call.function?.arguments ?? "{}") as Record<string, unknown>;
-      } catch {
-        /* an unparsable argument is reported back as an error below */
-      }
-      if (typeof args.clip === "number") {
-        const id = idsThisRound[args.clip];
-        const now = draft.main.elements.findIndex((el) => el.id === id);
-        args = { ...args, clip: id === undefined ? args.clip : now };
-      }
-      const out =
-        name === "clean_up_clip"
-          ? await cleanUp(draft, args, sourceSeconds, analyze)
-          : name === "assemble"
-            ? await assembleCut(draft, args, videos, more.assemble)
-            : name === "add_clip"
-              ? addClip(draft, args, videos)
-              : apply(draft, name, args, byId);
-      if ("said" in out) applied.push(out.said);
-      // The model plans its next round from this, so the last answer carries
-      // the cut as it now stands, positions included.
-      const last = n === calls.length - 1;
-      messages.push({
-        role: "tool",
-        tool_call_id: call.id,
-        content:
-          ("said" in out ? `done: ${out.said}` : `could not: ${out.error}`) +
-          (last ? `\n\nThe cut now:\n${describeEdl(draft, assetNames)}` : ""),
-      });
-    }
+  const ctx: InstructContext = { cfg, assetNames, sourceSeconds, analyze, highlights, assemble: more.assemble, watchBudget: more.watchBudget };
+  let state = startInstruction(edl, instruction, assetNames, highlights, history, more.videos ?? []);
+  for (;;) {
+    const out = await instructStep(state, ctx);
+    if ("done" in out) return out.done;
+    state = out.state;
   }
-
-  const checked = validateEdl(draft);
-  if ("invalid" in checked) return { failure: checked.invalid };
-  return { edl: checked.edl, said: "Stopped after several rounds.", applied };
 }

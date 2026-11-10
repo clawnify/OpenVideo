@@ -430,7 +430,7 @@ CREATE TABLE IF NOT EXISTS ask_messages (
 CREATE INDEX IF NOT EXISTS idx_ask_messages_project ON ask_messages(project_id, created_at);
 
 -- A request that watches more footage than a quick answer allows runs in the
--- background (src/server/ask-jobs.ts). `proposed`: told what it would watch,
+-- background (src/server/ask-jobs.ts), a few steps per queue delivery. `proposed`: told what it would watch,
 -- waiting for a yes. `queued` -> `running` -> `applied` (the cut was changed),
 -- `stale` (the cut changed while it ran, so it was kept aside: `result_edl`,
 -- applied only on request), `failed` or `cancelled`. `base_edl` is the cut it
@@ -448,6 +448,14 @@ CREATE TABLE IF NOT EXISTS ask_jobs (
   applied TEXT,
   error TEXT,
   author TEXT,
+  -- The request in progress (src/server/instruct.ts InstructState), saved
+  -- after every step, and what it is doing now in words.
+  state TEXT,
+  doing TEXT,
+  -- A delivery holds the job while it runs a step; past this time another may.
+  leased_until TEXT,
+  -- When the next step was last booked on the queue.
+  step_booked_at TEXT,
   started_at TEXT,
   finished_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),

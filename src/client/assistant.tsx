@@ -31,6 +31,8 @@ export interface AskJob {
   id: string;
   status: AskJobStatus;
   applied: string[];
+  /** What it is doing now, while it runs. */
+  doing?: string | null;
   error: string | null;
 }
 
@@ -241,12 +243,21 @@ export function AssistantPanel({
         <div className="mt-2 rounded-sm bg-surface-sunken px-3 py-2 text-fine text-muted">
           <div className="flex items-center gap-2">
             <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-            <span className="flex-1">{job.status === "queued" ? "Starting in the background…" : "Working in the background…"}</span>
+            <span className="flex-1" aria-live="polite">
+              {job.status === "queued" ? "Starting in the background…" : `${job.doing ?? "Working"}…`}
+            </span>
             <button onClick={() => doAct(job.id, "cancel")} disabled={acting !== null} className={`${btnGhost} h-6 text-fine`}>
               Cancel
             </button>
           </div>
-          <p className="mt-1 text-faint">Keep editing if you like: your changes stay, and this then waits for you to apply it.</p>
+          {job.applied.length > 0 && (
+            <ul className="mt-1.5 space-y-0.5 text-faint">
+              {job.applied.map((a, i) => (
+                <li key={i}>✓ {a}</li>
+              ))}
+            </ul>
+          )}
+          <p className="mt-1.5 text-faint">Keep editing if you like: your changes stay, and this then waits for you to apply it.</p>
         </div>
       );
     }

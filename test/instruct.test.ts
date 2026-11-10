@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addClip, apply, cleanUp, instructEdit, watchSeconds, type InstructHighlight, type InstructVideo } from "../src/server/instruct";
+import { addClip, apply, cleanUp, instructEdit, instructStep, startInstruction, watchSeconds, type InstructHighlight, type InstructVideo } from "../src/server/instruct";
 import type { Edl } from "../src/server/edl";
 
 const edl = (): Edl => ({
@@ -337,6 +337,47 @@ describe("Watching more than a quick answer allows", () => {
     const lengths = new Map([["asset:two", 60]]);
     expect(await instructEdit(edl(), "tighten", new Map(), { openrouterKey: "k" }, lengths, analyze, [], [], { watchBudget: 180 })).not.toHaveProperty("background");
     expect(await instructEdit(edl(), "tighten", new Map(), { openrouterKey: "k" }, new Map(), analyze, [], [])).not.toHaveProperty("background");
+  });
+});
+
+describe("A request in steps", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("carries on from saved state to the same result as running inline", async () => {
+    const replies = () => {
+      let n = 0;
+      return vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: [
+        { tool_calls: [{ id: "1", function: { name: "trim_clip", arguments: JSON.stringify({ clip: 0, seconds: 10 }) } }, { id: "2", function: { name: "delete_clip", arguments: JSON.stringify({ clip: 1 }) } }] },
+        { content: "Trimmed and dropped." },
+      ][n++] }] })));
+    };
+    vi.stubGlobal("fetch", replies());
+    const inline = await instructEdit(edl(), "tighten", new Map(), { openrouterKey: "k" });
+    vi.stubGlobal("fetch", replies());
+    const ctx = { cfg: { openrouterKey: "k" }, assetNames: new Map<string, string>() };
+    let state = startInstruction(edl(), "tighten", new Map());
+    const doing: string[] = [];
+    for (;;) {
+      const out = await instructStep(JSON.parse(JSON.stringify(state)), ctx);
+      if ("done" in out) {
+        expect(out.done).toEqual(inline);
+        break;
+      }
+      state = out.state;
+      doing.push(state.doing);
+    }
+    expect(doing).toEqual(["Changing the cut", "Changing the cut", "Checking the result"]);
+  });
+
+  it("marks watching footage as slow, and says which clip", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { tool_calls: [
+      { id: "1", function: { name: "clean_up_clip", arguments: JSON.stringify({ clip: 0 }) } },
+    ] } }] }))));
+    const ctx = { cfg: { openrouterKey: "k" }, assetNames: new Map([["asset:one", "Booth.mp4"]]), analyze: async () => ({ keeps: [{ start: 5, end: 9 }], notes: "" }) };
+    const first = await instructStep(startInstruction(edl(), "tighten", new Map()), ctx);
+    if (!("state" in first)) throw new Error("expected a state");
+    expect(first.state.doing).toBe('Watching "Booth.mp4" for the parts worth keeping');
+    const second = await instructStep(first.state, ctx);
+    expect(second).toMatchObject({ slow: true });
   });
 });
 

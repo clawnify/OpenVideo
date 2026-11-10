@@ -229,12 +229,15 @@ answered inline: the reply has `asked: true` and a `job` with `status:
 "proposed"`, and `said` says how much it would watch. Run it with
 `POST …/ask/jobs/{job}/run`, or send `background: true` with the instruction
 to skip the proposal when you already know you want it. Then read
-`GET /api/projects/{id}/ask` until the job is no longer `queued` or `running`:
+`GET /api/projects/{id}/ask` until the job is no longer `queued` or `running`.
+A job runs a few steps at a time; while it runs, `doing` says what it is doing
+now and `applied` lists what it has done so far. It ends as:
 
 - `applied`: the cut was changed (or the answer was a question, in the conversation)
 - `stale`: someone changed the cut while it ran, so the result was kept aside,
   never written over their edit. Apply it with `…/apply` only if the person wants it
-- `failed` (with `error`) or `cancelled`
+- `failed` (with `error`, e.g. "stopped without finishing" when it has not moved
+  for 20 minutes) or `cancelled`
 
 Google Drive limits how often a file shared with the link can be downloaded,
 and on a heavy day it refuses the files of a whole folder for a while. It
@@ -315,7 +318,7 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
 | POST | `/api/projects/{id}/instruct` | `{ instruction, background? }` — change the existing cut in words → `{ edl, said, applied, asked, job? }`; `asked: true` means `said` is a question back (or, with `job`, a proposal) and nothing was changed. `background: true` → `202` with a queued `job` |
 | GET  | `/api/projects/{id}/ask` | The project's AI conversation, oldest first, and its recent background jobs → `{ messages: [{ role, text, author, applied, asked, failed, job_id }], jobs }` |
-| GET  | `/api/projects/{id}/ask/jobs/{job}` | One background job with `base_edl` (the cut it started from) and `result_edl` |
+| GET  | `/api/projects/{id}/ask/jobs/{job}` | One background job with `base_edl` (the cut it started from), `draft_edl` (its cut so far, while it runs) and `result_edl` |
 | POST | `/api/projects/{id}/ask/jobs/{job}/run` | Yes to a proposal: run it in the background → `202` |
 | POST | `/api/projects/{id}/ask/jobs/{job}/cancel` | Drop a proposal, stop a queued or running job (its result is not applied), or let go of a kept one |
 | POST | `/api/projects/{id}/ask/jobs/{job}/apply` | Apply a result kept aside because the cut changed while it ran |
