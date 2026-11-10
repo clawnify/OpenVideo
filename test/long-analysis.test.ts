@@ -78,6 +78,34 @@ describe("reading clips longer than five minutes", () => {
     expect(out).toMatchObject({ result: { cuts: [{ start_ms: 512_000, end_ms: 519_000, keep: true }], model: "clawnify-video-analysis" } });
   });
 
+  it("collects the same analysis again instead of paying for another", async () => {
+    vi.mocked(getVideoAnalysis).mockResolvedValue({
+      job_id: "job",
+      status: "done",
+      result: { cuts: [{ start_ms: 512_000, end_ms: 519_000, label: "answer", keep: true }], captions: [], notes: "" },
+    } as never);
+    const ask = () => settled(analyzeAsset("talk", { mode: "cuts", window: { start: 510, end: 1110 } }, cfg));
+    const first = await ask();
+    const again = await ask();
+    expect(startVideoAnalysis).toHaveBeenCalledTimes(1);
+    expect(again).toEqual(first);
+  });
+
+  it("resumes a job a dropped request left running", async () => {
+    // The first request gives up while the job still runs (a phone locks, say).
+    vi.mocked(getVideoAnalysis).mockResolvedValue({ job_id: "job", status: "running" } as never);
+    const lost = await settled(analyzeAsset("talk", { mode: "cuts", window: { start: 510, end: 1110 } }, cfg));
+    expect(lost).toMatchObject({ failure: { detail: expect.stringMatching(/ask again/) } });
+    vi.mocked(getVideoAnalysis).mockResolvedValue({
+      job_id: "job",
+      status: "done",
+      result: { cuts: [{ start_ms: 512_000, end_ms: 519_000, label: "answer", keep: true }], captions: [], notes: "" },
+    } as never);
+    const collected = await settled(analyzeAsset("talk", { mode: "cuts", window: { start: 510, end: 1110 } }, cfg));
+    expect(startVideoAnalysis).toHaveBeenCalledTimes(1);
+    expect(collected).toMatchObject({ result: { cuts: [{ start_ms: 512_000 }] } });
+  });
+
   it("keeps short clips on the short path", async () => {
     const out = await analyzeAsset("short", { mode: "cuts" }, cfg);
     expect(startVideoAnalysis).not.toHaveBeenCalled();

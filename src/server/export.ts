@@ -529,7 +529,7 @@ export async function analyzeAsset(
     const window = opts.window ?? { start: 0, end: source.duration! };
     const long = await analyzeLong<Partial<AnalyzeResult>>(
       cfg,
-      source.media_uid,
+      { id: assetId, mediaUid: source.media_uid },
       window,
       analysisPrompt(mode, opts.prompt, window),
       ANALYSIS_SCHEMA,
@@ -934,7 +934,7 @@ async function autocutLong(
     assets.map((a, i) =>
       analyzeLong<{ segments?: { start_ms: number; end_ms: number; label: string; caption: string }[]; notes?: string }>(
         cfg,
-        sources[i]!.media_uid!,
+        { id: a.id, mediaUid: sources[i]!.media_uid! },
         { start: 0, end: sources[i]!.duration! },
         `You are a video editor. Watch this raw clip ("${a.name}") and choose the segments worth keeping for the finished ` +
           `video: tight in and out points, no dead air, false starts, filler or repetition, in the order they should play. ` +
