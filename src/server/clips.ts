@@ -362,7 +362,7 @@ export function taskDoing(t: ClipsTask): string {
     case "pick":
       return `Picking ${t.count} moments from ${name}`;
     case "create":
-      return `Making ${t.plans?.length ?? 0} clip projects`;
+      return `Making ${t.plans?.length ?? 0} videos`;
     case "frame": {
       const parts = t.targets.flatMap((x) => x.parts);
       const read = parts.filter((p) => p.status === "done" || p.status === "failed").length;
@@ -494,5 +494,5 @@ function summary(t: ClipsTask): string {
     return framed.length ? `Framed the cut for 9:16${tail}` : `Could not frame the cut${tail}`;
   }
   const list = (t.plans ?? []).map((p, i) => `${i + 1}. ${p.title} (${Math.round(p.body.end - p.body.start + (p.hook ? p.hook.end - p.hook.start : 0))}s${p.hook ? ", opens on its hook" : ""})`);
-  return `Made ${t.targets.length} vertical clip${t.targets.length === 1 ? "" : "s"} from "${t.video!.name}", each its own project with captions: ${list.join("; ")}. ${framed.length} framed on the speaker${tail}`;
+  return `Made ${t.targets.length} vertical clip${t.targets.length === 1 ? "" : "s"} from "${t.video!.name}", each its own video in this project, with captions: ${list.join("; ")}. ${framed.length} framed on the speaker${tail}`;
 }

@@ -266,7 +266,7 @@ const OPS = [
   {
     name: "make_clips",
     description:
-      "Cut several SEPARATE short vertical (9:16) videos out of one long listed video, each its own project: it reads what is said, picks the moments that stand on their own, opens each on its strongest line, and makes each its own project with captions, framed on the speaker. Use it whenever the person wants more than one video: clips, cut-downs, shorts, reels, teasers or 'N clips' from a talk, interview or podcast, even when the long video is the one in this cut. Highlights already found are used as the moments to prefer. It does not change this cut.",
+      "Cut several SEPARATE short vertical (9:16) videos out of one long listed video, each its own video in this project: it reads what is said, picks the moments that stand on their own, opens each on its strongest line, and makes each its own video with captions, framed on the speaker. Use it whenever the person wants more than one video: clips, cut-downs, shorts, reels, teasers or 'N clips' from a talk, interview or podcast, even when the long video is the one in this cut. Highlights already found are used as the moments to prefer. It does not change this cut.",
     parameters: {
       type: "object",
       properties: {
@@ -685,7 +685,7 @@ const SYSTEM = [
   "Earlier messages in this conversation are listed before the request; use them to resolve what 'it', 'that' or 'shorter' means. The cut shown is the current one, which may have been edited since.",
   "Call ask_user instead of guessing when the request is ambiguous, and to confirm your plan first when it would watch more than two clips. Never ask about something the request already says.",
   "When videos are listed that are not in the cut and the person asks to make something from 'these clips' or 'my videos', build it from them: assemble for a cut that needs the best moments, add_clip to place a video as it is. If it is unclear which videos they mean, ask.",
-  "Several videos ('5 cut-downs', 'clips', 'shorts', 'reels', 'teasers') are never one cut: call make_clips once with the long video they come from, the one in this cut when there is one. It makes a new project per clip and leaves this cut alone; never put several clips one after another in this cut instead. For framing this one cut for vertical or keeping a speaker in frame, call reframe.",
+  "Several videos ('5 cut-downs', 'clips', 'shorts', 'reels', 'teasers') are never one cut: call make_clips once with the long video they come from, the one in this cut when there is one. It makes a new video in this project per clip and leaves this cut alone; never put several clips one after another in this cut instead. For framing this one cut for vertical or keeping a speaker in frame, call reframe.",
   "When highlights are listed, they are the best parts of the footage: to build or extend this ONE cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then ones marked best, then higher scores, and keep to the length asked for.",
 ].join(" ");
 
@@ -869,7 +869,7 @@ export async function instructStep(
       s.applied.push(out.said);
       answer(callId, `done: ${out.said}`);
     } else {
-      answer(callId, `could not: ${out.error}${out.made.length ? ` (${out.made.length} projects were made before it stopped)` : ""}`);
+      answer(callId, `could not: ${out.error}${out.made.length ? ` (${out.made.length} videos were made before it stopped)` : ""}`);
     }
     return { state: s };
   }

@@ -472,3 +472,9 @@ ALTER TABLE ask_messages ADD COLUMN made TEXT;
 
 -- When an applied AI change was put back to the cut before it (POST …/ask/jobs/{job}/revert).
 ALTER TABLE ask_jobs ADD COLUMN reverted_at TEXT;
+
+-- Videos of one project: every edit made from a project's footage (a cut-down,
+-- a teaser) is its own row, pointing at the row that holds the footage, its
+-- highlights and its conversation. NULL: a project (and its first video).
+ALTER TABLE edit_projects ADD COLUMN parent_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_edit_projects_parent ON edit_projects(parent_id);

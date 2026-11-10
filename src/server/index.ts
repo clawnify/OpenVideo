@@ -680,20 +680,80 @@ app.get("/api/projects", async (c) => {
   >(
     `SELECT p.id, p.name, p.created_at, p.updated_at,
             (SELECT COUNT(*) FROM project_footage f WHERE f.project_id = p.id AND f.status != 'removed') AS footage,
+            (SELECT json_group_array(v.id) FROM edit_projects v WHERE v.parent_id = p.id) AS video_ids,
             a.key AS cover_key, a.content_type AS cover_type,
             a.id AS cover_asset, a.media_uid AS cover_media,
             json_extract(p.edl, '$.main.elements[0].trimStart') AS cover_at
        FROM edit_projects p
        LEFT JOIN assets a ON a.id = substr(json_extract(p.edl, '$.main.elements[0].src'), 7)
+      WHERE p.parent_id IS NULL
       ORDER BY p.updated_at DESC`,
   );
-  return c.json(rows);
+  // A project's other videos live inside it, not in this list.
+  return c.json(rows.map((r) => {
+    const ids = JSON.parse((r as { video_ids?: string }).video_ids ?? "[]") as string[];
+    return { ...r, video_ids: ids, videos: ids.length + 1 };
+  }));
 });
 
 app.get("/api/projects/:id", async (c) => {
   const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
   if (!row) return c.json({ error: "Not found" }, 404);
   return c.json(projectOut(row));
+});
+
+/** The project a video belongs to: its own id for a project's first video. */
+async function projectOf(id: string): Promise<string | null> {
+  const row = await get<{ id: string; parent_id: string | null }>("SELECT id, parent_id FROM edit_projects WHERE id = ?", [id]);
+  return row ? (row.parent_id ?? row.id) : null;
+}
+
+/** Every video of the project this one belongs to: the first, then the rest as they were made. */
+app.get("/api/projects/:id/videos", async (c) => {
+  const root = await projectOf(c.req.param("id"));
+  if (!root) return c.json({ error: "Not found" }, 404);
+  const rows = await query<{ id: string; name: string; edl: string; parent_id: string | null; created_at: string; updated_at: string }>(
+    "SELECT id, name, edl, parent_id, created_at, updated_at FROM edit_projects WHERE id = ? OR parent_id = ? ORDER BY parent_id IS NOT NULL, created_at, rowid",
+    [root, root],
+  );
+  return c.json({
+    project: root,
+    videos: rows.map((r) => {
+      const edl = JSON.parse(r.edl) as Edl;
+      const seconds = edl.main.elements.reduce((n, el) => n + (("duration" in el && el.duration) || 0), 0);
+      return {
+        id: r.id,
+        name: r.name,
+        first: r.parent_id === null,
+        shapes: [edl.output, ...(edl.formats ?? [])].map((f) => `${f.width}x${f.height}`),
+        seconds: Math.round(seconds * 10) / 10,
+        updated_at: r.updated_at,
+      };
+    }),
+  });
+});
+
+/** A new video in this project: empty, or a copy of one of its videos (`from`), to cut differently. */
+app.post("/api/projects/:id/videos", async (c) => {
+  const root = await projectOf(c.req.param("id"));
+  if (!root) return c.json({ error: "Not found" }, 404);
+  const b = await c.req.json<{ name?: string; from?: string }>().catch(() => ({}) as { name?: string; from?: string });
+  const name = b.name?.trim();
+  if (!name) return c.json({ error: "invalid_request", detail: "name is required" }, 400);
+  let edl: Edl = { ...starterEdl(), output: { width: 1080, height: 1920, fps: 30, background: "#000000" } };
+  if (b.from) {
+    const src = await get<{ edl: string }>("SELECT edl FROM edit_projects WHERE id = ? AND (id = ? OR parent_id = ?)", [b.from, root, root]);
+    if (!src) return c.json({ error: "not_found", detail: "that video is not in this project" }, 404);
+    edl = JSON.parse(src.edl) as Edl;
+  }
+  const id = crypto.randomUUID();
+  await run("INSERT INTO edit_projects (id, name, edl, brief, parent_id) SELECT ?, ?, ?, brief, id FROM edit_projects WHERE id = ?", [
+    id,
+    name.slice(0, 200),
+    JSON.stringify(edl),
+    root,
+  ]);
+  return c.json(projectOut((await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]))!), 201);
 });
 
 app.post("/api/projects", async (c) => {
@@ -738,7 +798,19 @@ app.put("/api/projects/:id", async (c) => {
   const existing = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
   if (!existing) return c.json({ error: "Not found" }, 404);
 
-  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string }>();
+  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string; parent_id?: string }>();
+  // Move a project in as a video of another one: only a project with no
+  // footage and no videos of its own, into a project (never into a video).
+  if (b.parent_id !== undefined && b.parent_id !== (existing as { parent_id?: string | null }).parent_id) {
+    const into = await get<{ id: string }>("SELECT id FROM edit_projects WHERE id = ? AND parent_id IS NULL AND id != ?", [b.parent_id, id]);
+    const own = await get<{ n: number }>(
+      "SELECT (SELECT COUNT(*) FROM edit_projects WHERE parent_id = ?) + (SELECT COUNT(*) FROM project_footage WHERE project_id = ?) AS n",
+      [id, id],
+    );
+    if (!into) return c.json({ error: "invalid_request", detail: "parent_id must be a project" }, 422);
+    if (own && own.n > 0) return c.json({ error: "conflict", detail: "this project has footage or videos of its own" }, 409);
+    await run("UPDATE edit_projects SET parent_id = ? WHERE id = ?", [into.id, id]);
+  }
   let edlJson = existing.edl;
   if (b.edl !== undefined) {
     const v = validateEdl(b.edl);
@@ -768,7 +840,9 @@ app.put("/api/projects/:id", async (c) => {
  * first, then the best, in the order the model put them when the project
  * asked for a number of them (the first that many are marked best).
  */
-async function instructHighlights(projectId: string): Promise<InstructHighlight[]> {
+async function instructHighlights(videoId: string): Promise<InstructHighlight[]> {
+  // Footage and its highlights belong to the project, whichever of its videos asks.
+  const projectId = (await projectOf(videoId)) ?? videoId;
   const project = await get<{ highlights_wanted: number | null }>("SELECT highlights_wanted FROM edit_projects WHERE id = ?", [projectId]);
   const wanted = project?.highlights_wanted ?? 0;
   const rows = await query<{ id: string; asset_id: string; kind: HighlightKind; src_in: number; src_out: number; text: string; speaker: string; score: number; pick: string | null }>(
@@ -803,12 +877,12 @@ const MAX_LISTED_VIDEOS = 40;
 async function instructVideos(projectId: string): Promise<InstructVideo[]> {
   const rows = await query<{ id: string; name: string; duration: number | null; in_project: number }>(
     `SELECT a.id, a.name, a.duration,
-            EXISTS (SELECT 1 FROM project_footage f WHERE f.project_id = ? AND f.asset_id = a.id AND f.status = 'ready') AS in_project
+            EXISTS (SELECT 1 FROM project_footage f WHERE f.project_id = COALESCE((SELECT parent_id FROM edit_projects WHERE id = ?), ?) AND f.asset_id = a.id AND f.status = 'ready') AS in_project
        FROM assets a
       WHERE a.content_type LIKE 'video/%' AND a.deleting = 0
       ORDER BY in_project DESC, a.created_at DESC, a.id
       LIMIT ?`,
-    [projectId, MAX_LISTED_VIDEOS],
+    [projectId, projectId, MAX_LISTED_VIDEOS],
   );
   return rows.map((r, i) => ({ id: `v${i + 1}`, src: `asset:${r.id}`, name: r.name, seconds: r.duration ?? null, inProject: r.in_project === 1 }));
 }
@@ -910,12 +984,13 @@ async function instructContext(env: Bindings, projectId: string): Promise<Instru
       };
     },
     assemble: assembler(env, brief),
-    clips: env.CLAWNIFY_TOKEN ? clipDeps(env) : undefined,
+    // Clips become videos of the project this one belongs to.
+    clips: env.CLAWNIFY_TOKEN ? clipDeps(env, (await projectOf(projectId)) ?? projectId) : undefined,
   };
 }
 
 /** What making clips and framing need from this app: transcripts, the model, projects, framing analysis. */
-function clipDeps(env: Bindings): ClipDeps {
+function clipDeps(env: Bindings, project: string): ClipDeps {
   return {
     async transcript(assetId) {
       // A transcript already made is used in whatever language it is in.
@@ -931,7 +1006,13 @@ function clipDeps(env: Bindings): ClipDeps {
     async createProject(id, name, edl, brief) {
       const checked = validateEdl(edl);
       if ("invalid" in checked) throw new Error(checked.invalid.detail);
-      await run("INSERT OR IGNORE INTO edit_projects (id, name, edl, brief) VALUES (?, ?, ?, ?)", [id, name.slice(0, 100), JSON.stringify(checked.edl), brief.slice(0, 1000)]);
+      await run("INSERT OR IGNORE INTO edit_projects (id, name, edl, brief, parent_id) VALUES (?, ?, ?, ?, ?)", [
+        id,
+        name.slice(0, 100),
+        JSON.stringify(checked.edl),
+        brief.slice(0, 1000),
+        project,
+      ]);
     },
     frame: async (assetId, start, end) => (await requestFraming(env, { asset_id: assetId, start, end })).body,
     check: async (id) => (await readFraming(env, id)).body,
@@ -1209,6 +1290,8 @@ app.post("/api/projects/:id/autocut", async (c) => {
 app.delete("/api/projects/:id", async (c) => {
   await backfillHighlights();
   const id = c.req.param("id");
+  // A project's other videos go first, so its footage is no longer theirs.
+  for (const v of await query<{ id: string }>("SELECT id FROM edit_projects WHERE parent_id = ?", [id])) await deleteVideoRows(v.id);
   // Its footage from Drive goes first. Each clip is a copy on the media
   // service, counted against the org's storage until it is deleted there, so
   // a big shoot is deleted a batch per call: 202 says how many are left, and
@@ -1281,6 +1364,12 @@ app.delete("/api/projects/:id", async (c) => {
   }
   await run("DELETE FROM footage_sources WHERE project_id = ?", [id]);
   await run("DELETE FROM footage_highlights WHERE project_id = ?", [id]);
+  await deleteVideoRows(id);
+  return c.json({ ok: true });
+});
+
+/** One video and what is its own: exports and their files, share link, comments, conversation. */
+async function deleteVideoRows(id: string): Promise<void> {
   // Drop each completed export's rendered file from storage before the rows go,
   // otherwise the renders/*.mp4 objects outlive the only rows that point to them
   // and are orphaned forever. Best-effort: a storage hiccup must not strand the
@@ -1297,8 +1386,7 @@ app.delete("/api/projects/:id", async (c) => {
   await run("DELETE FROM ask_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
   await run("DELETE FROM edit_projects WHERE id = ?", [id]);
-  return c.json({ ok: true });
-});
+}
 
 // ── Footage from Drive folders ──────────────────────────────────────
 // A project's own clips, from folders shared with the link: imported and

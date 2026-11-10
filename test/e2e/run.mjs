@@ -1568,10 +1568,30 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
     // The hook first, then the moment, each framed on the speaker.
     assert.deepEqual(clip.edl.main.elements.map((e) => [e.trimStart, e.fit, !!e.crop]), [[129.9, "cover", true], [99.9, "cover", true]]);
     assert.equal((await call("GET", `/api/projects/${last.made[1].id}`)).data.edl.main.elements.length, 1, "a clip that opens on its hook plays it once");
-    for (const p of [pi, ...last.made.map((m) => m.id)]) await call("DELETE", `/api/projects/${p}`);
+    // The clips are videos of the interview's project, not projects of their own.
+    assert.equal(clip.parent_id, pi);
+    r = await call("GET", "/api/projects");
+    assert.ok(!r.data.some((p) => last.made.some((m) => m.id === p.id)), "not in the projects list");
+    assert.equal(r.data.find((p) => p.id === pi).videos, 3);
+    r = await call("GET", `/api/projects/${last.made[0].id}/videos`);
+    assert.equal(r.data.project, pi);
+    assert.deepEqual(r.data.videos.map((v) => v.first), [true, false, false]);
+    assert.deepEqual(r.data.videos[1].shapes, ["1080x1920"]);
+    // A new video and a copy, then a project moved in; one with footage of its own cannot be.
+    r = await call("POST", `/api/projects/${last.made[0].id}/videos`, { name: "Teaser", from: last.made[0].id });
+    assert.equal(r.status, 201, JSON.stringify(r.data));
+    assert.equal(r.data.parent_id, pi);
+    assert.equal(r.data.edl.main.elements.length, 2, "a copy of the clip");
+    const loose = (await call("POST", "/api/projects", { name: "Loose" })).data.id;
+    assert.equal((await call("PUT", `/api/projects/${loose}`, { parent_id: pi })).status, 200);
+    assert.equal((await call("GET", `/api/projects/${pi}/videos`)).data.videos.length, 5);
+    assert.equal((await call("PUT", `/api/projects/${pi}`, { parent_id: loose })).status, 422, "never into a video");
+    // Deleting the project deletes its videos.
+    await call("DELETE", `/api/projects/${pi}`);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM edit_projects WHERE id = ? OR parent_id = ?").get(pi, pi).n, 0);
     db.prepare("DELETE FROM assets WHERE id = 'talk'").run();
     world.askReplies = null;
-    console.log("17 ok: clips with a hook from one long talk become 9:16 projects with captions, framed on the speaker, in the background; the project asked from is unchanged");
+    console.log("17 ok: clips with a hook from one long talk become 9:16 videos of the project, with captions, framed on the speaker, in the background; the video asked from is unchanged; videos list, copy, move in and go with the project");
   }
   console.log("16 ok: Ask asks back without changing anything, a follow-up reads the question, a failure is shown but not read, start over and project delete clear it; from an empty timeline it places a library video; long requests are proposed, run in the background on a yes, never over a change made meanwhile, and can be cancelled; a job runs a few steps per delivery, says what it is doing, is rebooked when its delivery is lost and marked failed when it stops");
 }

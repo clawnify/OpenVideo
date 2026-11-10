@@ -231,16 +231,39 @@ tell the person it is running: the editor shows its progress. Read `GET
 /api/projects/{id}/ask` for how it ended, and pass on what `said` says,
 including any shot it was unsure how to frame.
 
+### Projects hold videos
+
+A project is its footage plus every video made from it. The row you create
+with `POST /api/projects` is the project and its first video; it holds the
+footage, highlights and conversation. Every other video (a cut-down, a
+teaser) is a row of its own with `parent_id` set to it, with its own
+timeline, formats, exports, share link and comments, and is left out of `GET
+/api/projects` (which counts them in `videos`). `GET
+/api/projects/{id}/videos` lists a project's videos from any of them; `POST
+/api/projects/{id}/videos { name, from? }` makes a new one, empty (9:16) or a
+copy of `from`; `PUT /api/projects/{id} { parent_id }` moves a project with no
+footage or videos of its own in. Deleting the project deletes its videos;
+deleting a video deletes only that video.
+
+### Putting an AI change back
+
+Every change `/instruct` makes is recorded as a job with the cut before and
+after it, and is written only over the cut it read (otherwise it comes back
+`stale`, kept aside, and the cut stays as the person left it). `POST
+/api/projects/{id}/ask/jobs/{job}/revert` puts the cut back as it was, while
+the cut is still what that change made (`revertible: true`); after a later
+edit it answers 409, and the person undoes it in the editor instead.
+
 ### Clips from a long video, and framing for vertical
 
 "5 vertical clips with a strong hook from this interview" is one request:
 `/instruct` reads the video's transcript, picks the moments that stand on
 their own (about 45 seconds unless asked otherwise, at most 8), opens each on
 its strongest line (played first when it comes later in the moment), and makes
-each one **its own project**: 1080×1920 with captions on, framed on the person
-speaking. The project the request was sent to is not changed. The finished
+each one **its own video in the project**: 1080×1920 with captions on, framed on the person
+speaking. The video the request was sent to is not changed. The finished
 message, and the job while it runs, list them in `made: [{ id, name }]`; open
-one at `/edits/{id}`. "Frame it for vertical" frames the project's own cut the
+one at `/edits/{id}`. "Frame it for vertical" frames the video it was sent to the
 same way, in its 9:16 version (added when missing). Shots the framing is unsure
 of keep the whole picture, and the message says how many: a person checks them
 in the editor's AI reframe. Both need the video on the media service (an
