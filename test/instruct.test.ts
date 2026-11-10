@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addClip, apply, cleanUp, instructEdit, type InstructHighlight, type InstructVideo } from "../src/server/instruct";
+import { addClip, apply, cleanUp, instructEdit, watchSeconds, type InstructHighlight, type InstructVideo } from "../src/server/instruct";
 import type { Edl } from "../src/server/edl";
 
 const edl = (): Edl => ({
@@ -307,6 +307,36 @@ describe("Videos added but not in the cut", () => {
     expect(assemble).toHaveBeenCalledWith([{ id: "new1", name: "Booth.mp4" }, { id: "new2", name: "Interview.mp4" }], "30s reel");
     expect(out).toMatchObject({ said: "Built a 30 second reel.", applied: ["Built the cut from 2 videos: 2 pieces (best moments)"] });
     if ("edl" in out) expect(out.edl.main.elements.map((e) => e.src)).toEqual(["asset:new1", "asset:new2"]);
+  });
+});
+
+describe("Watching more than a quick answer allows", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const cleanUpBoth = () => vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { tool_calls: [
+    { id: "1", function: { name: "clean_up_clip", arguments: JSON.stringify({ clip: 0 }) } },
+    { id: "2", function: { name: "clean_up_clip", arguments: JSON.stringify({ clip: 1 }) } },
+  ] } }] }))));
+
+  it("measures a clip's window, and an unknown end as too long", () => {
+    expect(watchSeconds(edl(), { clip: 0 }, new Map())).toBe(20);
+    expect(watchSeconds(edl(), { clip: 1 }, new Map([["asset:two", 300]]))).toBe(300);
+    expect(watchSeconds(edl(), { clip: 1 }, new Map())).toBe(Infinity);
+  });
+
+  it("stops before watching anything, and changes nothing", async () => {
+    cleanUpBoth();
+    const analyze = vi.fn();
+    const out = await instructEdit(edl(), "tighten everything", new Map(), { openrouterKey: "k" }, new Map([["asset:two", 300]]), analyze, [], [], { watchBudget: 180 });
+    expect(out).toEqual({ background: { clips: 2, seconds: 320 } });
+    expect(analyze).not.toHaveBeenCalled();
+  });
+
+  it("watches inline within the limit, and without one in the background", async () => {
+    cleanUpBoth();
+    const analyze = vi.fn(async () => ({ keeps: [{ start: 0, end: 1 }], notes: "" }));
+    const lengths = new Map([["asset:two", 60]]);
+    expect(await instructEdit(edl(), "tighten", new Map(), { openrouterKey: "k" }, lengths, analyze, [], [], { watchBudget: 180 })).not.toHaveProperty("background");
+    expect(await instructEdit(edl(), "tighten", new Map(), { openrouterKey: "k" }, new Map(), analyze, [], [])).not.toHaveProperty("background");
   });
 });
 

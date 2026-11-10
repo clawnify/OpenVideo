@@ -22,7 +22,8 @@
       { "path": "/api/drive/imports/step", "methods": ["POST"] },
       { "path": "/s/**", "methods": ["GET", "HEAD"] },
       { "path": "/s/*/comments", "methods": ["POST"] },
-      { "path": "/api/footage/step", "methods": ["POST"] }
+      { "path": "/api/footage/step", "methods": ["POST"] },
+      { "path": "/api/ask/step", "methods": ["POST"] }
     ],
     "server_routes": ["/s/*"]
   },

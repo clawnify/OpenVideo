@@ -224,6 +224,18 @@ more than two clips, it answers with `asked: true` and a question or plan in
 `said`, and changes nothing. Answer by sending the reply as the next
 `instruction`.
 
+A request that would watch more than about three minutes of footage is not
+answered inline: the reply has `asked: true` and a `job` with `status:
+"proposed"`, and `said` says how much it would watch. Run it with
+`POST …/ask/jobs/{job}/run`, or send `background: true` with the instruction
+to skip the proposal when you already know you want it. Then read
+`GET /api/projects/{id}/ask` until the job is no longer `queued` or `running`:
+
+- `applied`: the cut was changed (or the answer was a question, in the conversation)
+- `stale`: someone changed the cut while it ran, so the result was kept aside,
+  never written over their edit. Apply it with `…/apply` only if the person wants it
+- `failed` (with `error`) or `cancelled`
+
 Google Drive limits how often a file shared with the link can be downloaded,
 and on a heavy day it refuses the files of a whole folder for a while. It
 refuses the whole file but still serves pieces of it, so a refused file of up
@@ -301,8 +313,12 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | GET  | `/api/projects/{id}/highlights/export` | `format=csv\|xml`: a sheet, or a Premiere Pro / Resolve timeline of the picks |
 | PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
-| POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied, asked }`; `asked: true` means `said` is a question back and nothing was changed |
-| GET  | `/api/projects/{id}/ask` | The project's AI conversation, oldest first → `{ messages: [{ role, text, author, applied, asked, failed }] }` |
+| POST | `/api/projects/{id}/instruct` | `{ instruction, background? }` — change the existing cut in words → `{ edl, said, applied, asked, job? }`; `asked: true` means `said` is a question back (or, with `job`, a proposal) and nothing was changed. `background: true` → `202` with a queued `job` |
+| GET  | `/api/projects/{id}/ask` | The project's AI conversation, oldest first, and its recent background jobs → `{ messages: [{ role, text, author, applied, asked, failed, job_id }], jobs }` |
+| GET  | `/api/projects/{id}/ask/jobs/{job}` | One background job with `base_edl` (the cut it started from) and `result_edl` |
+| POST | `/api/projects/{id}/ask/jobs/{job}/run` | Yes to a proposal: run it in the background → `202` |
+| POST | `/api/projects/{id}/ask/jobs/{job}/cancel` | Drop a proposal, stop a queued or running job (its result is not applied), or let go of a kept one |
+| POST | `/api/projects/{id}/ask/jobs/{job}/apply` | Apply a result kept aside because the cut changed while it ran |
 | DELETE | `/api/projects/{id}/ask` | Start the conversation over; the cut is untouched |
 | DELETE | `/api/projects/{id}` | Delete a project, its export history and its footage from Drive; `202 { remaining }` means call again |
 | POST | `/api/projects/{id}/export` | Export `{ quality?, format? }` → returns the job, `status: "exporting"` |

@@ -3,13 +3,16 @@
 // Ask what you want in your own words; the editor works out the steps and
 // applies them as one undo step. It remembers the conversation, so a
 // follow-up ("shorter", "a square one too") knows what it refers to, and it
-// asks back instead of guessing. Auto-cut and AI reframe still run in their
+// asks back instead of guessing. A request that would watch a lot of footage
+// says so first and, on a yes, runs in the background (src/server/ask-jobs.ts):
+// the editor keeps working, the tab can close, and the result never lands on
+// top of a change made meanwhile. Auto-cut and AI reframe still run in their
 // own dialogs, opened from here, until the conversation can run them itself.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Crop, Loader2, RotateCcw, Send, Sparkles, X } from "lucide-react";
 import { api, type Edl } from "./edit";
-import { btnGhost, btnIcon, btnPrimary } from "./ui";
+import { btnGhost, btnIcon, btnPrimary, btnSecondary } from "./ui";
 
 export interface AskMessage {
   id: string;
@@ -19,7 +22,19 @@ export interface AskMessage {
   applied: string[];
   asked: boolean;
   failed: boolean;
+  job_id?: string | null;
 }
+
+export type AskJobStatus = "proposed" | "queued" | "running" | "applied" | "stale" | "failed" | "cancelled";
+
+export interface AskJob {
+  id: string;
+  status: AskJobStatus;
+  applied: string[];
+  error: string | null;
+}
+
+const ACTIVE: AskJobStatus[] = ["queued", "running"];
 
 /** Requests that show what it can do, sent as written. */
 const SUGGESTIONS = [
@@ -29,8 +44,100 @@ const SUGGESTIONS = [
   "Add a title for the first 3 seconds",
 ];
 
+/** JSON with keys in order: the server stores a cut with its keys in another order. */
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
+  if (v && typeof v === "object") {
+    return `{${Object.keys(v as object)
+      .sort()
+      .filter((k) => (v as Record<string, unknown>)[k] !== undefined)
+      .map((k) => `${JSON.stringify(k)}:${canonical((v as Record<string, unknown>)[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+/**
+ * The project's conversation and its background jobs. Lives in the editor,
+ * not the panel, so a job that finishes while the panel is closed still lands:
+ * its result becomes an undo step when the cut on screen is the one it started
+ * from, and otherwise waits for the person ("Apply anyway").
+ */
+export function useAsk(projectId: string, getEdl: () => Edl, onApplied: (edl: Edl) => void) {
+  const [messages, setMessages] = useState<AskMessage[] | null>(null);
+  const [jobs, setJobs] = useState<AskJob[]>([]);
+  const [loadErr, setLoadErr] = useState("");
+  /** Jobs whose result the editor did not take, because the cut changed first. */
+  const [notTaken, setNotTaken] = useState<Set<string>>(new Set());
+  const seenActive = useRef(new Set<string>());
+  const handled = useRef(new Set<string>());
+  const latest = useRef({ getEdl, onApplied });
+  latest.current = { getEdl, onApplied };
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await api.get<{ messages: AskMessage[]; jobs: AskJob[] }>(`/api/projects/${projectId}/ask`);
+      setMessages(r.messages);
+      setJobs(r.jobs);
+      setLoadErr("");
+      for (const j of r.jobs) {
+        if (ACTIVE.includes(j.status)) seenActive.current.add(j.id);
+        // Finished while this editor was open: take the result into the cut on screen.
+        if (j.status === "applied" && j.applied.length > 0 && seenActive.current.has(j.id) && !handled.current.has(j.id)) {
+          handled.current.add(j.id);
+          const detail = await api.get<{ base_edl: Edl | null; result_edl: Edl | null }>(`/api/projects/${projectId}/ask/jobs/${j.id}`);
+          if (detail.result_edl && detail.base_edl && canonical(latest.current.getEdl()) === canonical(detail.base_edl)) {
+            latest.current.onApplied(detail.result_edl);
+          } else if (detail.result_edl) {
+            // An edit made here got to the server after the job wrote: it kept
+            // the person's version. Offer the job's.
+            setNotTaken((s) => new Set(s).add(j.id));
+          }
+        }
+      }
+    } catch (e) {
+      setLoadErr(String((e as Error).message));
+      setMessages((m) => m ?? []);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const active = jobs.some((j) => ACTIVE.includes(j.status));
+  useEffect(() => {
+    if (!active) return;
+    const t = setInterval(() => void refresh(), 4000);
+    return () => clearInterval(t);
+  }, [active, refresh]);
+
+  const act = useCallback(
+    async (jobId: string, action: "run" | "cancel" | "apply") => {
+      const out = await api.send<{ result_edl?: Edl | null }>("POST", `/api/projects/${projectId}/ask/jobs/${jobId}/${action}`);
+      if (action === "run") seenActive.current.add(jobId);
+      if (action === "apply" && out.result_edl) {
+        handled.current.add(jobId);
+        latest.current.onApplied(out.result_edl);
+        setNotTaken((s) => {
+          const n = new Set(s);
+          n.delete(jobId);
+          return n;
+        });
+      }
+      await refresh();
+    },
+    [projectId, refresh],
+  );
+
+  return { messages, setMessages, jobs, active, notTaken, loadErr, refresh, act };
+}
+
+export type Ask = ReturnType<typeof useAsk>;
+
 export function AssistantPanel({
   projectId,
+  ask,
   pane,
   saving,
   canReframe,
@@ -40,6 +147,7 @@ export function AssistantPanel({
   onClose,
 }: {
   projectId: string;
+  ask: Ask;
   pane: "library" | "canvas" | "inspector";
   /** A change is still on its way to the server: the request would read the cut before it. */
   saving: boolean;
@@ -49,34 +157,28 @@ export function AssistantPanel({
   onReframe: () => void;
   onClose: () => void;
 }) {
-  const [messages, setMessages] = useState<AskMessage[] | null>(null);
+  const { messages, setMessages, jobs, notTaken, loadErr, refresh, act } = ask;
   const [draft, setDraft] = useState("");
   const [running, setRunning] = useState(false);
-  const [loadErr, setLoadErr] = useState("");
+  const [acting, setActing] = useState<string | null>(null);
+  const [actErr, setActErr] = useState("");
   const list = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    let live = true;
-    api
-      .get<{ messages: AskMessage[] }>(`/api/projects/${projectId}/ask`)
-      .then((r) => live && setMessages(r.messages))
-      .catch((e) => live && (setLoadErr(String((e as Error).message)), setMessages([])));
     input.current?.focus();
-    return () => {
-      live = false;
-    };
-  }, [projectId]);
+  }, []);
 
   useEffect(() => {
     list.current?.scrollTo({ top: list.current.scrollHeight });
-  }, [messages, running]);
+  }, [messages, running, jobs]);
 
   const send = async (text: string) => {
     const instruction = text.trim();
     if (!instruction || running || saving) return;
     setDraft("");
     setRunning(true);
+    setActErr("");
     const mine: AskMessage = { id: `local-${Date.now()}`, role: "user", text: instruction, author: null, applied: [], asked: false, failed: false };
     setMessages((m) => [...(m ?? []), mine]);
     try {
@@ -87,28 +189,83 @@ export function AssistantPanel({
       );
       // Only a request that changed something becomes an undo step.
       if (out.applied.length > 0) onApplied(out.edl);
-      setMessages((m) => [
-        ...(m ?? []),
-        { id: `local-${Date.now()}-a`, role: "assistant", text: out.said, author: null, applied: out.applied, asked: out.asked, failed: false },
-      ]);
-    } catch (e) {
-      setMessages((m) => [
-        ...(m ?? []),
-        { id: `local-${Date.now()}-f`, role: "assistant", text: String((e as Error).message), author: null, applied: [], asked: false, failed: true },
-      ]);
+    } catch {
+      /* the failure is in the conversation, read back below */
     } finally {
+      await refresh();
       setRunning(false);
       input.current?.focus();
     }
   };
 
+  const doAct = async (jobId: string, action: "run" | "cancel" | "apply") => {
+    setActing(`${jobId}:${action}`);
+    setActErr("");
+    try {
+      await act(jobId, action);
+    } catch (e) {
+      setActErr(String((e as Error).message));
+    } finally {
+      setActing(null);
+    }
+  };
+
   const startOver = async () => {
     await api.send("DELETE", `/api/projects/${projectId}/ask`).catch(() => {});
-    setMessages([]);
+    await refresh();
     input.current?.focus();
   };
 
   const empty = messages !== null && messages.length === 0;
+  // A job's controls go under the last message about it.
+  const lastOfJob = new Map<string, string>();
+  for (const m of messages ?? []) if (m.job_id) lastOfJob.set(m.job_id, m.id);
+  const jobById = new Map(jobs.map((j) => [j.id, j]));
+
+  const controls = (job: AskJob) => {
+    const busy = (a: string) => acting === `${job.id}:${a}`;
+    if (job.status === "proposed") {
+      return (
+        <div className="mt-2 flex gap-1.5">
+          <button onClick={() => doAct(job.id, "run")} disabled={acting !== null} className={btnPrimary}>
+            {busy("run") ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Run in background
+          </button>
+          <button onClick={() => doAct(job.id, "cancel")} disabled={acting !== null} className={btnGhost}>
+            Not now
+          </button>
+        </div>
+      );
+    }
+    if (ACTIVE.includes(job.status)) {
+      return (
+        <div className="mt-2 rounded-sm bg-surface-sunken px-3 py-2 text-fine text-muted">
+          <div className="flex items-center gap-2">
+            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+            <span className="flex-1">{job.status === "queued" ? "Starting in the background…" : "Working in the background…"}</span>
+            <button onClick={() => doAct(job.id, "cancel")} disabled={acting !== null} className={`${btnGhost} h-6 text-fine`}>
+              Cancel
+            </button>
+          </div>
+          <p className="mt-1 text-faint">Keep editing if you like: your changes stay, and this then waits for you to apply it.</p>
+        </div>
+      );
+    }
+    if (job.status === "stale" || notTaken.has(job.id)) {
+      return (
+        <div className="mt-2 flex gap-1.5">
+          <button onClick={() => doAct(job.id, "apply")} disabled={acting !== null} className={btnSecondary}>
+            {busy("apply") && <Loader2 className="w-4 h-4 animate-spin" />} Apply anyway
+          </button>
+          {job.status === "stale" && (
+            <button onClick={() => doAct(job.id, "cancel")} disabled={acting !== null} className={btnGhost}>
+              Discard
+            </button>
+          )}
+        </div>
+      );
+    }
+    return null;
+  };
 
   return (
     <aside
@@ -143,20 +300,29 @@ export function AssistantPanel({
             </p>
             <div className="mt-3 flex flex-col gap-1.5">
               {SUGGESTIONS.map((s) => (
-                <button key={s} onClick={() => send(s)} disabled={running || saving} className="w-full rounded-sm bg-surface px-2.5 py-1.5 text-left text-button text-foreground shadow-raised hover:bg-surface-sunken disabled:opacity-50 disabled:pointer-events-none">
+                <button
+                  key={s}
+                  onClick={() => send(s)}
+                  disabled={running || saving}
+                  className="w-full rounded-sm bg-surface px-2.5 py-1.5 text-left text-button text-foreground shadow-raised hover:bg-surface-sunken disabled:opacity-50 disabled:pointer-events-none"
+                >
                   {s}
                 </button>
               ))}
             </div>
           </div>
         )}
-        {messages?.map((m) =>
-          m.role === "user" ? (
-            <div key={m.id} className="flex flex-col items-end">
-              {m.author && <span className="text-fine text-faint mb-0.5">{m.author}</span>}
-              <div className="max-w-[90%] rounded-md bg-surface-sunken px-3 py-2 text-body-sm whitespace-pre-wrap break-words">{m.text}</div>
-            </div>
-          ) : (
+        {messages?.map((m) => {
+          if (m.role === "user") {
+            return (
+              <div key={m.id} className="flex flex-col items-end">
+                {m.author && <span className="text-fine text-faint mb-0.5">{m.author}</span>}
+                <div className="max-w-[90%] rounded-md bg-surface-sunken px-3 py-2 text-body-sm whitespace-pre-wrap break-words">{m.text}</div>
+              </div>
+            );
+          }
+          const job = m.job_id && lastOfJob.get(m.job_id) === m.id ? jobById.get(m.job_id) : undefined;
+          return (
             <div key={m.id} className="text-body-sm">
               <p className={`whitespace-pre-wrap break-words ${m.failed ? "text-danger" : ""}`}>{m.text}</p>
               {m.applied.length > 0 && (
@@ -166,14 +332,16 @@ export function AssistantPanel({
                   ))}
                 </ul>
               )}
+              {job && controls(job)}
             </div>
-          ),
-        )}
+          );
+        })}
         {running && (
           <div className="flex items-center gap-2 text-fine text-muted">
             <Loader2 className="w-4 h-4 animate-spin" /> Working through the cut…
           </div>
         )}
+        {actErr && <div className="text-fine text-danger break-words">{actErr}</div>}
       </div>
 
       <div className="border-t border-border p-3 shrink-0">
