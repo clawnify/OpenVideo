@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   advanceTask,
   clipEdl,
+  clipsPrompt,
   clipsTask,
   frameTargets,
   frameTask,
@@ -59,6 +60,12 @@ describe("Picking the moments", () => {
     expect(got).toHaveLength(2);
     expect(got[0].body.end - got[0].body.start).toBeLessThanOrEqual(48.5);
     expect(readClipPlans({ nonsense: true }, cues, DURATION, 3, 30)).toEqual([]);
+  });
+
+  it("offers the video's highlights as the moments to prefer, kept ones marked", () => {
+    const prompt = clipsPrompt(cues, 5, 45, "", [{ start: 285.7, end: 336.8, text: "when you send tracks and you get signed", kept: true }]);
+    expect(prompt).toContain("- 4:45.7 to 5:36.8 (kept): when you send tracks and you get signed");
+    expect(clipsPrompt(cues, 5, 45, "")).not.toContain("highlights (a person");
   });
 
   it("makes each clip a valid 9:16 project: the hook, then the moment, with captions", () => {
