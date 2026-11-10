@@ -770,9 +770,6 @@ export function startInstruction(
   };
 }
 
-/** Operations that watch footage: slow, so a background job runs one per delivery. */
-export const SLOW_OPS = new Set(["clean_up_clip", "assemble"]);
-
 /** What a step about to run an operation is doing, for a person watching. */
 function doingFor(state: InstructState, call: { name: string; args: Record<string, unknown> }, names: Map<string, string>): string {
   const clipName = () => {
@@ -798,7 +795,7 @@ function doingFor(state: InstructState, call: { name: string; args: Record<strin
  * call asked for. Returns the state to carry on from, or how it ended. A
  * request that never stops is not possible: MAX_ROUNDS model calls at most.
  */
-export async function instructStep(state: InstructState, ctx: InstructContext): Promise<{ state: InstructState; slow: boolean } | { done: InstructDone }> {
+export async function instructStep(state: InstructState, ctx: InstructContext): Promise<{ state: InstructState } | { done: InstructDone }> {
   const s = state;
   const highlights = ctx.highlights ?? [];
   const sourceSeconds = ctx.sourceSeconds ?? new Map<string, number>();
@@ -841,7 +838,7 @@ export async function instructStep(state: InstructState, ctx: InstructContext): 
         (last ? `\n\nThe cut now:\n${describeEdl(s.draft, ctx.assetNames)}` : ""),
     });
     s.doing = s.pending[0] ? doingFor(s, s.pending[0], ctx.assetNames) : "Checking the result";
-    return { state: s, slow: SLOW_OPS.has(call.name) };
+    return { state: s };
   }
 
   if (s.round >= MAX_ROUNDS) return finish("Stopped after several rounds.");
@@ -919,7 +916,7 @@ export async function instructStep(state: InstructState, ctx: InstructContext): 
   s.calls = calls.length;
   s.idsThisRound = s.draft.main.elements.map((el) => el.id);
   s.doing = doingFor(s, calls[0], ctx.assetNames);
-  return { state: s, slow: false };
+  return { state: s };
 }
 
 /**

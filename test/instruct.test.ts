@@ -368,7 +368,7 @@ describe("A request in steps", () => {
     expect(doing).toEqual(["Changing the cut", "Changing the cut", "Checking the result"]);
   });
 
-  it("marks watching footage as slow, and says which clip", async () => {
+  it("says which clip it is watching", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { tool_calls: [
       { id: "1", function: { name: "clean_up_clip", arguments: JSON.stringify({ clip: 0 }) } },
     ] } }] }))));
@@ -377,7 +377,8 @@ describe("A request in steps", () => {
     if (!("state" in first)) throw new Error("expected a state");
     expect(first.state.doing).toBe('Watching "Booth.mp4" for the parts worth keeping');
     const second = await instructStep(first.state, ctx);
-    expect(second).toMatchObject({ slow: true });
+    if (!("state" in second)) throw new Error("expected a state");
+    expect(second.state.applied[0]).toMatch(/^Cleaned up clip 0/);
   });
 });
 

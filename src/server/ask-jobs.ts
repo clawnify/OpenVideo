@@ -9,9 +9,16 @@
 // jobs at a time for every app on it, and a delivery may not outlive the
 // queue's own run (15 minutes), so a delivery takes a lease on the job, runs
 // steps of the request (instruct.ts instructStep: one model call, or one of the
-// operations it asked for) until it has run one slow one (watching footage),
-// two model calls or STEP_BUDGET_MS, saves where it got to, and books the next
-// delivery. The saved state says what it is doing, so the editor can show it.
+// operations it asked for) until STEP_BUDGET_MS has passed or it is about to
+// make a model call past MODEL_CALLS_PER_DELIVERY, saves where it got to, and
+// books the next delivery. The saved state says what it is doing, so the editor
+// can show it.
+//
+// Why a time budget and not "one slow step per delivery": the queue starts a
+// booked delivery only on its per-minute clock, so every extra delivery costs
+// up to a minute of waiting. Two minutes of work per delivery keeps a delivery
+// far inside the 15-minute limit (one step that starts late can add a few
+// minutes) while a request that watches four clips still finishes in one or two.
 //
 // The result is applied only over the cut the job started from; if a person
 // changed the cut meanwhile it is kept aside (`stale`) for them to apply or
@@ -61,9 +68,9 @@ export interface AskJobRow {
 /** How long a delivery may hold a job before another may take it over. */
 const LEASE_MINUTES = 10;
 /** A delivery stops starting new steps after this long. */
-export const STEP_BUDGET_MS = 45_000;
+export const STEP_BUDGET_MS = 120_000;
 /** Model calls a delivery makes at most; then it books the next. */
-const MODEL_CALLS_PER_DELIVERY = 2;
+const MODEL_CALLS_PER_DELIVERY = 4;
 /** A job with no step booked this long ago (and no delivery on it) is booked again. */
 const REBOOK_AFTER_MINUTES = 3;
 /** A job that has not moved for this long stopped: it is marked failed. */
@@ -227,10 +234,10 @@ export async function runJobStep(
       JSON.stringify(state.applied),
       job.id,
     ]);
-    // Stop after something slow, before a model call past the limit, or when
-    // the time is up; a model call's quick operations run in the same delivery.
+    // Stop before a model call past the limit, or when the time is up; a model
+    // call's operations run in the same delivery while time allows.
     const nextIsModelCall = state.pending.length === 0;
-    if (out.slow || (nextIsModelCall && modelCalls >= MODEL_CALLS_PER_DELIVERY) || Date.now() - began > budgetMs) break;
+    if ((nextIsModelCall && modelCalls >= MODEL_CALLS_PER_DELIVERY) || Date.now() - began > budgetMs) break;
   }
 
   if (!done) {

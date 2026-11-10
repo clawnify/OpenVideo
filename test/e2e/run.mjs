@@ -1418,21 +1418,21 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
   assert.equal(r.data.job.status, "queued");
   assert.equal((await call("POST", `/api/projects/${pa}/ask/jobs/${r.data.job.id}/cancel`)).status, 200);
   assert.equal((await stepJob(r.data.job.id)).data.status, "cancelled", "a cancelled job never runs");
-  // A long request runs a few steps per delivery and books the next: two model
+  // A long request runs a few steps per delivery and books the next: four model
   // calls at most per delivery, and what it is doing is readable while it runs.
   const trimTo = (n) => ({ tool_calls: [{ id: `t${n}`, function: { name: "trim_clip", arguments: JSON.stringify({ clip: 0, seconds: n }) } }] });
   assert.equal((await call("PUT", `/api/projects/${pa}`, { edl: longCut(150) })).status, 200);
   r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "tighten it in steps", background: true });
   const stepped = r.data.job.id;
-  world.askReplies = [trimTo(100), trimTo(90), trimTo(80), { content: "Trimmed the first clip three times." }];
+  world.askReplies = [trimTo(100), trimTo(90), trimTo(80), trimTo(70), trimTo(60), { content: "Trimmed the first clip five times." }];
   const booked = world.calls.filter((u) => u.includes("queue.test")).length;
-  assert.equal((await stepJob(stepped)).data.status, "running", "stops after two model calls");
+  assert.equal((await stepJob(stepped)).data.status, "running", "stops before a fifth model call");
   assert.equal(world.calls.filter((u) => u.includes("queue.test")).length, booked + 1, "and books the next delivery");
   assert.equal(world.lastEnqueue.payload.job_id, stepped);
   r = await call("GET", `/api/projects/${pa}/ask`);
   const mid = r.data.jobs.find((j) => j.id === stepped);
   assert.equal(mid.status, "running");
-  assert.equal(mid.applied.length, 2, JSON.stringify(mid));
+  assert.equal(mid.applied.length, 4, JSON.stringify(mid));
   assert.ok(mid.doing, "says what it is doing");
   assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements[0].duration, 150, "nothing reaches the cut until it is done");
   // A second delivery while one holds the job does nothing.
@@ -1440,7 +1440,7 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
   assert.equal((await stepJob(stepped)).data.status, "busy");
   db.prepare("UPDATE ask_jobs SET leased_until = NULL WHERE id = ?").run(stepped);
   assert.equal((await stepJob(stepped)).data.status, "applied", "the next delivery carries on and finishes");
-  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements[0].duration, 80);
+  assert.equal((await call("GET", `/api/projects/${pa}`)).data.edl.main.elements[0].duration, 60);
   // A job whose next delivery was lost is booked again when read; one that has
   // not moved for 20 minutes is marked failed, never left "working".
   r = await call("POST", `/api/projects/${pa}/instruct`, { instruction: "lost", background: true });
