@@ -1495,6 +1495,15 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
       { title: "Why we started", start: "1:40.0", end: "2:30.0", hook_start: "2:10.0", hook_end: "2:14.0", why: "a story" },
       { title: "The number", start: "6:00.0", end: "6:45.0", hook_start: "6:00.0", hook_end: "6:03.0", why: "a surprise" },
     ] };
+    // Asked the way a person asks in the editor (not background): offered, then proposed.
+    const pickClips = world.askReplies[0];
+    world.askBodies = [];
+    world.askReplies = [pickClips];
+    r = await call("POST", `/api/projects/${pi}/instruct`, { instruction: "We'd need 5/6 cut downs, with a strong hook" });
+    assert.ok(world.askBodies[0].tools.some((t) => t.function.name === "make_clips"), "make_clips is offered in a quick answer");
+    assert.equal(r.data.job?.status, "proposed", JSON.stringify(r.data));
+    await call("POST", `/api/projects/${pi}/ask/jobs/${r.data.job.id}/cancel`);
+    world.askReplies = [pickClips, { content: "Made two clips from the interview." }];
     r = await call("POST", `/api/projects/${pi}/instruct`, { instruction: "5 vertical clips with a strong hook for LinkedIn", background: true });
     assert.equal(r.status, 202, JSON.stringify(r.data));
     const cj = r.data.job.id;

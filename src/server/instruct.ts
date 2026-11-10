@@ -1058,7 +1058,7 @@ export async function instructEdit(
   /** Videos it may add, how to build a cut from several of them, and how much
    *  footage this run may watch: past it, it stops with `background` and
    *  changes nothing (omitted in a background job: no limit). */
-  more: { videos?: InstructVideo[]; assemble?: Assembler; watchBudget?: number } = {},
+  more: { videos?: InstructVideo[]; assemble?: Assembler; clips?: ClipDeps; watchBudget?: number } = {},
 ): Promise<InstructDone> {
   if (!cfg.openrouterKey) {
     return {
@@ -1068,7 +1068,7 @@ export async function instructEdit(
       },
     };
   }
-  const ctx: InstructContext = { cfg, assetNames, sourceSeconds, analyze, highlights, assemble: more.assemble, watchBudget: more.watchBudget };
+  const ctx: InstructContext = { cfg, assetNames, sourceSeconds, analyze, highlights, assemble: more.assemble, clips: more.clips, watchBudget: more.watchBudget };
   let state = startInstruction(edl, instruction, assetNames, highlights, history, more.videos ?? []);
   for (;;) {
     const out = await instructStep(state, ctx);
