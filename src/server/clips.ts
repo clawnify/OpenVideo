@@ -51,6 +51,8 @@ export interface ClipPlan {
   hook: Span | null;
   body: Span;
   why: string;
+  /** Its place in the model's answer: the strongest first. */
+  rank?: number;
 }
 
 /** One stretch of a source, analysed for framing. */
@@ -89,6 +91,8 @@ export interface ClipsTask {
   lang?: string;
   /** Moments already found in this video (its highlights): preferred when they stand alone. */
   hints?: { start: number; end: number; text: string; kept: boolean }[];
+  /** One video of all the moments in a row, opening on one hook, instead of a video per moment. */
+  together?: boolean;
   /** Kept only between reading the transcript and picking the moments. */
   cues?: Cue[];
   plans?: ClipPlan[];
@@ -219,14 +223,31 @@ export function readClipPlans(raw: unknown, cues: Cue[], duration: number, count
       if (start >= body.start + 1.5 && start < body.end && end - start >= 1.5) hook = { start, end };
     }
     const title = typeof c.title === "string" && c.title.trim() ? c.title.trim().slice(0, 80) : `Clip ${out.length + 1}`;
-    out.push({ title, hook, body, why: typeof c.why === "string" ? c.why.trim().slice(0, 300) : "" });
+    out.push({ title, hook, body, why: typeof c.why === "string" ? c.why.trim().slice(0, 300) : "", rank: out.length });
     if (out.length >= count) break;
   }
   return out.sort((a, b) => a.body.start - b.body.start);
 }
 
-/** A clip's own project: 9:16, the hook then the moment, captions on. */
+/** A clip's own video: 9:16, the hook then the moment, captions on. */
 export function clipEdl(src: string, plan: ClipPlan, lang: string, id: () => string): Edl {
+  return momentsEdl(src, [plan], plan.hook, lang, id);
+}
+
+/**
+ * One video of several moments in a row, opening on one hook: the strongest
+ * moment's hook line, or its first seconds when it has none, unless that
+ * would only repeat how the video already opens.
+ */
+export function togetherEdl(src: string, plans: ClipPlan[], lang: string, id: () => string): Edl {
+  const inOrder = [...plans].sort((a, b) => a.body.start - b.body.start);
+  const best = [...plans].sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0))[0];
+  let hook = best.hook;
+  if (!hook && best !== inOrder[0]) hook = { start: best.body.start, end: Math.min(best.body.end, Math.round((best.body.start + HOOK_SECONDS) * 10) / 10) };
+  return momentsEdl(src, inOrder, hook, lang, id);
+}
+
+function momentsEdl(src: string, plans: ClipPlan[], hook: Span | null, lang: string, id: () => string): Edl {
   const piece = (span: Span) => ({
     id: id(),
     type: "video" as const,
@@ -238,7 +259,7 @@ export function clipEdl(src: string, plan: ClipPlan, lang: string, id: () => str
   return {
     version: 1,
     output: { ...TALL_FRAME, fps: 30, background: "#000000" },
-    main: { elements: [...(plan.hook ? [piece(plan.hook)] : []), piece(plan.body)] },
+    main: { elements: [...(hook ? [piece(hook)] : []), ...plans.map((p) => piece(p.body))] },
     overlays: [],
     audio: [],
     // Sound is often off on a feed. Above the bottom fifth, where the apps put their own buttons and words.
@@ -347,8 +368,16 @@ export function applyFraming(target: FrameTarget): { edl: Edl; unsure: number } 
 
 // ── the task ───────────────────────────────────────────────────────────────
 
-export function clipsTask(callId: string | undefined, video: { src: string; name: string; seconds: number | null }, count: number, seconds: number, brief: string, now: number): ClipsTask {
-  return { kind: "clips", callId, phase: "transcript", video, count, seconds, brief, targets: [], startedAt: now, waits: 0 };
+export function clipsTask(
+  callId: string | undefined,
+  video: { src: string; name: string; seconds: number | null },
+  count: number,
+  seconds: number,
+  brief: string,
+  now: number,
+  together = false,
+): ClipsTask {
+  return { kind: "clips", callId, phase: "transcript", video, count, seconds, brief, targets: [], startedAt: now, waits: 0, ...(together ? { together } : {}) };
 }
 
 export function frameTask(callId: string | undefined, targets: FrameTarget[], now: number): ClipsTask {
@@ -414,10 +443,12 @@ export async function advanceTask(
     if (!plans.length) return { error: "it found no moment that stands on its own", made: [] };
     // Ids are chosen before anything is made, so a delivery that stops halfway makes nothing twice.
     t.plans = plans;
-    t.targets = plans.map((p, i) => {
-      const edl = clipEdl(t.video!.src, p, t.lang ?? "en", deps.newId);
-      return { project: deps.newId(), name: `${i + 1}. ${p.title}`, edl, parts: [] };
-    });
+    t.targets = t.together
+      ? [{ project: deps.newId(), name: `${plans.length} moments from ${t.video!.name}`.slice(0, 100), edl: togetherEdl(t.video!.src, plans, t.lang ?? "en", deps.newId), parts: [] }]
+      : plans.map((p, i) => {
+          const edl = clipEdl(t.video!.src, p, t.lang ?? "en", deps.newId);
+          return { project: deps.newId(), name: `${i + 1}. ${p.title}`, edl, parts: [] };
+        });
     delete t.cues;
     t.phase = "create";
     return step();
@@ -494,6 +525,12 @@ function summary(t: ClipsTask): string {
   const tail = notes.length ? `. ${notes.join("; ")}.` : ".";
   if (t.kind === "frame") {
     return framed.length ? `Framed the cut for 9:16${tail}` : `Could not frame the cut${tail}`;
+  }
+  if (t.together) {
+    const edl = t.targets[0]?.edl;
+    const seconds = Math.round((edl?.main.elements ?? []).reduce((n, el) => n + (("duration" in el && el.duration) || 0), 0));
+    const titles = [...(t.plans ?? [])].sort((a, b) => a.body.start - b.body.start).map((p) => p.title);
+    return `Made one ${seconds}s vertical video in this project from ${titles.length} moments of "${t.video!.name}", opening on a ${HOOK_SECONDS} second hook, with captions: ${titles.join("; ")}. ${framed.length ? "Framed on the speaker" : "Not framed"}${tail}`;
   }
   const list = (t.plans ?? []).map((p, i) => `${i + 1}. ${p.title} (${Math.round(p.body.end - p.body.start + (p.hook ? p.hook.end - p.hook.start : 0))}s${p.hook ? ", opens on its hook" : ""})`);
   return `Made ${t.targets.length} vertical clip${t.targets.length === 1 ? "" : "s"} from "${t.video!.name}", each its own video in this project, with captions: ${list.join("; ")}. ${framed.length} framed on the speaker${tail}`;

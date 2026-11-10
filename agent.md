@@ -263,7 +263,9 @@ its strongest line (played first when it comes later in the moment), and makes
 each one **its own video in the project**: 1080×1920 with captions on, framed on the person
 speaking. The video the request was sent to is not changed. The finished
 message, and the job while it runs, list them in `made: [{ id, name }]`; open
-one at `/edits/{id}`. "Frame it for vertical" frames the video it was sent to the
+one at `/edits/{id}`. With `together`, the moments become **one** video instead, in order, opening
+on one 3 second hook. When a request could mean either ("5 cut downs with a
+strong hook"), `/instruct` asks which before doing anything. "Frame it for vertical" frames the video it was sent to the
 same way, in its 9:16 version (added when missing). Shots the framing is unsure
 of keep the whole picture, and the message says how many: a person checks them
 in the editor's AI reframe. Both need the video on the media service (an

@@ -3,6 +3,7 @@ import {
   advanceTask,
   clipEdl,
   clipsPrompt,
+  togetherEdl,
   clipsTask,
   frameTargets,
   frameTask,
@@ -223,6 +224,37 @@ describe("Making clips from a long video", () => {
     await advanceTask(JSON.parse(saved), deps, empty(), seconds);
     const ids = vi.mocked(deps.createProject).mock.calls.map((c) => c[0]);
     expect(new Set(ids).size).toBe(2);
+  });
+});
+
+describe("One video of several moments", () => {
+  it("opens on the strongest moment's hook, then plays the moments in order", () => {
+    // The model lists the strongest first: the later moment, with its hook inside.
+    const plans = readClipPlans({ clips: [plan("12:00.0", "12:45.0", "12:20.0", "12:24.0", "Strongest"), plan("1:41.0", "2:31.0", "1:41.0", "1:44.0", "Earlier")] }, cues, DURATION, 2, 45);
+    let n = 0;
+    const edl = togetherEdl("asset:talk", plans, "en", () => `e${n++}`);
+    expect("edl" in validateEdl(edl)).toBe(true);
+    expect(edl.main.elements.map((e) => [e.trimStart, "duration" in e ? e.duration : null])).toEqual([
+      [739.9, 3],
+      [99.9, 54.9],
+      [719.9, 44.9],
+    ]);
+  });
+
+  it("uses the strongest moment's own opening as the hook when it has none, unless the video starts with it", () => {
+    const later = readClipPlans({ clips: [plan("12:00.0", "12:45.0", "12:00.0", "12:03.0", "Strongest"), plan("1:41.0", "2:31.0", "1:41.0", "1:44.0", "Earlier")] }, cues, DURATION, 2, 45);
+    expect(togetherEdl("asset:talk", later, "en", () => "x").main.elements[0]).toMatchObject({ trimStart: 719.9, duration: 3 });
+    const first = readClipPlans({ clips: [plan("1:41.0", "2:31.0", "1:41.0", "1:44.0", "Strongest"), plan("12:00.0", "12:45.0", "12:00.0", "12:03.0", "Later")] }, cues, DURATION, 2, 45);
+    expect(togetherEdl("asset:talk", first, "en", () => "x").main.elements).toHaveLength(2);
+  });
+
+  it("makes one video, not one per moment", async () => {
+    const { deps } = fakeDeps();
+    const { out } = await runTask(clipsTask("c1", talk, 2, 45, "", 0, true), deps);
+    if (!("said" in out)) throw new Error(JSON.stringify(out));
+    expect(out.made).toHaveLength(1);
+    expect(out.made[0].name).toBe("2 moments from talk 1.mp4");
+    expect(out.said).toMatch(/^Made one \d+s vertical video in this project from 2 moments/);
   });
 });
 

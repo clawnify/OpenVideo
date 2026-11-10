@@ -274,6 +274,10 @@ const OPS = [
         count: { type: "integer", description: `how many clips, 1 to ${MAX_CLIPS}` },
         seconds: { type: "number", description: `about how long each runs; ${CLIP_SECONDS.usual} when not said` },
         brief: { type: "string", description: "what they are for, in the person's words: audience, platform, tone, topics" },
+        together: {
+          type: "boolean",
+          description: "true: ONE video made of the moments in a row, opening on one 3 second hook. Left out: a separate video per moment, each opening on its own hook.",
+        },
       },
       required: ["video", "count"],
     },
@@ -687,6 +691,7 @@ const SYSTEM = [
   "Earlier messages in this conversation are listed before the request; use them to resolve what 'it', 'that' or 'shorter' means. The cut shown is the current one, which may have been edited since.",
   "Call ask_user instead of guessing when the request is ambiguous, and to confirm your plan first when it would watch more than two clips. Never ask about something the request already says.",
   "When videos are listed that are not in the cut and the person asks to make something from 'these clips' or 'my videos', build it from them: assemble for a cut that needs the best moments, add_clip to place a video as it is. If it is unclear which videos they mean, ask.",
+  "When it is unclear whether the person wants several separate videos or ONE video made of several moments (for example '5 cut downs with a strong hook'), call ask_user first, in one sentence offering both: separate videos each with its own 3 second hook, or one video of the moments that opens on one hook. When the request says which ('6 separate reels', 'one 60 second highlight video of the best moments'), do not ask. For one video of moments, call make_clips with together: true.",
   "Several videos ('5 cut-downs', 'clips', 'shorts', 'reels', 'teasers') are never one cut: call make_clips once with the long video they come from, the one in this cut when there is one. It makes a new video in this project per clip and leaves this cut alone; never put several clips one after another in this cut instead. For framing this one cut for vertical or keeping a speaker in frame, call reframe.",
   "When highlights are listed, they are the best parts of the footage: to build or extend this ONE cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then ones marked best, then higher scores, and keep to the length asked for.",
 ].join(" ");
@@ -1036,7 +1041,7 @@ function startTask(
   if (!Number.isFinite(asked)) return { error: `cannot make clips of ${call.args.seconds} seconds` };
   const seconds = Math.min(CLIP_SECONDS.max, Math.max(CLIP_SECONDS.min, asked));
   if (v.seconds !== null && v.seconds < seconds * 1.5) return { error: `"${v.name}" is too short to cut clips from; use it as it is` };
-  const task = clipsTask(call.id, { src: v.src, name: v.name, seconds: v.seconds }, count, seconds, String(call.args.brief ?? ""), now);
+  const task = clipsTask(call.id, { src: v.src, name: v.name, seconds: v.seconds }, count, seconds, String(call.args.brief ?? ""), now, call.args.together === true);
   // Moments already found in this video: kept ones first, then the best.
   const hints = (ctx.highlights ?? []).filter((h) => h.src === v.src && h.kind === "soundbite").slice(0, 30);
   if (hints.length) task.hints = hints.map((h) => ({ start: h.start, end: h.end, text: h.text.slice(0, 200), kept: h.kept }));
