@@ -118,6 +118,13 @@ function madeSoFar(state: InstructState): { id: string; name: string }[] {
 
 /** How the proposal reads: what it would watch, and that it runs in the background. */
 export function proposalText(need: NeedsBackground): string {
+  if (need.makes) {
+    const minutes = Number.isFinite(need.seconds) ? Math.max(1, Math.round(need.seconds / 60)) : null;
+    return (
+      `This reads${minutes ? ` about ${minutes} minute${minutes === 1 ? "" : "s"} of` : ""} the video, picks the moments, and cuts and frames each one as a new video in this project, ` +
+      "so it runs in the background for a few minutes: you can keep working or close the tab. This cut stays as it is. Run it?"
+    );
+  }
   const clips = need.clips === 1 ? "a clip" : `${need.clips} clips`;
   const minutes = Number.isFinite(need.seconds) ? Math.max(1, Math.round(need.seconds / 60)) : null;
   const amount = minutes ? `, about ${minutes} minute${minutes === 1 ? "" : "s"} of footage` : "";

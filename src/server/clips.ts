@@ -25,8 +25,8 @@ import { snapToCues, stamp } from "./highlights";
 export const MAX_CLIPS = 8;
 /** How long a clip runs, in seconds, unless the request says otherwise. */
 export const CLIP_SECONDS = { min: 10, usual: 45, max: 90 };
-/** A hook is one line: the first seconds of the clip. */
-const HOOK_SECONDS = { min: 0.8, max: 6 };
+/** The hook: a cut this long at the start of the clip, from its strongest line. */
+export const HOOK_SECONDS = 3;
 /** The most stretches one task has analysed: a cut of about four hours. */
 export const MAX_PARTS = 48;
 /** A task that has waited this long on the media service gives up on what is left. */
@@ -141,13 +141,12 @@ export const CLIPS_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["title", "start", "end", "hook_start", "hook_end", "why"],
+        required: ["title", "start", "end", "hook_start", "why"],
         properties: {
           title: { type: "string", description: "a short label for the clip, at most 8 words, in the language spoken" },
           start: { type: "string", description: "where the clip starts, on the transcript's clock (M:SS.s)" },
           end: { type: "string", description: "where it ends (M:SS.s)" },
-          hook_start: { type: "string", description: "the hook line's start (M:SS.s), inside the clip" },
-          hook_end: { type: "string", description: "the hook line's end (M:SS.s)" },
+          hook_start: { type: "string", description: `where its strongest line starts (M:SS.s), inside the clip: the ${HOOK_SECONDS} seconds from there open the video` },
           why: { type: "string", description: "one sentence: why this stands on its own and makes people stay" },
         },
       },
@@ -171,8 +170,8 @@ export function clipsPrompt(
     `Pick the ${count} best moments that each work as a video of about ${seconds} seconds (between ${low} and ${high}).`,
     brief.trim() ? `What they are for, in the person's words: ${brief.trim().slice(0, 600)}` : "",
     "Each moment must make sense to someone who has seen nothing else: one complete thought with a payoff, starting at the start of a sentence and ending at the end of one.",
-    "The first three seconds decide whether anyone keeps watching, so give each moment a hook: its single most striking line (a surprising claim, a strong opinion, a sharp question, a number), one to four seconds long.",
-    "If the moment already opens on that line, the hook is its own first line. Otherwise give the line from inside the moment: it plays first, then the moment from its start.",
+    `The first ${HOOK_SECONDS} seconds decide whether anyone keeps watching, so give each moment a hook: where its single most striking line starts (a surprising claim, a strong opinion, a sharp question, a number). The ${HOOK_SECONDS} seconds from there play first, as a cut of their own, then the moment from its start.`,
+    `Pick a line whose first ${HOOK_SECONDS} seconds land on their own. If the moment already opens on its strongest line, give the moment's own start: nothing is played twice.`,
     "Moments must not overlap. Spread them across the video rather than taking them all from one part, and prefer fewer good moments to filler.",
     hints.length
       ? "Moments already picked out of this video as its highlights (a person kept the ones marked kept). Prefer them, widened or tightened to stand on their own, before looking elsewhere:\n" +
@@ -206,15 +205,18 @@ export function readClipPlans(raw: unknown, cues: Cue[], duration: number, count
     if (body.end - body.start < CLIP_SECONDS.min) continue;
     if (out.some((p) => p.body.start < body.end && body.start < p.body.end)) continue;
 
+    // The hook is a cut of HOOK_SECONDS from where the line starts: a line
+    // the transcript holds as part of a longer one still opens the clip.
     let hook: Span | null = null;
-    const hs = sourceTime(c?.hook_start);
-    const he = sourceTime(c?.hook_end);
-    if (hs !== null && he !== null && he > hs) {
-      const h = snapToCues(hs, he, cues, duration);
-      const inside = h.start >= body.start - 0.1 && h.end <= body.end + 0.1;
-      const length = h.end - h.start;
-      // A hook that is the clip's own opening is not played twice.
-      if (inside && length >= HOOK_SECONDS.min && length <= HOOK_SECONDS.max && h.start > body.start + 1.5) hook = h;
+    let hs = sourceTime(c?.hook_start);
+    if (hs !== null) {
+      // On the line's own start when the model is a moment off, never mid-word.
+      const line = cues.find((q) => q.start <= hs! + 0.05 && q.end > hs!);
+      if (line && hs - line.start <= 0.6) hs = line.start;
+      const start = Math.round(Math.max(0, hs - 0.1) * 10) / 10;
+      const end = Math.min(body.end, Math.round((start + HOOK_SECONDS) * 10) / 10);
+      // Inside the moment, and not its own opening, which would play twice.
+      if (start >= body.start + 1.5 && start < body.end && end - start >= 1.5) hook = { start, end };
     }
     const title = typeof c.title === "string" && c.title.trim() ? c.title.trim().slice(0, 80) : `Clip ${out.length + 1}`;
     out.push({ title, hook, body, why: typeof c.why === "string" ? c.why.trim().slice(0, 300) : "" });

@@ -529,6 +529,8 @@ export interface NeedsBackground {
   clips: number;
   /** Seconds of footage those clips hold (Infinity when one's length is unknown). */
   seconds: number;
+  /** Making videos from a long one: new videos in the project, this cut unchanged. */
+  makes?: true;
 }
 
 export async function cleanUp(
@@ -987,7 +989,10 @@ export async function instructStep(
     const waits = calls.some((c) => c.name === "make_clips" || c.name === "reframe");
     if (watching.length) {
       const seconds = watching.reduce((sum, c) => sum + taskSeconds(s.draft, c, videos, sourceSeconds), s.watched);
-      if (waits) return { done: { background: { clips: s.watchedClips + watching.length, seconds } } };
+      if (waits) {
+        const makes = calls.some((c) => c.name === "make_clips");
+        return { done: { background: { clips: s.watchedClips + watching.length, seconds, ...(makes ? { makes: true as const } : {}) } } };
+      }
       if (seconds > ctx.watchBudget) return { done: { background: { clips: s.watchedClips + watching.length, seconds } } };
       s.watched = seconds;
       s.watchedClips += watching.length;

@@ -49,10 +49,17 @@ describe("Picking the moments", () => {
     expect(got.map((p) => p.title)).toEqual(["Cold open", "Hook from elsewhere", "Opens on its hook"]);
     // From the start of a line to the end of one.
     expect(got[0].body).toEqual({ start: 99.9, end: 154.8 });
-    expect(got[0].hook).toEqual({ start: 129.9, end: 134.8 });
+    // A 3 second cut from the start of the line the model chose.
+    expect(got[0].hook).toEqual({ start: 129.9, end: 132.9 });
     // The clip already opens on it, and a hook from another part of the talk is not borrowed.
     expect(got[2].hook).toBeNull();
     expect(got[1].hook).toBeNull();
+  });
+
+  it("keeps a hook whose line runs across two transcript lines (Circulate, 2026-11-10: every hook was dropped)", () => {
+    // Lines of 4.2 s on the transcript; the model's hook spans the end of one and the start of the next.
+    const got = readClipPlans({ clips: [plan("1:41.0", "2:31.0", "2:13.0", "2:17.0")] }, cues, DURATION, 1, 45);
+    expect(got[0].hook).toEqual({ start: 132.9, end: 135.9 });
   });
 
   it("ends a moment that runs too long on the last line that fits, and makes no more than asked", () => {
@@ -75,7 +82,7 @@ describe("Picking the moments", () => {
     expect("edl" in validateEdl(edl)).toBe(true);
     expect(edl.output).toMatchObject({ width: 1080, height: 1920 });
     expect(edl.main.elements.map((e) => [e.trimStart, "duration" in e ? e.duration : null])).toEqual([
-      [129.9, 4.9],
+      [129.9, 3],
       [99.9, 54.9],
     ]);
     expect(edl.captions).toMatchObject({ enabled: true, lang: "en" });
@@ -257,7 +264,7 @@ describe("Clips in the conversation", () => {
     const { deps } = fakeDeps();
     const ctx: InstructContext = { cfg: { openrouterKey: "k" }, assetNames: new Map(), sourceSeconds: seconds, clips: deps, watchBudget: 180 };
     const out = await instructStep(startInstruction(empty(), "5 clips from the talk", new Map(), [], [], videos), ctx);
-    expect(out).toEqual({ done: { background: { clips: 1, seconds: DURATION } } });
+    expect(out).toEqual({ done: { background: { clips: 1, seconds: DURATION, makes: true } } });
   });
 
   it("in the background, waits between deliveries and ends listing the projects, with this cut unchanged", async () => {

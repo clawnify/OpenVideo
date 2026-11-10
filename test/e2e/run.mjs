@@ -1541,6 +1541,7 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
     r = await call("POST", `/api/projects/${pi}/instruct`, { instruction: "We'd need 5/6 cut downs, with a strong hook" });
     assert.ok(world.askBodies[0].tools.some((t) => t.function.name === "make_clips"), "make_clips is offered in a quick answer");
     assert.equal(r.data.job?.status, "proposed", JSON.stringify(r.data));
+    assert.match(r.data.said, /new video in this project/);
     await call("POST", `/api/projects/${pi}/ask/jobs/${r.data.job.id}/cancel`);
     world.askReplies = [pickClips, { content: "Made two clips from the interview." }];
     r = await call("POST", `/api/projects/${pi}/instruct`, { instruction: "5 vertical clips with a strong hook for LinkedIn", background: true });
