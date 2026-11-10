@@ -266,7 +266,7 @@ const OPS = [
   {
     name: "make_clips",
     description:
-      "Cut several short vertical (9:16) videos out of one long listed video: it reads what is said, picks the moments that stand on their own, opens each on its strongest line, and makes each its own project with captions, framed on the speaker. Use it for clips, shorts, reels or cut-downs from a talk, interview or podcast. It does not change this cut.",
+      "Cut several SEPARATE short vertical (9:16) videos out of one long listed video, each its own project: it reads what is said, picks the moments that stand on their own, opens each on its strongest line, and makes each its own project with captions, framed on the speaker. Use it whenever the person wants more than one video: clips, cut-downs, shorts, reels, teasers or 'N clips' from a talk, interview or podcast, even when the long video is the one in this cut. Highlights already found are used as the moments to prefer. It does not change this cut.",
     parameters: {
       type: "object",
       properties: {
@@ -685,8 +685,8 @@ const SYSTEM = [
   "Earlier messages in this conversation are listed before the request; use them to resolve what 'it', 'that' or 'shorter' means. The cut shown is the current one, which may have been edited since.",
   "Call ask_user instead of guessing when the request is ambiguous, and to confirm your plan first when it would watch more than two clips. Never ask about something the request already says.",
   "When videos are listed that are not in the cut and the person asks to make something from 'these clips' or 'my videos', build it from them: assemble for a cut that needs the best moments, add_clip to place a video as it is. If it is unclear which videos they mean, ask.",
-  "For short vertical clips, shorts, reels or cut-downs from a long talk or interview, call make_clips once with the long video; it makes new projects and leaves this cut alone. For framing this cut for vertical or keeping a speaker in frame, call reframe.",
-  "When highlights are listed, they are the best parts of the footage: to build or extend a cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then ones marked best, then higher scores, and keep to the length asked for.",
+  "Several videos ('5 cut-downs', 'clips', 'shorts', 'reels', 'teasers') are never one cut: call make_clips once with the long video they come from, the one in this cut when there is one. It makes a new project per clip and leaves this cut alone; never put several clips one after another in this cut instead. For framing this one cut for vertical or keeping a speaker in frame, call reframe.",
+  "When highlights are listed, they are the best parts of the footage: to build or extend this ONE cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then ones marked best, then higher scores, and keep to the length asked for.",
 ].join(" ");
 
 /** A video the model may add: in this project's footage or in the library, newest first. */
@@ -1031,7 +1031,11 @@ function startTask(
   if (!Number.isFinite(asked)) return { error: `cannot make clips of ${call.args.seconds} seconds` };
   const seconds = Math.min(CLIP_SECONDS.max, Math.max(CLIP_SECONDS.min, asked));
   if (v.seconds !== null && v.seconds < seconds * 1.5) return { error: `"${v.name}" is too short to cut clips from; use it as it is` };
-  return { task: clipsTask(call.id, { src: v.src, name: v.name, seconds: v.seconds }, count, seconds, String(call.args.brief ?? ""), now) };
+  const task = clipsTask(call.id, { src: v.src, name: v.name, seconds: v.seconds }, count, seconds, String(call.args.brief ?? ""), now);
+  // Moments already found in this video: kept ones first, then the best.
+  const hints = (ctx.highlights ?? []).filter((h) => h.src === v.src && h.kind === "soundbite").slice(0, 30);
+  if (hints.length) task.hints = hints.map((h) => ({ start: h.start, end: h.end, text: h.text.slice(0, 200), kept: h.kept }));
+  return { task };
 }
 
 /**
