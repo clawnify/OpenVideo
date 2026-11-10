@@ -1,4 +1,5 @@
 import { ReframeDialog } from "./reframe";
+import { AssistantPanel } from "./assistant";
 // Footage edit projects — the timeline editor over EDL documents.
 //
 // Layout (the classic four-region editor grid): left rail (Media / Audio /
@@ -99,7 +100,6 @@ import {
   Undo2,
   Type as TypeIcon,
   Upload,
-  Wand2,
   X,
   Eye,
   EyeOff,
@@ -1128,7 +1128,7 @@ export function EditEditor({
   const [playhead, setPlayhead] = useState(0);
   const [autocutOpen, setAutocutOpen] = useState(false);
   const [reframeOpen, setReframeOpen] = useState(false);
-  const [askOpen, setAskOpen] = useState(false);
+  const [aiOpen, setAiOpen] = useState(false);
   // The format on screen: null is the main one. Every control edits the cut
   // as this format sees it (shared/formats.ts). One removed (or undone away)
   // falls back to the main format.
@@ -1532,22 +1532,19 @@ export function EditEditor({
           <Redo2 className="w-4 h-4" />
         </button>
         <button
-          onClick={() => setAskOpen(true)}
+          onClick={() => {
+            const open = !aiOpen;
+            setAiOpen(open);
+            // On a phone the conversation is its own pane.
+            setPane(open ? "inspector" : "canvas");
+          }}
+          aria-pressed={aiOpen}
           className={btnSecondary}
-          title="Change the cut by describing it"
-          aria-label="Ask"
+          title="Ask AI to change the cut, in your own words"
+          aria-label="AI"
         >
-          <Wand2 className="w-4 h-4" /> <span className="hidden md:inline">Ask</span>
+          <Sparkles className="w-4 h-4" /> <span className="hidden md:inline">AI</span>
         </button>
-        <button
-          onClick={() => setAutocutOpen(true)}
-          className={btnSecondary}
-          title="Assemble a cut from several clips with AI"
-          aria-label="Auto-cut"
-        >
-          <Sparkles className="w-4 h-4" /> <span className="hidden md:inline">Auto-cut</span>
-        </button>
-        <span className="hidden lg:contents"><button className={btnSecondary} disabled={!edl.main.elements.some(e=>e.type==="video")} onClick={()=>{setPlaying(false);setReframeOpen(true);}}><Sparkles className="w-4 h-4" /> AI reframe</button></span>
         <ShareControl projectId={initial.id} />
         <ExportControls
           projectId={initial.id}
@@ -1563,7 +1560,7 @@ export function EditEditor({
             [
               ["library", "Library"],
               ["canvas", "Edit"],
-              ["inspector", "Options"],
+              ["inspector", aiOpen ? "AI" : "Options"],
             ] as const
           ).map(([key, label]) => (
             <button
@@ -1578,7 +1575,6 @@ export function EditEditor({
             </button>
           ))}
         </div>
-        <button className={`${btnSecondary} ml-auto`} disabled={!edl.main.elements.some(e=>e.type==="video")} onClick={()=>{setPlaying(false);setReframeOpen(true);}}>AI reframe</button>
       </div>
 
       {reframeOpen && (
@@ -1594,18 +1590,6 @@ export function EditEditor({
           }}
         />
       )}
-      {askOpen && (
-        <AskDialog
-          projectId={initial.id}
-          onClose={() => setAskOpen(false)}
-          onApplied={(next) => {
-            // One step for the whole instruction, like Auto-cut.
-            commit(next);
-            setSel(null);
-          }}
-        />
-      )}
-
       {autocutOpen && (
         <AutocutModal
           projectId={initial.id}
@@ -1676,21 +1660,44 @@ export function EditEditor({
           update={update}
         />
         </div>
-        <Inspector
-          pane={pane}
-          edl={view}
-          doc={edl}
-          updateDoc={updateDoc}
-          sel={sel}
-          update={update}
-          srcDur={srcDur}
-          resolveAsset={resolveAsset}
-          segments={segments}
-          onDelete={deleteSelected}
-          brief={brief}
-          setBrief={setBrief}
-          playheadRef={playheadRef}
-        />
+        {aiOpen ? (
+          <AssistantPanel
+            projectId={initial.id}
+            pane={pane}
+            saving={saveState === "saving"}
+            canReframe={edl.main.elements.some((e) => e.type === "video")}
+            onApplied={(next) => {
+              // One step for the whole request, like Auto-cut.
+              commit(next);
+              setSel(null);
+            }}
+            onAutocut={() => setAutocutOpen(true)}
+            onReframe={() => {
+              setPlaying(false);
+              setReframeOpen(true);
+            }}
+            onClose={() => {
+              setAiOpen(false);
+              setPane("canvas");
+            }}
+          />
+        ) : (
+          <Inspector
+            pane={pane}
+            edl={view}
+            doc={edl}
+            updateDoc={updateDoc}
+            sel={sel}
+            update={update}
+            srcDur={srcDur}
+            resolveAsset={resolveAsset}
+            segments={segments}
+            onDelete={deleteSelected}
+            brief={brief}
+            setBrief={setBrief}
+            playheadRef={playheadRef}
+          />
+        )}
       </div>
 
       {/* timeline */}
@@ -2444,74 +2451,6 @@ function FolderLinkDialog({
  * rather than writing the document, and the answer says what it did, so an
  * edit is reviewable instead of a black box. The whole pass is one undo step.
  */
-function AskDialog({
-  projectId,
-  onClose,
-  onApplied,
-}: {
-  projectId: string;
-  onClose: () => void;
-  onApplied: (edl: Edl) => void;
-}) {
-  const [instruction, setInstruction] = useState("");
-  const [running, setRunning] = useState(false);
-  const [err, setErr] = useState("");
-
-  const run = async () => {
-    if (!instruction.trim()) return;
-    setRunning(true);
-    setErr("");
-    try {
-      const out = await api.send<{ edl: Edl; said: string; applied: string[] }>(
-        "POST",
-        `/api/projects/${projectId}/instruct`,
-        { instruction: instruction.trim() },
-      );
-      onApplied(out.edl);
-      onClose();
-    } catch (e) {
-      setErr(String((e as Error).message));
-    } finally {
-      setRunning(false);
-    }
-  };
-
-  return (
-    <Dialog
-      title="Ask for a change"
-      icon={<Wand2 className="w-4 h-4 text-muted" />}
-      description="Describe the change in your words. It edits the cut you have, one step you can undo."
-      onClose={onClose}
-      footer={
-        <>
-          <button onClick={onClose} className={btnGhost}>
-            Cancel <Kbd>esc</Kbd>
-          </button>
-          <button onClick={run} disabled={running || !instruction.trim()} className={btnPrimary}>
-            {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />} Apply
-          </button>
-        </>
-      }
-    >
-      <div className="mt-4">
-        <textarea
-          className={`${inputCls} min-h-16`}
-          placeholder="e.g. drop the first two seconds of clip 1, put the demo first, and add a title that says Spring Open Day for the first 3 seconds"
-          value={instruction}
-          onChange={(e) => setInstruction(e.target.value)}
-          data-autofocus
-        />
-        <p className="mt-2 text-fine text-faint">
-          It can trim, split, delete, reorder and mute clips, watch a clip and cut its dead air and false starts,
-          add or remove on-screen text, and change the format (vertical for Reels, square, 4:5 and the rest).
-        </p>
-        {running && <div className="mt-2 text-fine text-muted">Working through the cut…</div>}
-        {err && <div className="mt-2 text-fine text-danger break-words">{err}</div>}
-      </div>
-    </Dialog>
-  );
-}
-
 // ── Google Drive picker ─────────────────────────────────────────────────────
 
 interface DriveFile {

@@ -211,6 +211,13 @@ each file's Drive link.
 `POST /api/projects/{id}/instruct` sees the highlights too: "make a 60 second
 cut from the kept soundbites" places them with its `add_highlight` operation.
 
+`/instruct` is the same conversation people see in the editor's AI panel: it
+reads the last few turns, so a follow-up ("shorter") works, and your requests
+show there beside theirs. When a request could mean two things, or would watch
+more than two clips, it answers with `asked: true` and a question or plan in
+`said`, and changes nothing. Answer by sending the reply as the next
+`instruction`.
+
 Google Drive limits how often a file shared with the link can be downloaded,
 and on a heavy day it refuses the files of a whole folder for a while. It
 refuses the whole file but still serves pieces of it, so a refused file of up
@@ -288,7 +295,9 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | GET  | `/api/projects/{id}/highlights/export` | `format=csv\|xml`: a sheet, or a Premiere Pro / Resolve timeline of the picks |
 | PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |
 | POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
-| POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied }` |
+| POST | `/api/projects/{id}/instruct` | `{ instruction }` — change the existing cut in words → `{ edl, said, applied, asked }`; `asked: true` means `said` is a question back and nothing was changed |
+| GET  | `/api/projects/{id}/ask` | The project's AI conversation, oldest first → `{ messages: [{ role, text, author, applied, asked, failed }] }` |
+| DELETE | `/api/projects/{id}/ask` | Start the conversation over; the cut is untouched |
 | DELETE | `/api/projects/{id}` | Delete a project, its export history and its footage from Drive; `202 { remaining }` means call again |
 | POST | `/api/projects/{id}/export` | Export `{ quality?, format? }` → returns the job, `status: "exporting"` |
 | GET  | `/api/exports/{id}` | One export; read it until it is no longer `exporting` |

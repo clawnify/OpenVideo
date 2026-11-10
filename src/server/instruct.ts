@@ -235,6 +235,16 @@ const OPS = [
     },
   },
   {
+    name: "ask_user",
+    description:
+      "Ask the person before changing anything: a question when the request could mean different things (which clip, which talk, how long), or your plan in a sentence or two when it would watch more than two clips. Call it alone, before any change; their answer comes back as their next message.",
+    parameters: {
+      type: "object",
+      properties: { question: { type: "string", description: "what to ask, or the plan to confirm, in plain words" } },
+      required: ["question"],
+    },
+  },
+  {
     name: "set_format",
     description: `Change the shape of the main video. ${FORMAT_PRESETS.map((p) => `${p.ratio} is ${p.name.toLowerCase()} (${p.hint})`).join("; ")}. To deliver the same cut in another shape as well, use add_format instead.`,
     parameters: {
@@ -543,8 +553,19 @@ const SYSTEM = [
   "Positions on the main track are the order the clips play in.",
   "Make the smallest set of changes that does what was asked, then stop and say in one sentence what you changed.",
   "If the request cannot be done with these operations, say so plainly instead of guessing.",
+  "Earlier messages in this conversation are listed before the request; use them to resolve what 'it', 'that' or 'shorter' means. The cut shown is the current one, which may have been edited since.",
+  "Call ask_user instead of guessing when the request is ambiguous, and to confirm your plan first when it would watch more than two clips. Never ask about something the request already says.",
   "When highlights are listed, they are the best parts of the footage: to build or extend a cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then ones marked best, then higher scores, and keep to the length asked for.",
 ].join(" ");
+
+/** One earlier turn of the conversation, as the model reads it. */
+export interface InstructTurn {
+  role: "user" | "assistant";
+  text: string;
+}
+
+/** How many earlier turns the model reads: enough for follow-ups, bounded. */
+export const HISTORY_TURNS = 12;
 
 /**
  * Run one instruction against the cut. Returns the new document, whatever the
@@ -560,7 +581,9 @@ export async function instructEdit(
   analyze?: ClipAnalyzer,
   /** The project's highlights, kept first then best: what add_highlight places. */
   highlights: InstructHighlight[] = [],
-): Promise<{ edl: Edl; said: string; applied: AppliedOp[] } | { failure: InstructFailure | EdlInvalid }> {
+  /** The conversation so far, oldest first; only the last HISTORY_TURNS are read. */
+  history: InstructTurn[] = [],
+): Promise<{ edl: Edl; said: string; applied: AppliedOp[]; asked?: true } | { failure: InstructFailure | EdlInvalid }> {
   if (!cfg.openrouterKey) {
     return {
       failure: {
@@ -574,6 +597,7 @@ export async function instructEdit(
   const applied: AppliedOp[] = [];
   const messages: Record<string, unknown>[] = [
     { role: "system", content: SYSTEM },
+    ...history.slice(-HISTORY_TURNS).map((t) => ({ role: t.role, content: t.text.slice(0, 2000) })),
     {
       role: "user",
       content: `The cut right now:\n${describeEdl(draft, assetNames)}${describeHighlights(highlights)}\n\nWhat to change: ${instruction}`,
@@ -613,6 +637,21 @@ export async function instructEdit(
       const checked = validateEdl(draft);
       if ("invalid" in checked) return { failure: checked.invalid };
       return { edl: checked.edl, said: message.content?.trim() || "Done.", applied };
+    }
+
+    // A question ends the turn: whatever was changed before it stays, and the
+    // answer arrives as the next message.
+    const question = calls.find((call) => call.function?.name === "ask_user");
+    if (question) {
+      let text = "";
+      try {
+        text = String((JSON.parse(question.function?.arguments ?? "{}") as { question?: unknown }).question ?? "").trim();
+      } catch {
+        /* falls through to the generic question */
+      }
+      const checked = validateEdl(draft);
+      if ("invalid" in checked) return { failure: checked.invalid };
+      return { edl: checked.edl, said: text || "Could you say a little more about what you want?", applied, asked: true };
     }
 
     messages.push(message as Record<string, unknown>);
