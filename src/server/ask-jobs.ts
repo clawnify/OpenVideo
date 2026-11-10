@@ -26,7 +26,7 @@
 
 import { enqueueJob, type QueueEnv } from "@clawnify/queue";
 import { get, query, run } from "./db";
-import type { Edl } from "./edl";
+import { validateEdl, type Edl } from "./edl";
 import {
   instructStep,
   startInstruction,
@@ -89,6 +89,8 @@ export function jobView(j: AskJobRow, withDocs = false) {
     said: j.said,
     applied: j.applied ? (JSON.parse(j.applied) as string[]) : [],
     doing: j.status === "queued" || j.status === "running" ? j.doing : null,
+    // Clip projects made so far, while it runs; once done, its message lists them.
+    made: j.state ? madeSoFar(JSON.parse(j.state) as InstructState) : [],
     error: j.error,
     started_at: j.started_at,
     finished_at: j.finished_at,
@@ -102,6 +104,12 @@ export function jobView(j: AskJobRow, withDocs = false) {
         }
       : {}),
   };
+}
+
+/** Projects a running request has made: finished tasks', then the one under way. */
+function madeSoFar(state: InstructState): { id: string; name: string }[] {
+  const underWay = state.task && state.task.phase === "frame" ? state.task.targets.filter((t) => t.project !== "draft") : [];
+  return [...(state.made ?? []), ...underWay.map((t) => ({ id: t.project, name: t.name }))];
 }
 
 /** How the proposal reads: what it would watch, and that it runs in the background. */
@@ -218,7 +226,7 @@ export async function runJobStep(
     // Cancelled from the editor: stop where it is; nothing is applied.
     const now = await get<{ status: AskJobStatus }>("SELECT status FROM ask_jobs WHERE id = ?", [job.id]);
     if (now?.status !== "running") return { status: now?.status ?? "gone" };
-    const modelCall = state.pending.length === 0;
+    const modelCall = state.pending.length === 0 && !state.task;
     const out = await instructStep(state, ctx).catch(
       (e: unknown) => ({ done: { failure: { error: "ai_failed", detail: String((e as Error).message ?? e) } } }) as { done: InstructDone },
     );
@@ -227,7 +235,7 @@ export async function runJobStep(
       break;
     }
     state = out.state;
-    if (modelCall) modelCalls++;
+    if (modelCall && !out.wait) modelCalls++;
     await run("UPDATE ask_jobs SET state = ?, doing = ?, applied = ?, updated_at = datetime('now') WHERE id = ?", [
       JSON.stringify(state),
       state.doing,
@@ -236,7 +244,9 @@ export async function runJobStep(
     ]);
     // Stop before a model call past the limit, or when the time is up; a model
     // call's operations run in the same delivery while time allows.
-    const nextIsModelCall = state.pending.length === 0;
+    // Waiting on the media service: the next delivery, about a minute on, asks again.
+    if (out.wait) break;
+    const nextIsModelCall = state.pending.length === 0 && !state.task;
     if ((nextIsModelCall && modelCalls >= MODEL_CALLS_PER_DELIVERY) || Date.now() - began > budgetMs) break;
   }
 
@@ -265,13 +275,14 @@ async function conclude(job: AskJobRow, out: InstructDone): Promise<AskJobStatus
     await say(job, "This could not run in the background.", [], { failed: true });
     return "failed";
   }
-  if (out.asked || out.applied.length === 0) {
-    // A question back, or nothing to change: the cut stays as it is.
-    await finish(job, "applied", { said: out.said, applied: [] });
-    await say(job, out.said, [], { asked: !!out.asked });
+  const result = JSON.stringify(out.edl);
+  if (out.asked || out.applied.length === 0 || unchanged(job.base_edl, result)) {
+    // A question back, or nothing to change in this cut (clips go to projects of
+    // their own): the cut stays as it is.
+    await finish(job, "applied", { said: out.said, applied: out.asked ? [] : out.applied });
+    await say(job, out.said, out.asked ? [] : out.applied, { asked: !!out.asked, made: out.made });
     return "applied";
   }
-  const result = JSON.stringify(out.edl);
   // Applied only over the cut it started from, in one statement, so an edit
   // saved meanwhile is never overwritten.
   const written = await get<{ id: string }>(
@@ -280,7 +291,7 @@ async function conclude(job: AskJobRow, out: InstructDone): Promise<AskJobStatus
   );
   const status: AskJobStatus = written ? "applied" : "stale";
   await finish(job, status, { said: out.said, applied: out.applied, result });
-  await say(job, written ? out.said : `${out.said} The cut changed while this ran, so it was kept aside instead of applied.`, out.applied);
+  await say(job, written ? out.said : `${out.said} The cut changed while this ran, so it was kept aside instead of applied.`, out.applied, { made: out.made });
   return status;
 }
 
@@ -297,11 +308,23 @@ async function finish(
   );
 }
 
-async function say(job: AskJobRow, text: string, applied: AppliedOp[], o: { asked?: boolean; failed?: boolean } = {}): Promise<void> {
+async function say(
+  job: AskJobRow,
+  text: string,
+  applied: AppliedOp[],
+  o: { asked?: boolean; failed?: boolean; made?: { id: string; name: string }[] } = {},
+): Promise<void> {
   await run(
-    "INSERT INTO ask_messages (project_id, role, text, applied, asked, failed, job_id) VALUES (?, 'assistant', ?, ?, ?, ?, ?)",
-    [job.project_id, text, JSON.stringify(applied), o.asked ? 1 : 0, o.failed ? 1 : 0, job.id],
+    "INSERT INTO ask_messages (project_id, role, text, applied, asked, failed, job_id, made) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?)",
+    [job.project_id, text, JSON.stringify(applied), o.asked ? 1 : 0, o.failed ? 1 : 0, job.id, o.made?.length ? JSON.stringify(o.made) : null],
   );
+}
+
+/** Whether a result is the cut the job started from: both read in the schema's key order. */
+function unchanged(base: string | null, result: string): boolean {
+  if (!base) return false;
+  const checked = validateEdl(JSON.parse(base));
+  return !("invalid" in checked) && JSON.stringify(checked.edl) === result;
 }
 
 /**

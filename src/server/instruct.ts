@@ -23,6 +23,7 @@ import {
 import { FORMAT_PRESETS, reshape, sameShape, sizeFor } from "../shared/format";
 import { addFormat, MAX_FORMATS } from "../shared/formats";
 import { ADJUST_KEYS, cleanAdjust, describeAdjust, type Adjust } from "../shared/adjust";
+import { advanceTask, CLIP_SECONDS, clipsTask, frameTask, frameTargets, MAX_CLIPS, taskDoing, type ClipDeps, type ClipsTask } from "./clips";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 const MODEL = "google/gemini-3.7-flash";
@@ -261,6 +262,27 @@ const OPS = [
       },
       required: ["videos", "brief"],
     },
+  },
+  {
+    name: "make_clips",
+    description:
+      "Cut several short vertical (9:16) videos out of one long listed video: it reads what is said, picks the moments that stand on their own, opens each on its strongest line, and makes each its own project with captions, framed on the speaker. Use it for clips, shorts, reels or cut-downs from a talk, interview or podcast. It does not change this cut.",
+    parameters: {
+      type: "object",
+      properties: {
+        video: { type: "string", description: "the long video's id as listed, e.g. v1" },
+        count: { type: "integer", description: `how many clips, 1 to ${MAX_CLIPS}` },
+        seconds: { type: "number", description: `about how long each runs; ${CLIP_SECONDS.usual} when not said` },
+        brief: { type: "string", description: "what they are for, in the person's words: audience, platform, tone, topics" },
+      },
+      required: ["video", "count"],
+    },
+  },
+  {
+    name: "reframe",
+    description:
+      "Frame this cut for vertical (9:16): it watches each clip's camera shots and crops to the person speaking, or stacks two people, keeping the whole picture where it is unsure. When the cut is another shape it adds a 9:16 version and frames that. Use it for 'make it vertical', 'keep the speaker in frame', 'close-ups'.",
+    parameters: { type: "object", properties: {} },
   },
   {
     name: "ask_user",
@@ -663,6 +685,7 @@ const SYSTEM = [
   "Earlier messages in this conversation are listed before the request; use them to resolve what 'it', 'that' or 'shorter' means. The cut shown is the current one, which may have been edited since.",
   "Call ask_user instead of guessing when the request is ambiguous, and to confirm your plan first when it would watch more than two clips. Never ask about something the request already says.",
   "When videos are listed that are not in the cut and the person asks to make something from 'these clips' or 'my videos', build it from them: assemble for a cut that needs the best moments, add_clip to place a video as it is. If it is unclear which videos they mean, ask.",
+  "For short vertical clips, shorts, reels or cut-downs from a long talk or interview, call make_clips once with the long video; it makes new projects and leaves this cut alone. For framing this cut for vertical or keeping a speaker in frame, call reframe.",
   "When highlights are listed, they are the best parts of the footage: to build or extend a cut from the footage, add them with add_highlight. Soundbites carry what is said; b-roll goes between them. Prefer kept ones, then ones marked best, then higher scores, and keep to the length asked for.",
 ].join(" ");
 
@@ -717,6 +740,10 @@ export interface InstructState {
   videos: InstructVideo[];
   /** What the next step will do, in words a person reads while it runs. */
   doing: string;
+  /** Work that waits on the media service between steps (clips.ts), when one is under way. */
+  task?: ClipsTask | null;
+  /** Projects this request made. */
+  made?: { id: string; name: string }[];
 }
 
 /** Everything a step needs from the app that is not part of the request itself. */
@@ -729,13 +756,15 @@ export interface InstructContext {
   /** The project's highlights, kept first then best: what add_highlight places. */
   highlights?: InstructHighlight[];
   assemble?: Assembler;
+  /** Making clip projects and framing: only where the app can wait on the media service. */
+  clips?: ClipDeps;
   /** Seconds of footage this run may watch. Past it, it stops with `background`
    *  and changes nothing. Omitted in a background job: no limit. */
   watchBudget?: number;
 }
 
 export type InstructDone =
-  | { edl: Edl; said: string; applied: AppliedOp[]; asked?: true }
+  | { edl: Edl; said: string; applied: AppliedOp[]; asked?: true; made?: { id: string; name: string }[] }
   | { background: NeedsBackground }
   | { failure: InstructFailure | EdlInvalid };
 
@@ -785,6 +814,10 @@ function doingFor(state: InstructState, call: { name: string; args: Record<strin
     }
     case "add_clip":
       return "Placing a video";
+    case "make_clips":
+      return "Reading the transcript";
+    case "reframe":
+      return "Framing the cut for 9:16";
     default:
       return "Changing the cut";
   }
@@ -795,7 +828,10 @@ function doingFor(state: InstructState, call: { name: string; args: Record<strin
  * call asked for. Returns the state to carry on from, or how it ended. A
  * request that never stops is not possible: MAX_ROUNDS model calls at most.
  */
-export async function instructStep(state: InstructState, ctx: InstructContext): Promise<{ state: InstructState } | { done: InstructDone }> {
+export async function instructStep(
+  state: InstructState,
+  ctx: InstructContext,
+): Promise<{ state: InstructState; wait?: true } | { done: InstructDone }> {
   const s = state;
   const highlights = ctx.highlights ?? [];
   const sourceSeconds = ctx.sourceSeconds ?? new Map<string, number>();
@@ -803,8 +839,40 @@ export async function instructStep(state: InstructState, ctx: InstructContext): 
   const finish = (said: string, asked?: true): { done: InstructDone } => {
     const checked = validateEdl(s.draft);
     if ("invalid" in checked) return { done: { failure: checked.invalid } };
-    return { done: { edl: checked.edl, said, applied: s.applied, ...(asked ? { asked } : {}) } };
+    return { done: { edl: checked.edl, said, applied: s.applied, ...(asked ? { asked } : {}), ...(s.made?.length ? { made: s.made } : {}) } };
   };
+  /** The answer to an operation, read by the model's next call. */
+  const answer = (id: string | undefined, text: string) => {
+    s.messages.push({
+      role: "tool",
+      tool_call_id: id,
+      content: text + (s.pending.length === 0 ? `\n\nThe cut now:\n${describeEdl(s.draft, ctx.assetNames)}` : ""),
+    });
+    s.doing = s.pending[0] ? doingFor(s, s.pending[0], ctx.assetNames) : "Checking the result";
+  };
+
+  // Work under way that waits on the media service: one step of it.
+  if (s.task) {
+    if (!ctx.clips) return { done: { failure: { error: "ai_unavailable", detail: "making clips is not available here" } } };
+    const out = await advanceTask(s.task, ctx.clips, s.draft, sourceSeconds);
+    if ("task" in out) {
+      s.task = out.task;
+      if (out.draft) s.draft = out.draft;
+      s.doing = out.doing;
+      return out.wait ? { state: s, wait: true } : { state: s };
+    }
+    const callId = s.task.callId;
+    s.task = null;
+    s.made = [...(s.made ?? []), ...out.made];
+    if ("said" in out) {
+      if (out.draft) s.draft = out.draft;
+      s.applied.push(out.said);
+      answer(callId, `done: ${out.said}`);
+    } else {
+      answer(callId, `could not: ${out.error}${out.made.length ? ` (${out.made.length} projects were made before it stopped)` : ""}`);
+    }
+    return { state: s };
+  }
 
   // An operation the model asked for, not run yet.
   const call = s.pending.shift();
@@ -817,6 +885,16 @@ export async function instructStep(state: InstructState, ctx: InstructContext): 
       const id = s.idsThisRound[args.clip];
       const now = s.draft.main.elements.findIndex((el) => el.id === id);
       args = { ...args, clip: id === undefined ? args.clip : now };
+    }
+    if (call.name === "make_clips" || call.name === "reframe") {
+      const started = startTask(s, call, videos, sourceSeconds, ctx);
+      if ("error" in started) {
+        answer(call.id, `could not: ${started.error}`);
+        return { state: s };
+      }
+      s.task = started.task;
+      s.doing = taskDoing(started.task);
+      return { state: s };
     }
     const out =
       call.name === "clean_up_clip"
@@ -857,7 +935,9 @@ export async function instructStep(state: InstructState, ctx: InstructContext): 
     (op) =>
       (op.name !== "add_highlight" || highlights.length > 0) &&
       (op.name !== "add_clip" || videos.size > 0) &&
-      (op.name !== "assemble" || (videos.size > 0 && !!ctx.assemble)),
+      (op.name !== "assemble" || (videos.size > 0 && !!ctx.assemble)) &&
+      (op.name !== "make_clips" || (videos.size > 0 && !!ctx.clips)) &&
+      (op.name !== "reframe" || !!ctx.clips),
   );
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -902,9 +982,12 @@ export async function instructStep(state: InstructState, ctx: InstructContext): 
   // that the whole request moves to the background, starting over there, so
   // nothing half-done reaches the cut.
   if (ctx.watchBudget !== undefined) {
-    const watching = calls.filter((c) => c.name === "clean_up_clip");
+    const watching = calls.filter((c) => c.name === "clean_up_clip" || c.name === "make_clips" || c.name === "reframe");
+    // Clips and framing wait on the media service for minutes: never inside a quick answer.
+    const waits = calls.some((c) => c.name === "make_clips" || c.name === "reframe");
     if (watching.length) {
-      const seconds = watching.reduce((sum, c) => sum + watchSeconds(s.draft, c.args, sourceSeconds), s.watched);
+      const seconds = watching.reduce((sum, c) => sum + taskSeconds(s.draft, c, videos, sourceSeconds), s.watched);
+      if (waits) return { done: { background: { clips: s.watchedClips + watching.length, seconds } } };
       if (seconds > ctx.watchBudget) return { done: { background: { clips: s.watchedClips + watching.length, seconds } } };
       s.watched = seconds;
       s.watchedClips += watching.length;
@@ -917,6 +1000,38 @@ export async function instructStep(state: InstructState, ctx: InstructContext): 
   s.idsThisRound = s.draft.main.elements.map((el) => el.id);
   s.doing = doingFor(s, calls[0], ctx.assetNames);
   return { state: s };
+}
+
+/** Footage an operation watches, for the proposal: a clip's window, the long video, the whole cut. */
+function taskSeconds(draft: Edl, call: { name: string; args: Record<string, unknown> }, videos: Map<string, InstructVideo>, sourceSeconds: Map<string, number>): number {
+  if (call.name === "clean_up_clip") return watchSeconds(draft, call.args, sourceSeconds);
+  if (call.name === "make_clips") return videos.get(String(call.args.video ?? ""))?.seconds ?? Infinity;
+  return draft.main.elements.reduce((sum, _el, i) => sum + watchSeconds(draft, { clip: i }, sourceSeconds), 0);
+}
+
+/** Check a make_clips or reframe call and set up its task. */
+function startTask(
+  s: InstructState,
+  call: { id?: string; name: string; args: Record<string, unknown> },
+  videos: Map<string, InstructVideo>,
+  sourceSeconds: Map<string, number>,
+  ctx: InstructContext,
+): { task: ClipsTask } | { error: string } {
+  if (!ctx.clips) return { error: "making clips and framing are not available here" };
+  const now = ctx.clips.now();
+  if (call.name === "reframe") {
+    const targets = frameTargets([{ project: "draft", name: "this cut", edl: s.draft }], sourceSeconds);
+    return "error" in targets ? targets : { task: frameTask(call.id, targets, now) };
+  }
+  const v = videos.get(String(call.args.video ?? ""));
+  if (!v) return { error: `there is no video "${call.args.video}"` };
+  const count = Math.round(Number(call.args.count ?? 5));
+  if (!Number.isFinite(count) || count < 1 || count > MAX_CLIPS) return { error: `make 1 to ${MAX_CLIPS} clips at a time` };
+  const asked = call.args.seconds === undefined ? CLIP_SECONDS.usual : Number(call.args.seconds);
+  if (!Number.isFinite(asked)) return { error: `cannot make clips of ${call.args.seconds} seconds` };
+  const seconds = Math.min(CLIP_SECONDS.max, Math.max(CLIP_SECONDS.min, asked));
+  if (v.seconds !== null && v.seconds < seconds * 1.5) return { error: `"${v.name}" is too short to cut clips from; use it as it is` };
+  return { task: clipsTask(call.id, { src: v.src, name: v.name, seconds: v.seconds }, count, seconds, String(call.args.brief ?? ""), now) };
 }
 
 /**
@@ -954,6 +1069,8 @@ export async function instructEdit(
   for (;;) {
     const out = await instructStep(state, ctx);
     if ("done" in out) return out.done;
+    // Waiting on the media service only happens in a background job.
+    if (out.wait) return { failure: { error: "needs_background", detail: "this request waits on video analysis, so it has to run in the background" } };
     state = out.state;
   }
 }
