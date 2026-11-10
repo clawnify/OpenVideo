@@ -1043,7 +1043,7 @@ app.post("/api/projects/:id/instruct", async (c) => {
     ctx.analyze,
     await instructHighlights(project.id),
     await askHistory(project.id),
-    { videos: await instructVideos(project.id), assemble: ctx.assemble, watchBudget: QUICK_WATCH_SECONDS },
+    { videos: await instructVideos(project.id), assemble: ctx.assemble, clips: ctx.clips, watchBudget: QUICK_WATCH_SECONDS },
   );
   // A failed exchange stays on screen but out of what the model reads next.
   await userSays("failure" in out);
