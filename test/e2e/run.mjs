@@ -1555,7 +1555,7 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
       if (now.doing) seen.add(now.doing);
     }
     assert.equal(status, "applied", [...seen].join(" | "));
-    assert.ok([...seen].some((d) => d.startsWith("Framing 2 clips for 9:16")), [...seen].join(" | "));
+    assert.ok([...seen].some((d) => d.startsWith("Framing 2 videos for 9:16")), [...seen].join(" | "));
     r = await call("GET", `/api/projects/${pi}/ask`);
     const last = r.data.messages.at(-1);
     assert.equal(last.text, "Made two clips from the interview.");

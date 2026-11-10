@@ -164,7 +164,7 @@ describe("Making clips from a long video", () => {
     expect(out.said).toContain("2 framed on the speaker.");
     expect(waits).toBe(3);
     expect(doing[0]).toBe('Reading the transcript of "talk 1.mp4"');
-    expect(doing).toContain("Framing 2 clips for 9:16: 0 of 2 stretches read");
+    expect(doing).toContain("Framing 2 videos for 9:16: 0 of 2 stretches read");
     // The hook sits inside its moment, so each clip is one analysis of its own stretch, not of the talk.
     expect([...analyses.values()].map((a) => [a.start, a.end])).toEqual([
       [99.9, 154.8],

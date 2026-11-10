@@ -172,86 +172,77 @@ function MadeLinks({ made, onOpen }: { made: Made[]; onOpen: (id: string) => voi
 }
 
 /**
- * The background work, when the conversation is the dashboard's chat: what a
- * job is doing, its controls, and the clips it made. Nothing shows while
- * nothing needs the person.
+ * The background work, when the conversation is the dashboard's chat: one
+ * short line beside the Videos menu. What a job is doing while it runs, its
+ * controls when it needs the person, and "6 new videos" for a few seconds when
+ * it made some. Nothing when nothing is happening: it never takes room from
+ * the player.
  */
-export function JobStrip({ ask, onOpen }: { ask: Ask; onOpen: (id: string) => void }) {
-  const { jobs, messages, notTaken, act } = ask;
-  const [acting, setActing] = useState<string | null>(null);
+export function JobStatus({ ask }: { ask: Ask }) {
+  const { jobs, notTaken, act } = ask;
+  const [acting, setActing] = useState(false);
   const [err, setErr] = useState("");
-  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
-  const doAct = async (id: string, action: "run" | "cancel" | "apply") => {
-    setActing(`${id}:${action}`);
+  const [done, setDone] = useState<string | null>(null);
+  const was = useRef(new Map<string, AskJobStatus>());
+  // A job seen running here that finished with videos: say so, briefly.
+  useEffect(() => {
+    for (const j of jobs) {
+      const before = was.current.get(j.id);
+      if (before && ACTIVE.includes(before) && !ACTIVE.includes(j.status) && j.status === "applied") {
+        const n = ask.messages?.filter((m) => m.job_id === j.id).reduce((k, m) => k + (m.made?.length ?? 0), 0) ?? 0;
+        setDone(n ? `${n} new video${n === 1 ? "" : "s"}` : "Done");
+      }
+      was.current.set(j.id, j.status);
+    }
+  }, [jobs, ask.messages]);
+  useEffect(() => {
+    if (!done) return;
+    const t = setTimeout(() => setDone(null), 8000);
+    return () => clearTimeout(t);
+  }, [done]);
+  const run = async (id: string, action: "run" | "cancel" | "apply") => {
+    setActing(true);
     setErr("");
     try {
       await act(id, action);
     } catch (e) {
       setErr(String((e as Error).message));
     } finally {
-      setActing(null);
+      setActing(false);
     }
   };
-  // The newest message of each finished job that made clips, until dismissed.
-  const madeBy = new Map<string, Made[]>();
-  for (const m of messages ?? []) if (m.job_id && m.made?.length) madeBy.set(m.job_id, m.made);
-  const shown = jobs.filter(
-    (j) =>
-      !dismissed.has(j.id) &&
-      (j.status === "proposed" || ACTIVE.includes(j.status) || j.status === "stale" || notTaken.has(j.id) || (j.status === "applied" && madeBy.has(j.id))),
-  );
-  if (!shown.length && !err) return null;
-  const close = (id: string) => setDismissed((d) => new Set(d).add(id));
+  const job = jobs.find((j) => j.status === "proposed" || ACTIVE.includes(j.status) || j.status === "stale" || notTaken.has(j.id));
+  const small = `${btnGhost} h-7 px-1.5 text-fine`;
+  if (err) return <span className="hidden md:inline text-fine text-danger truncate max-w-64" title={err}>{err}</span>;
+  if (!job) return done ? <span className="hidden md:inline text-fine text-muted whitespace-nowrap" role="status">{done}</span> : null;
   return (
-    <div className="border-b border-border bg-surface px-3 py-2 space-y-2" aria-live="polite">
-      {shown.map((j) => {
-        const busy = acting !== null;
-        return (
-          <div key={j.id} className="text-fine">
-            <div className="flex items-center gap-2 min-w-0">
-              {ACTIVE.includes(j.status) ? <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" /> : <Sparkles className="w-3.5 h-3.5 shrink-0 text-muted" />}
-              <span className="flex-1 min-w-0 truncate" title={j.instruction}>
-                {j.status === "proposed"
-                  ? `Waiting for a yes: ${j.instruction}`
-                  : j.status === "queued"
-                    ? "Starting in the background…"
-                    : j.status === "running"
-                      ? `${j.doing ?? "Working"}…`
-                      : j.status === "applied"
-                        ? `Made ${madeBy.get(j.id)!.length} clips`
-                        : "A change from the chat is waiting: the cut changed while it ran"}
-              </span>
-              {j.status === "proposed" && (
-                <>
-                  <button onClick={() => doAct(j.id, "run")} disabled={busy} className={`${btnPrimary} h-7 text-fine`}>Run</button>
-                  <button onClick={() => doAct(j.id, "cancel")} disabled={busy} className={`${btnGhost} h-7 text-fine`}>Not now</button>
-                </>
-              )}
-              {ACTIVE.includes(j.status) && (
-                <button onClick={() => doAct(j.id, "cancel")} disabled={busy} className={`${btnGhost} h-7 text-fine`}>Cancel</button>
-              )}
-              {(j.status === "stale" || notTaken.has(j.id)) && (
-                <>
-                  <button onClick={() => doAct(j.id, "apply")} disabled={busy} className={`${btnSecondary} h-7 text-fine`}>Apply anyway</button>
-                  {j.status === "stale" && (
-                    <button onClick={() => doAct(j.id, "cancel")} disabled={busy} className={`${btnGhost} h-7 text-fine`}>Discard</button>
-                  )}
-                </>
-              )}
-              {j.status === "applied" && (
-                <button onClick={() => close(j.id)} className={btnIcon} aria-label="Dismiss">
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              )}
-            </div>
-            {(j.status === "applied" ? madeBy.get(j.id) : j.made)?.length ? (
-              <MadeLinks made={(j.status === "applied" ? madeBy.get(j.id) : j.made)!} onOpen={onOpen} />
-            ) : null}
-          </div>
-        );
-      })}
-      {err && <p className="text-fine text-danger break-words">{err}</p>}
-    </div>
+    <span className="hidden md:flex items-center gap-1 min-w-0 text-fine text-muted" role="status">
+      {ACTIVE.includes(job.status) && <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />}
+      <span className="truncate max-w-72" title={job.doing ?? job.instruction}>
+        {job.status === "proposed"
+          ? "Run in the background?"
+          : job.status === "queued"
+            ? "Starting…"
+            : job.status === "running"
+              ? (job.doing ?? "Working…")
+              : "Kept aside: the cut changed"}
+      </span>
+      {job.status === "proposed" && (
+        <>
+          <button onClick={() => run(job.id, "run")} disabled={acting} className={small}>Run</button>
+          <button onClick={() => run(job.id, "cancel")} disabled={acting} className={small}>Not now</button>
+        </>
+      )}
+      {ACTIVE.includes(job.status) && (
+        <button onClick={() => run(job.id, "cancel")} disabled={acting} className={small}>Cancel</button>
+      )}
+      {(job.status === "stale" || notTaken.has(job.id)) && (
+        <>
+          <button onClick={() => run(job.id, "apply")} disabled={acting} className={small}>Apply anyway</button>
+          {job.status === "stale" && <button onClick={() => run(job.id, "cancel")} disabled={acting} className={small}>Discard</button>}
+        </>
+      )}
+    </span>
   );
 }
 

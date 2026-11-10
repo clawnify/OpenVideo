@@ -368,7 +368,7 @@ export function taskDoing(t: ClipsTask): string {
     case "frame": {
       const parts = t.targets.flatMap((x) => x.parts);
       const read = parts.filter((p) => p.status === "done" || p.status === "failed").length;
-      const cuts = t.kind === "clips" ? `${t.targets.length} clip${t.targets.length === 1 ? "" : "s"}` : "the cut";
+      const cuts = t.kind === "clips" ? `${t.targets.length} video${t.targets.length === 1 ? "" : "s"}` : "the cut";
       return `Framing ${cuts} for 9:16: ${read} of ${parts.length} stretch${parts.length === 1 ? "" : "es"} read`;
     }
   }
