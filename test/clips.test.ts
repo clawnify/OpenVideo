@@ -3,6 +3,7 @@ import {
   advanceTask,
   clipEdl,
   clipsPrompt,
+  togetherEdl,
   clipsTask,
   frameTargets,
   frameTask,
@@ -49,10 +50,17 @@ describe("Picking the moments", () => {
     expect(got.map((p) => p.title)).toEqual(["Cold open", "Hook from elsewhere", "Opens on its hook"]);
     // From the start of a line to the end of one.
     expect(got[0].body).toEqual({ start: 99.9, end: 154.8 });
-    expect(got[0].hook).toEqual({ start: 129.9, end: 134.8 });
+    // A 3 second cut from the start of the line the model chose.
+    expect(got[0].hook).toEqual({ start: 129.9, end: 132.9 });
     // The clip already opens on it, and a hook from another part of the talk is not borrowed.
     expect(got[2].hook).toBeNull();
     expect(got[1].hook).toBeNull();
+  });
+
+  it("keeps a hook whose line runs across two transcript lines (Circulate, 2026-11-10: every hook was dropped)", () => {
+    // Lines of 4.2 s on the transcript; the model's hook spans the end of one and the start of the next.
+    const got = readClipPlans({ clips: [plan("1:41.0", "2:31.0", "2:13.0", "2:17.0")] }, cues, DURATION, 1, 45);
+    expect(got[0].hook).toEqual({ start: 132.9, end: 135.9 });
   });
 
   it("ends a moment that runs too long on the last line that fits, and makes no more than asked", () => {
@@ -75,7 +83,7 @@ describe("Picking the moments", () => {
     expect("edl" in validateEdl(edl)).toBe(true);
     expect(edl.output).toMatchObject({ width: 1080, height: 1920 });
     expect(edl.main.elements.map((e) => [e.trimStart, "duration" in e ? e.duration : null])).toEqual([
-      [129.9, 4.9],
+      [129.9, 3],
       [99.9, 54.9],
     ]);
     expect(edl.captions).toMatchObject({ enabled: true, lang: "en" });
@@ -157,7 +165,7 @@ describe("Making clips from a long video", () => {
     expect(out.said).toContain("2 framed on the speaker.");
     expect(waits).toBe(3);
     expect(doing[0]).toBe('Reading the transcript of "talk 1.mp4"');
-    expect(doing).toContain("Framing 2 clips for 9:16: 0 of 2 stretches read");
+    expect(doing).toContain("Framing 2 videos for 9:16: 0 of 2 stretches read");
     // The hook sits inside its moment, so each clip is one analysis of its own stretch, not of the talk.
     expect([...analyses.values()].map((a) => [a.start, a.end])).toEqual([
       [99.9, 154.8],
@@ -219,6 +227,37 @@ describe("Making clips from a long video", () => {
   });
 });
 
+describe("One video of several moments", () => {
+  it("opens on the strongest moment's hook, then plays the moments in order", () => {
+    // The model lists the strongest first: the later moment, with its hook inside.
+    const plans = readClipPlans({ clips: [plan("12:00.0", "12:45.0", "12:20.0", "12:24.0", "Strongest"), plan("1:41.0", "2:31.0", "1:41.0", "1:44.0", "Earlier")] }, cues, DURATION, 2, 45);
+    let n = 0;
+    const edl = togetherEdl("asset:talk", plans, "en", () => `e${n++}`);
+    expect("edl" in validateEdl(edl)).toBe(true);
+    expect(edl.main.elements.map((e) => [e.trimStart, "duration" in e ? e.duration : null])).toEqual([
+      [739.9, 3],
+      [99.9, 54.9],
+      [719.9, 44.9],
+    ]);
+  });
+
+  it("uses the strongest moment's own opening as the hook when it has none, unless the video starts with it", () => {
+    const later = readClipPlans({ clips: [plan("12:00.0", "12:45.0", "12:00.0", "12:03.0", "Strongest"), plan("1:41.0", "2:31.0", "1:41.0", "1:44.0", "Earlier")] }, cues, DURATION, 2, 45);
+    expect(togetherEdl("asset:talk", later, "en", () => "x").main.elements[0]).toMatchObject({ trimStart: 719.9, duration: 3 });
+    const first = readClipPlans({ clips: [plan("1:41.0", "2:31.0", "1:41.0", "1:44.0", "Strongest"), plan("12:00.0", "12:45.0", "12:00.0", "12:03.0", "Later")] }, cues, DURATION, 2, 45);
+    expect(togetherEdl("asset:talk", first, "en", () => "x").main.elements).toHaveLength(2);
+  });
+
+  it("makes one video, not one per moment", async () => {
+    const { deps } = fakeDeps();
+    const { out } = await runTask(clipsTask("c1", talk, 2, 45, "", 0, true), deps);
+    if (!("said" in out)) throw new Error(JSON.stringify(out));
+    expect(out.made).toHaveLength(1);
+    expect(out.made[0].name).toBe("2 moments from talk 1.mp4");
+    expect(out.said).toMatch(/^Made one \d+s vertical video in this project from 2 moments/);
+  });
+});
+
 describe("Framing this cut", () => {
   it("adds a 9:16 version to a wide cut and frames only that", async () => {
     const wide: Edl = { ...empty(), main: { elements: [{ id: "a", type: "video", src: "asset:talk", trimStart: 60, duration: 30 }] } };
@@ -257,7 +296,7 @@ describe("Clips in the conversation", () => {
     const { deps } = fakeDeps();
     const ctx: InstructContext = { cfg: { openrouterKey: "k" }, assetNames: new Map(), sourceSeconds: seconds, clips: deps, watchBudget: 180 };
     const out = await instructStep(startInstruction(empty(), "5 clips from the talk", new Map(), [], [], videos), ctx);
-    expect(out).toEqual({ done: { background: { clips: 1, seconds: DURATION } } });
+    expect(out).toEqual({ done: { background: { clips: 1, seconds: DURATION, makes: true } } });
   });
 
   it("in the background, waits between deliveries and ends listing the projects, with this cut unchanged", async () => {

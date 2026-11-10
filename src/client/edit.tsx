@@ -1,5 +1,5 @@
 import { ReframeDialog } from "./reframe";
-import { AssistantPanel, JobStrip, canonical, useAsk } from "./assistant";
+import { AssistantPanel, JobStatus, canonical, useAsk } from "./assistant";
 import { VideoSwitcher, useProjectVideos } from "./videos";
 import { embedded, openChat, useChatCommands, useChatContext, useHostChanges } from "@clawnify/app/client";
 // Footage edit projects — the timeline editor over EDL documents.
@@ -1574,6 +1574,7 @@ export function EditEditor({
           {saveState === "saved" ? "Saved" : saveState === "saving" ? "Saving…" : saveState}
         </span>
         <VideoSwitcher videoId={initial.id} videos={videos.videos} reload={videos.reload} onOpen={onOpenProject} />
+        {embedded && <JobStatus ask={ask} />}
         <div className="flex-1" />
         <button
           onClick={undo}
@@ -1691,7 +1692,6 @@ export function EditEditor({
           onShowComment={showComment}
         />
         <div className={`${pane === "canvas" ? "flex" : "hidden"} lg:flex flex-1 flex-col min-w-0 min-h-0`}>
-        {embedded && <JobStrip ask={ask} onOpen={(id) => onOpenProject?.(id)} />}
         <FormatBar
           edl={edl}
           active={format}
