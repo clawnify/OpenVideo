@@ -61,6 +61,7 @@ export interface AskJobRow {
   step_booked_at: string | null;
   started_at: string | null;
   finished_at: string | null;
+  reverted_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -94,6 +95,9 @@ export function jobView(j: AskJobRow, withDocs = false) {
     error: j.error,
     started_at: j.started_at,
     finished_at: j.finished_at,
+    // An applied change can be put back while the cut is still what it made.
+    revertible: j.status === "applied" && !!j.base_edl && !!j.result_edl && !j.reverted_at,
+    reverted_at: j.reverted_at,
     created_at: j.created_at,
     ...(withDocs
       ? {
@@ -320,8 +324,48 @@ async function say(
   );
 }
 
+/**
+ * A quick answer's change, recorded like a job's: the cut before it and after,
+ * so it can be put back from anywhere (another tab, the dashboard's chat, an
+ * agent), and written only over the cut it read. Returns the job, `applied`
+ * or, when the cut changed while the model worked, `stale` (kept aside).
+ */
+export async function recordQuick(
+  projectId: string,
+  instruction: string,
+  author: string | null,
+  base: string,
+  out: { edl: Edl; said: string; applied: AppliedOp[] },
+): Promise<AskJobRow> {
+  const result = JSON.stringify(out.edl);
+  const written = await get<{ id: string }>(
+    "UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ? AND edl = ? RETURNING id",
+    [result, projectId, base],
+  );
+  const job = await get<AskJobRow>(
+    `INSERT INTO ask_jobs (project_id, instruction, status, base_edl, result_edl, said, applied, author, started_at, finished_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) RETURNING *`,
+    [projectId, instruction, written ? "applied" : "stale", base, result, out.said, JSON.stringify(out.applied), author],
+  );
+  return job!;
+}
+
+/** Put an applied change back to the cut before it, only while the cut is still what the change made. */
+export async function revertJob(projectId: string, jobId: string): Promise<{ job: AskJobRow } | { refused: "not_found" | "not_applied" | "changed" }> {
+  const job = await get<AskJobRow>("SELECT * FROM ask_jobs WHERE id = ? AND project_id = ?", [jobId, projectId]);
+  if (!job) return { refused: "not_found" };
+  if (job.status !== "applied" || !job.base_edl || !job.result_edl || job.reverted_at) return { refused: "not_applied" };
+  const back = await get<{ id: string }>(
+    "UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ? AND edl = ? RETURNING id",
+    [job.base_edl, projectId, job.result_edl],
+  );
+  if (!back) return { refused: "changed" };
+  await run("UPDATE ask_jobs SET reverted_at = datetime('now'), updated_at = datetime('now') WHERE id = ?", [jobId]);
+  return { job: (await get<AskJobRow>("SELECT * FROM ask_jobs WHERE id = ?", [jobId]))! };
+}
+
 /** Whether a result is the cut the job started from: both read in the schema's key order. */
-function unchanged(base: string | null, result: string): boolean {
+export function unchanged(base: string | null, result: string): boolean {
   if (!base) return false;
   const checked = validateEdl(JSON.parse(base));
   return !("invalid" in checked) && JSON.stringify(checked.edl) === result;

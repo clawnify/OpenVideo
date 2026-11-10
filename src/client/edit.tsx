@@ -1,5 +1,6 @@
 import { ReframeDialog } from "./reframe";
 import { AssistantPanel, JobStrip, canonical, useAsk } from "./assistant";
+import { VideoSwitcher, useProjectVideos } from "./videos";
 import { embedded, openChat, useChatCommands, useChatContext, useHostChanges } from "@clawnify/app/client";
 // Footage edit projects — the timeline editor over EDL documents.
 //
@@ -321,6 +322,8 @@ type RailTab = "media" | "highlights" | "audio" | "text" | "captions" | "comment
 
 export interface EditProject {
   id: string;
+  /** The project this video belongs to; null for a project's first video. */
+  parent_id?: string | null;
   name: string;
   edl: Edl;
   brief: string;
@@ -799,6 +802,8 @@ type ProjectSummary = Omit<EditProject, "edl" | "brief"> & {
   cover_media: string | null;
   /** Clips taken from the project's Drive folders. */
   footage: number;
+  /** How many videos the project holds, its first included. */
+  videos?: number;
 };
 
 /** The frame a project is recognised by: its opening shot, or a blank tile. */
@@ -907,8 +912,8 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
               )}
             </h1>
             <p className="text-body-sm text-muted mt-0.5">
-              One project is one video: upload your footage, trim it, put the clips in order, add
-              text and music, and export it to MP4.
+              A project holds your footage and every video you make from it: the full cut,
+              short clips, a teaser. Each video has its own timeline, shapes and export.
             </p>
           </div>
           {projects && projects.length > 0 && (
@@ -966,7 +971,7 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
                     <div className="text-fine text-faint mt-0.5">
                       {removing?.id === p.id
                         ? `Deleting${removing.left ? `, ${removing.left} clips to go` : ""}`
-                        : `Edited ${fmtDate(p.updated_at)}${p.footage ? ` · ${p.footage} source ${p.footage === 1 ? "video" : "videos"}` : ""}`}
+                        : `Edited ${fmtDate(p.updated_at)}${(p.videos ?? 1) > 1 ? ` · ${p.videos} videos` : ""}${p.footage ? ` · ${p.footage} source ${p.footage === 1 ? "video" : "videos"}` : ""}`}
                     </div>
                   </div>
                 </button>
@@ -988,7 +993,9 @@ export function ProjectsHome({ navigate }: { navigate: (to: string) => void }) {
           <ConfirmDialog
             title={`Delete “${confirmDel.name}”?`}
             body={
-              confirmDel.footage
+              (confirmDel.videos ?? 1) > 1
+                ? `The project, its ${confirmDel.videos} videos and their exports are deleted. Shared highlights and videos used by other projects are kept.`
+                : confirmDel.footage
                 ? "The project and its export history are deleted. Shared highlights and videos used by them or other projects are kept. Unused Drive-folder copies are removed; originals in Google Drive are kept."
                 : "The project and its export history go with it. Your footage stays in the media library."
             }
@@ -1041,12 +1048,10 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
     setAssets(null);
     setFootage(null);
     setErr("");
-    Promise.all([
-      api.get<EditProject>(`/api/projects/${id}`),
-      api.get<Asset[]>("/api/assets"),
-      // A first look only: the panel's own reads move the footage on.
-      api.get<FootageList>(`/api/projects/${id}/footage?logs=0&step=0`),
-    ])
+    Promise.all([api.get<EditProject>(`/api/projects/${id}`), api.get<Asset[]>("/api/assets")])
+      // The footage is the project's, whichever of its videos is open. A
+      // first look only: the panel's own reads move the footage on.
+      .then(async ([p, a]) => [p, a, await api.get<FootageList>(`/api/projects/${p.parent_id ?? p.id}/footage?logs=0&step=0`)] as const)
       .then(([p, a, f]) => {
         if (!current) return;
         setProject(p);
@@ -1089,7 +1094,8 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
       initial={project}
       initialAssets={assets}
       initialFootage={footage}
-      onOpenHighlights={() => navigate(`/edits/${id}/highlights`)}
+      projectId={project.parent_id ?? project.id}
+      onOpenHighlights={() => navigate(`/edits/${project.parent_id ?? project.id}/highlights`)}
       onOpenProject={(other) => navigate(`/edits/${other}`)}
     />
   );
@@ -1101,14 +1107,17 @@ export function EditEditor({
   initialFootage,
   onOpenHighlights,
   onOpenProject,
+  projectId,
 }: {
   initial: EditProject;
   initialAssets: Asset[];
   initialFootage: FootageList;
   /** Opens the footage's highlights. */
   onOpenHighlights?: () => void;
-  /** Opens another project, such as a clip the AI made. */
+  /** Opens another video, such as a clip the AI made. */
   onOpenProject?: (id: string) => void;
+  /** The project this video belongs to: its footage and highlights. */
+  projectId?: string;
 }) {
   const [name, setName] = useState(initial.name);
   const [brief, setBrief] = useState(initial.brief ?? "");
@@ -1228,6 +1237,12 @@ export function EditEditor({
     [commit],
   );
   const ask = useAsk(initial.id, () => edlRef.current, applyAi);
+  const videos = useProjectVideos(initial.id);
+  // Clips the AI makes become videos of this project: count them as they come.
+  const madeCount = (ask.messages ?? []).reduce((n, m) => n + (m.made?.length ?? 0), 0) + ask.jobs.reduce((n, j) => n + (j.made?.length ?? 0), 0);
+  useEffect(() => {
+    if (madeCount) void videos.reload();
+  }, [madeCount, videos.reload]);
 
   // Inside Clawnify the conversation is the dashboard's chat. It knows which
   // project is open, offers its requests in the "/" menu, and calls this app's
@@ -1548,7 +1563,7 @@ export function EditEditor({
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          aria-label="Project name"
+          aria-label="Video name"
           className="min-w-24 flex-1 lg:flex-none lg:w-64 bg-transparent text-heading-3 outline-none rounded-sm h-7 px-1.5 -mx-1.5 hover:bg-surface-sunken focus:bg-surface focus:shadow-edge"
         />
         <span
@@ -1558,6 +1573,7 @@ export function EditEditor({
         >
           {saveState === "saved" ? "Saved" : saveState === "saving" ? "Saving…" : saveState}
         </span>
+        <VideoSwitcher videoId={initial.id} videos={videos.videos} reload={videos.reload} onOpen={onOpenProject} />
         <div className="flex-1" />
         <button
           onClick={undo}
@@ -1658,7 +1674,7 @@ export function EditEditor({
       {/* three-panel middle */}
       <div className="flex-1 flex min-h-0">
         <LeftPanel
-          projectId={initial.id}
+          projectId={projectId ?? initial.id}
           initialFootage={initialFootage}
           onOpenHighlights={onOpenHighlights}
           pane={pane}

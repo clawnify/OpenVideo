@@ -29,7 +29,7 @@ function useRouter() {
  * it.
  */
 function HostNav({ active, path, navigate }: { active: string; path: string; navigate: (to: string) => void }) {
-  const [projects, setProjects] = useState<Omit<EditProject, "edl">[]>([]);
+  const [projects, setProjects] = useState<(Omit<EditProject, "edl"> & { video_ids?: string[] })[]>([]);
   useEffect(() => {
     fetch("/api/projects")
       .then((r) => (r.ok ? (r.json() as Promise<Omit<EditProject, "edl">[]>) : []))
@@ -37,11 +37,14 @@ function HostNav({ active, path, navigate }: { active: string; path: string; nav
       .catch(() => {});
     reportLocation(window.location.pathname + window.location.search);
   }, [path]);
+  // A project's other videos are inside it: opening one keeps the project marked.
+  const owner = projects.find((p) => p.video_ids?.some((v) => `edits/${v}` === active));
+  const marked = owner ? `edits/${owner.id}` : active || "home";
   return (
     <AppNav
       title="Video"
       icon="video"
-      active={active || "home"}
+      active={marked}
       groups={[
         { items: [{ id: "home", label: "Projects", icon: "video", href: "/", home: true }, { id: "highlights", label: "Highlights", icon: "sparkles", href: "/highlights" }] },
         {
