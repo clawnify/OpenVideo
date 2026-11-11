@@ -1520,6 +1520,20 @@ console.log("14 ok: review comments off by default, on per link, pinned to an ex
     });
     db.prepare("INSERT INTO assets (id, key, name, content_type, size, duration, media_uid, transcript, transcript_lang) VALUES ('talk', 'media/talk', 'TALK.MP4', 'video/mp4', 100, 600, ?, ?, 'en')")
       .run(uid, `WEBVTT\n\n${lines.join("\n\n")}`);
+    // The transcript downloads as text with times, and a cue is corrected in
+    // the kept transcript, so every caption made from it carries the fix.
+    r = await app.request("/api/assets/talk/transcript/text", {}, env);
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get("content-disposition"), /attachment; filename="TALK transcript\.txt"/);
+    assert.ok((await r.text()).startsWith("[0:00] line 0\n[0:05] line 1\n"), "one line per cue, with its time");
+    r = await call("PUT", "/api/assets/talk/transcript/cues", { lang: "en", start: 5, text: "  TrackStock,   line 1 " });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.match(r.data.vtt, /00:00:05\.000 --> 00:00:09\.500\nTrackStock, line 1\n/);
+    assert.match((await call("GET", "/api/assets/talk/transcript")).data.vtt, /TrackStock, line 1/, "the fix is kept");
+    assert.equal((await call("PUT", "/api/assets/talk/transcript/cues", { lang: "en", start: 5, text: " " })).status, 400);
+    assert.equal((await call("PUT", "/api/assets/talk/transcript/cues", { lang: "en", start: 7, text: "x" })).status, 404, "no cue starts there");
+    assert.equal((await call("PUT", "/api/assets/talk/transcript/cues", { lang: "it", start: 5, text: "x" })).status, 409, "another language's transcript is not this one");
+    await call("PUT", "/api/assets/talk/transcript/cues", { lang: "en", start: 5, text: "line 1" });
     r = await call("POST", "/api/projects", { name: "Interview" });
     const pi = r.data.id;
     const before = JSON.stringify((await call("GET", `/api/projects/${pi}`)).data.edl);

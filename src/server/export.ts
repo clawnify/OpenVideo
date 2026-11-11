@@ -12,7 +12,7 @@ import { getUpload, getUploadBytes, putUploadFromUrl } from "./uploads";
 import { mediaState, prepareMedia } from "./media";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { drawnStroke } from "../shared/outline";
-import { captionText, captionTimeline, type PlacedClip } from "../shared/captions";
+import { captionChars, captionText, captionTimeline, type PlacedClip } from "../shared/captions";
 import { parseVtt, type Cue } from "../shared/transcript";
 import { layOut } from "../shared/transition";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
@@ -206,7 +206,7 @@ export async function expandCaptions(edl: Edl): Promise<Edl> {
     }
   }
 
-  const lines = captionTimeline(placed, cues, captions.style.maxChars);
+  const lines = captionTimeline(placed, cues, captionChars(captions.style, edl.output));
   if (lines.length === 0) return rest as Edl;
   const track = {
     id: "captions",

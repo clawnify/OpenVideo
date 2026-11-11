@@ -1,6 +1,6 @@
 import { reframing, readFraming, requestFraming } from "./reframe";
 import type { ClipDeps } from "./clips";
-import { parseVtt } from "../shared/transcript";
+import { parseVtt, toVtt, transcriptText } from "../shared/transcript";
 import { backfillHighlights, libraryHighlights } from "./library-highlights";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { initDB, query, get, run } from "./db";
@@ -472,10 +472,66 @@ app.get("/api/assets/:id/source", async (c) => {
  * service transcribes.
  */
 app.get("/api/assets/:id/transcript", async (c) => {
-  const asked = c.req.query("lang") ?? "en";
-  const lang = /^[a-z]{2}(-[A-Z]{2})?$/.test(asked) ? asked : "en";
-  const out = await assetTranscript(c.env, c.req.param("id"), lang);
+  const out = await assetTranscript(c.env, c.req.param("id"), transcriptLang(c.req.query("lang")));
   return "code" in out ? c.json(out.body, out.code) : c.json(out);
+});
+
+/** The language a transcript request names, or English. */
+const transcriptLang = (asked: string | undefined) => (asked && /^[a-z]{2}(-[A-Z]{2})?$/.test(asked) ? asked : "en");
+
+/**
+ * The transcript as a text file, one line per cue with the time it is said:
+ * something to read, send to a client, or hand to another tool to pick moments.
+ */
+app.get("/api/assets/:id/transcript/text", async (c) => {
+  // With no language named, the one already kept: asking for another would replace it.
+  const kept = await get<{ transcript_lang: string | null }>("SELECT transcript_lang FROM assets WHERE id = ? AND transcript IS NOT NULL", [c.req.param("id")]);
+  const out = await assetTranscript(c.env, c.req.param("id"), transcriptLang(c.req.query("lang") ?? kept?.transcript_lang ?? undefined));
+  if ("code" in out) return c.json(out.body, out.code);
+  if (out.status !== "ready") {
+    const error =
+      out.status === "no_speech"
+        ? "No speech was found in this video."
+        : out.status === "unavailable"
+          ? "This video is kept in the app's own storage, which has no transcripts. Upload it again to get one."
+          : "The transcript is being made. Try again in a few minutes.";
+    return c.json({ error, status: out.status }, 409);
+  }
+  const asset = await get<{ name: string }>("SELECT name FROM assets WHERE id = ?", [c.req.param("id")]);
+  const name = (asset?.name ?? "video").replace(/\.[^.]+$/, "").replace(/[^\w .-]+/g, "_") || "video";
+  return c.body(transcriptText(parseVtt(out.vtt)) + "\n", 200, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Content-Disposition": `attachment; filename="${name} transcript.txt"`,
+  });
+});
+
+/**
+ * Correct what one cue says: a misheard word, a brand name's spelling. The
+ * fix is made in the kept transcript, so captions, exports and everything
+ * else read from it carry it, in every video cut from this clip. `start` names
+ * the cue by the second it begins.
+ */
+app.put("/api/assets/:id/transcript/cues", async (c) => {
+  const body = (await c.req.json().catch(() => null)) as { lang?: string; start?: number; text?: string } | null;
+  const text = typeof body?.text === "string" ? body.text.replace(/\s+/g, " ").trim() : "";
+  if (!body || typeof body.start !== "number" || !text || text.length > 500) {
+    return c.json({ error: "Send the cue's start and its new text, up to 500 characters." }, 400);
+  }
+  const asset = await get<{ id: string; transcript: string | null; transcript_lang: string | null }>(
+    "SELECT id, transcript, transcript_lang FROM assets WHERE id = ?",
+    [c.req.param("id")],
+  );
+  if (!asset) return c.json({ error: "Not found" }, 404);
+  if (!asset.transcript || asset.transcript_lang !== transcriptLang(body.lang)) {
+    return c.json({ error: "This video has no transcript in that language yet." }, 409);
+  }
+  const cues = parseVtt(asset.transcript);
+  const cue = cues.find((x) => Math.abs(x.start - body.start!) < 0.0015);
+  if (!cue) return c.json({ error: "No cue starts there." }, 404);
+  cue.text = text;
+  const vtt = toVtt(cues);
+  await run("UPDATE assets SET transcript = ? WHERE id = ?", [vtt, asset.id]);
+  return c.json({ status: "ready", vtt });
 });
 
 type TranscriptState =

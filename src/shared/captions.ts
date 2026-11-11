@@ -9,10 +9,15 @@
 // shared text layout, so the two agree.
 
 import { captionChunks, type Cue } from "./transcript";
-import { blockHeight, fitTop } from "./textLayout";
+import { blockHeight, charsPerLine, fitTop } from "./textLayout";
 
 export interface CaptionStyle {
-  /** Font size as a share of the frame's height, so it keeps its size across shapes. */
+  /**
+   * Font size as a share of the frame's shorter side. A share of the height
+   * made the same setting nearly twice as large on a vertical video as on a
+   * wide one, where each line then held half the words and captions wrapped
+   * to three lines.
+   */
   size: number;
   position: "bottom" | "top";
   /** Distance from that edge, as a share of the frame's height. */
@@ -43,6 +48,23 @@ export const DEFAULT_CAPTION_STYLE: CaptionStyle = {
 };
 
 export const DEFAULT_CAPTIONS: ProjectCaptions = { enabled: false, lang: "en", style: DEFAULT_CAPTION_STYLE };
+
+type Frame = { width: number; height: number };
+
+/** A caption's font size in pixels at the video's resolution. */
+export function captionFontSize(style: CaptionStyle, frame: Frame): number {
+  return Math.max(8, Math.round(style.size * Math.min(frame.width, frame.height)));
+}
+
+/**
+ * The longest caption this style gives on this frame: the chosen line length,
+ * or less where that would not fit on two lines. The margin under two full
+ * lines is for words that do not break evenly.
+ */
+export function captionChars(style: CaptionStyle, frame: Frame): number {
+  const twoLines = Math.floor(2 * charsPerLine(captionFontSize(style, frame), frame.width) * 0.8);
+  return Math.max(8, Math.min(style.maxChars, twoLines));
+}
 
 /** A main-track clip as it plays: where it starts on the video, and which part of its source. */
 export interface PlacedClip {
@@ -106,8 +128,8 @@ export function captionStroke(fontSize: number): TextStroke {
 /** The box behind a caption, when the style asks for one. */
 const CAPTION_BOX = "#000000a6";
 
-export function captionText(line: CaptionLine, style: CaptionStyle, frame: { width: number; height: number }, id: string): CaptionText {
-  const fontSize = Math.max(8, Math.round(style.size * frame.height));
+export function captionText(line: CaptionLine, style: CaptionStyle, frame: Frame, id: string): CaptionText {
+  const fontSize = captionFontSize(style, frame);
   const height = blockHeight(line.text, fontSize, frame.width, "sans", style.background);
   // Bottom captions keep their bottom edge put and grow upwards as they wrap.
   const wanted = style.position === "top" ? style.margin : 1 - style.margin - height / frame.height;

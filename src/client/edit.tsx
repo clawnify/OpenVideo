@@ -21,6 +21,7 @@ import { keepEdgeFades, splitClip } from "../shared/split";
 import { drawnStroke, maxStrokeWidth, outlineShadow } from "../shared/outline";
 import {
   DEFAULT_CAPTIONS,
+  captionChars,
   captionText,
   captionTimeline,
   type CaptionLine,
@@ -548,6 +549,8 @@ function mainDur(el: MainElement, srcDur: (src: string) => number | undefined): 
  * around its start (`before` / `after` the cut), shortened to fit as the
  * export does (shared/transition.ts).
  */
+type Segment = ReturnType<typeof mainSegments>[number];
+
 function mainSegments(edl: Edl, srcDur: (src: string) => number | undefined) {
   const els = edl.main.elements;
   const { placed } = layOut(
@@ -1339,7 +1342,7 @@ export function EditEditor({
     () => [...new Set(edl.main.elements.filter((e) => e.type === "video" && e.src.startsWith("asset:")).map((e) => e.src.slice(6)))],
     [edl.main.elements],
   );
-  const transcripts = useTranscripts(captionIds, edl.captions?.lang ?? "en", !!edl.captions?.enabled || tab === "captions");
+  const [transcripts, setTranscript] = useTranscripts(captionIds, edl.captions?.lang ?? "en", !!edl.captions?.enabled || tab === "captions");
   const captionLayer = useMemo(() => {
     const cfg = edl.captions;
     if (!cfg?.enabled) return null;
@@ -1348,8 +1351,8 @@ export function EditEditor({
       .map((sg) => ({ src: sg.el.src, start: sg.start, dur: sg.dur, trimStart: (sg.el as MainVideo).trimStart ?? 0 }));
     const cues = new Map<string, Cue[]>();
     for (const [src, t] of transcripts) if (t.status === "ready") cues.set(src, t.cues);
-    return { lines: captionTimeline(placed, cues, cfg.style.maxChars), style: cfg.style };
-  }, [edl.captions, segments, transcripts]);
+    return { lines: captionTimeline(placed, cues, captionChars(cfg.style, view.output)), style: cfg.style };
+  }, [edl.captions, view.output, segments, transcripts]);
 
   // Distinct video clips on the main track, in timeline order — the unit
   // Auto-cut operates on (the arrangement is the user's intent).
@@ -1688,6 +1691,9 @@ export function EditEditor({
           edl={view}
           update={update}
           transcripts={transcripts}
+          setTranscript={setTranscript}
+          segments={segments}
+          seek={seek}
           comments={comments}
           onShowComment={showComment}
         />
@@ -1900,6 +1906,9 @@ function LeftPanel({
   edl,
   update,
   transcripts,
+  setTranscript,
+  segments,
+  seek,
   comments,
   onShowComment,
 }: {
@@ -1912,6 +1921,9 @@ function LeftPanel({
   edl: Edl;
   update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
   transcripts: Map<string, TranscriptState>;
+  setTranscript: (src: string, vtt: string) => void;
+  segments: Segment[];
+  seek: (t: number) => void;
   assets: Asset[];
   setAssets: React.Dispatch<React.SetStateAction<Asset[]>>;
   onAdd: (a: Asset) => void;
@@ -1935,6 +1947,8 @@ function LeftPanel({
   const { ready: mediaReady, ingesting: mediaIngesting, failed: mediaFailed } = useMediaReady(library);
   const [deleting, setDeleting] = useState<Asset | null>(null);
   const [deleteErr, setDeleteErr] = useState("");
+  /** Why a transcript did not download, e.g. it is still being made. */
+  const [transcriptNote, setTranscriptNote] = useState("");
 
   const deleteAsset = async (a: Asset) => {
     setDeleteErr("");
@@ -1960,7 +1974,10 @@ function LeftPanel({
     /* The rail is surface-sunken; the canvas beside it stays white. The step
        between them is small, and the border carries the separation. */
     <div className={`${pane === "library" ? "flex" : "hidden"} lg:flex w-full lg:w-60 shrink-0 border-r border-border bg-surface-sunken min-h-0`}>
-      <div className="w-14 shrink-0 border-r border-border flex flex-col items-center py-3 gap-1">
+      {/* On a short screen the last tabs were below the fold with no way to
+          reach them: there the tabs are icons only, and the column scrolls if
+          even those do not fit. */}
+      <div className="w-14 shrink-0 border-r border-border flex flex-col items-center py-3 gap-1 overflow-y-auto [scrollbar-width:none]">
         {(
           [
             ["media", Film, "Media"],
@@ -1975,12 +1992,13 @@ function LeftPanel({
             key={key}
             onClick={() => setTab(key)}
             aria-pressed={tab === key}
-            className={`relative w-11 py-2 rounded-sm flex flex-col items-center gap-1 text-fine ${
+            title={label}
+            className={`relative w-11 py-2 shrink-0 rounded-sm flex flex-col items-center gap-1 text-fine ${
               tab === key ? "bg-surface text-foreground shadow-raised" : "text-muted hover:text-foreground"
             }`}
           >
             <Icon className="w-4 h-4" />
-            {label}
+            <span className="[@media(max-height:820px)]:sr-only">{label}</span>
             {key === "comments" && comments.open > 0 && (
               <span className="absolute top-1 right-1 min-w-4 h-4 px-1 rounded-full bg-primary text-on-primary text-[10px] leading-4 tabular-nums">
                 <span className="sr-only">, </span>
@@ -2003,6 +2021,9 @@ function LeftPanel({
             edl={edl}
             update={update}
             transcripts={transcripts}
+            setTranscript={setTranscript}
+            segments={segments}
+            seek={seek}
             clips={[...new Set(edl.main.elements.filter((e) => e.type === "video" && e.src.startsWith("asset:")).map((e) => e.src.slice(6)))]
               .map((id) => assets.find((x) => x.id === id))
               .filter((x): x is Asset => !!x)}
@@ -2056,6 +2077,7 @@ function LeftPanel({
               />
             )}
             {deleteErr && <div className="text-fine text-danger mb-2">{deleteErr}</div>}
+            {transcriptNote && <div className="text-fine text-muted mb-2" role="status">{transcriptNote}</div>}
             {deleting && (
               <ConfirmDialog
                 title={`Delete “${deleting.name}”?`}
@@ -2159,8 +2181,19 @@ function LeftPanel({
                       <Music className="w-5 h-5 text-track-audio" />
                     </div>
                   )}
-                  <div className="pl-2 pr-8 py-1.5 text-fine truncate text-muted group-hover:text-foreground">{a.name}</div>
+                  <div className={`pl-2 ${a.media_uid && !preparing ? "pr-14" : "pr-8"} py-1.5 text-fine truncate text-muted group-hover:text-foreground`}>{a.name}</div>
                 </button>
+                {a.media_uid && isVideoAsset(a) && !preparing && (
+                  <button
+                    onClick={() => void downloadTranscript(a).then(setTranscriptNote)}
+                    data-hover-only
+                    className="absolute right-7 bottom-0.5 grid place-items-center w-6 h-6 rounded-xs text-faint hover:text-foreground hover:bg-surface-sunken opacity-0 transition-opacity group-hover/tile:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+                    aria-label={`Download the transcript of ${a.name}`}
+                    title="Download transcript"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                  </button>
+                )}
                 {/* Shown on hover or keyboard focus. Screens without hover and
                     agents (data-hover-only) always see it. */}
                 <button
@@ -2657,7 +2690,11 @@ interface TranscriptState {
  * The media service makes one in minutes, so pending ones are asked again
  * until they arrive. Footage in app storage has none.
  */
-function useTranscripts(assetIds: string[], lang: string, active: boolean): Map<string, TranscriptState> {
+function useTranscripts(
+  assetIds: string[],
+  lang: string,
+  active: boolean,
+): [Map<string, TranscriptState>, (src: string, vtt: string) => void] {
   const [states, setStates] = useState<Map<string, TranscriptState>>(new Map());
   const key = `${lang}|${assetIds.join(",")}`;
 
@@ -2695,7 +2732,12 @@ function useTranscripts(assetIds: string[], lang: string, active: boolean): Map<
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, active]);
 
-  return states;
+  /** A transcript changed here (a corrected cue): show it without asking again. */
+  const set = useCallback(
+    (src: string, vtt: string) => setStates((cur) => new Map(cur).set(src, { status: "ready", cues: parseVtt(vtt) })),
+    [],
+  );
+  return [states, set];
 }
 
 const CAPTION_LANGUAGES: [string, string][] = [
@@ -2722,6 +2764,23 @@ const TRANSCRIPT_LABEL: Record<TranscriptState["status"], string> = {
   transcribing: "Transcribing…",
   error: "Could not load the transcript",
 };
+
+/**
+ * Save a video's transcript as a text file. Asking is also what starts a
+ * transcript that was never made, so the answer may be to come back for it.
+ * Returns what to tell the person when there is no file yet, else "".
+ */
+async function downloadTranscript(a: Asset, lang?: string): Promise<string> {
+  const r = await fetch(`/api/assets/${a.id}/transcript/text${lang ? `?lang=${lang}` : ""}`).catch(() => null);
+  if (!r?.ok) return (r && (await errJson(r)).error) || "The transcript could not be downloaded. Try again.";
+  const url = URL.createObjectURL(await r.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${a.name.replace(/\.[^.]+$/, "")} transcript.txt`;
+  link.click();
+  URL.revokeObjectURL(url);
+  return "";
+}
 
 /** One segmented choice, the pattern the panel uses for every setting. */
 function Choice<T extends string | number | boolean>({
@@ -2755,11 +2814,17 @@ function CaptionsPanel({
   edl,
   update,
   transcripts,
+  setTranscript,
+  segments,
+  seek,
   clips,
 }: {
   edl: Edl;
   update: (fn: (d: Edl) => void, coalesce?: boolean) => void;
   transcripts: Map<string, TranscriptState>;
+  setTranscript: (src: string, vtt: string) => void;
+  segments: Segment[];
+  seek: (t: number) => void;
   clips: Asset[];
 }) {
   const cfg = edl.captions ?? DEFAULT_CAPTIONS;
@@ -2815,7 +2880,7 @@ function CaptionsPanel({
         <Choice
           label="Size"
           value={cfg.style.size}
-          options={[[0.045, "Small"], [0.055, "Medium"], [0.07, "Large"]]}
+          options={[[0.035, "XS"], [0.045, "S"], [0.055, "M"], [0.07, "L"]]}
           onChange={(size) => setStyle({ size })}
         />
         <Choice
@@ -2855,12 +2920,93 @@ function CaptionsPanel({
                 <li key={a.id} className="text-fine">
                   <div className="truncate text-foreground">{a.name}</div>
                   <div className={state === "ready" ? "text-success" : "text-faint"}>{TRANSCRIPT_LABEL[state]}</div>
+                  {state === "ready" && (
+                    <a
+                      href={`/api/assets/${a.id}/transcript/text?lang=${cfg.lang}`}
+                      download
+                      className="inline-flex items-center gap-1 text-link underline decoration-border underline-offset-2"
+                    >
+                      <Download className="w-3 h-3" /> Download transcript
+                    </a>
+                  )}
                 </li>
               );
             })}
           </ul>
         )}
       </div>
+
+      <CaptionWords lang={cfg.lang} segments={segments} transcripts={transcripts} setTranscript={setTranscript} seek={seek} />
+    </div>
+  );
+}
+
+/**
+ * What the captions say, cue by cue, for the speech on the timeline. A cue is
+ * corrected in the clip's transcript, so the fix shows in every video cut
+ * from that clip.
+ */
+function CaptionWords({
+  lang,
+  segments,
+  transcripts,
+  setTranscript,
+  seek,
+}: {
+  lang: string;
+  segments: Segment[];
+  transcripts: Map<string, TranscriptState>;
+  setTranscript: (src: string, vtt: string) => void;
+  seek: (t: number) => void;
+}) {
+  const [error, setError] = useState("");
+  const rows = segments.flatMap((sg) => {
+    if (sg.el.type !== "video" || !sg.el.src.startsWith("asset:")) return [];
+    const src = sg.el.src;
+    const from = (sg.el as MainVideo).trimStart ?? 0;
+    const cues = transcripts.get(src)?.cues ?? [];
+    return cues
+      .filter((cue) => cue.end > from && cue.start < from + sg.dur)
+      .map((cue) => ({ src, cue, at: sg.start + Math.max(0, cue.start - from) }));
+  });
+  if (rows.length === 0) return null;
+
+  const save = async (src: string, cue: Cue, text: string) => {
+    const next = text.replace(/\s+/g, " ").trim();
+    if (!next || next === cue.text) return;
+    setError("");
+    try {
+      const r = await api.send<{ vtt: string }>("PUT", `/api/assets/${src.slice(6)}/transcript/cues`, { lang, start: cue.start, text: next });
+      setTranscript(src, r.vtt);
+    } catch (e) {
+      setError(`That correction was not saved: ${(e as Error).message}`);
+    }
+  };
+
+  return (
+    <div>
+      <Zone>Words</Zone>
+      <p className="text-fine text-faint mb-2">Fix a misheard word or a name's spelling. It changes in every video cut from that clip.</p>
+      {error && <p className="text-fine text-danger mb-2" role="alert">{error}</p>}
+      <ul className="space-y-2">
+        {rows.map(({ src, cue, at }, n) => (
+          <li key={`${src}-${cue.start}-${n}`}>
+            <button onClick={() => seek(at)} className="text-fine text-muted hover:text-foreground tabular-nums" aria-label={`Go to ${fmtTime(at)}`}>
+              {fmtTime(at)}
+            </button>
+            <textarea
+              // Remounts with the saved text, so a correction the server tidied shows as kept.
+              key={cue.text}
+              defaultValue={cue.text}
+              rows={2}
+              maxLength={500}
+              aria-label={`Caption at ${fmtTime(at)}`}
+              className="field w-full h-auto px-2 py-1.5 text-fine resize-none"
+              onBlur={(e) => void save(src, cue, e.target.value)}
+            />
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

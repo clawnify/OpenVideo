@@ -351,6 +351,8 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | GET  | `/api/assets/{id}/playback` | For long footage: `{ ready, hls, thumbnail, duration }` |
 | GET  | `/api/assets/{id}/frame?t=` | One frame of long footage, as an image |
 | GET  | `/api/assets/{id}/transcript?lang=en` | The clip's transcript for captions → `{ status, vtt? }` |
+| GET  | `/api/assets/{id}/transcript/text` | The transcript as a text file, one `[m:ss] words` line per cue; 409 with the reason while there is none |
+| PUT  | `/api/assets/{id}/transcript/cues` | `{ lang, start, text }` corrects what the cue starting at `start` seconds says → `{ status, vtt }` |
 | DELETE | `/api/assets/{id}` | Remove from the library; 409 `in_use`, naming the projects, while any project uses it |
 | PUT  | `/api/drive/folder` | `{ folderId }` limits browsing to one folder, `null` clears it |
 | GET  | `/api/projects` | List projects |
@@ -553,9 +555,10 @@ guests are stacked in the vertical version:
 **Captions** are a project setting, not overlays: an optional `captions` block,
 `{ "enabled": true, "lang": "en", "style": { "size": 0.055, "position":
 "bottom", "margin": 0.08, "background": true, "outline": false, "color":
-"#ffffff", "maxChars": 32 } }` (`size` and `margin` are shares of the frame's
-height; `outline` draws a black outline sized to the text, with or without
-the box). The words come
+"#ffffff", "maxChars": 32 } }` (`size` is a share of the frame's shorter
+side, 0.035 to 0.07 in the editor; `margin` is a share of its height;
+`outline` draws a black outline sized to the text, with or without the box;
+`maxChars` is cut down where it would not fit on two lines). The words come
 from each clip's transcript and the part of it the clip plays, so captions
 follow every trim, split and reorder; nothing is stored per caption. Only
 footage on the media service (uploaded in the editor, or imported from Drive) has a transcript: poll
@@ -563,6 +566,10 @@ footage on the media service (uploaded in the editor, or imported from Drive) ha
 silent clip, `unavailable` for footage in app storage). Languages: en, it, es,
 fr, de, nl, pt, pl, cs, ru, ja, ko. Use text overlays for titles and anything
 placed by hand; don't add captions on footage that already shows subtitles.
+To fix a misheard word or a name's spelling, correct the cue
+(`PUT /api/assets/{id}/transcript/cues`): the fix is kept in the clip's
+transcript, so every video cut from that clip shows it. Asking for the
+transcript in another language replaces it, corrections included.
 
 ### Worked examples (read → transform → save)
 

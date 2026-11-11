@@ -14,9 +14,14 @@ const USABLE_WIDTH = 0.88;
 
 export type FontFamily = keyof typeof GLYPH_WIDTH;
 
+/** Characters that fit on one line at this size. */
+export function charsPerLine(fontSize: number, frameWidth: number, family: FontFamily = "sans"): number {
+  return Math.max(8, Math.floor((frameWidth * USABLE_WIDTH) / (fontSize * GLYPH_WIDTH[family])));
+}
+
 /** Break text into lines that fit the frame. Explicit line breaks are kept. */
 export function wrapLines(text: string, fontSize: number, frameWidth: number, family: FontFamily = "sans"): string[] {
-  const perLine = Math.max(8, Math.floor((frameWidth * USABLE_WIDTH) / (fontSize * GLYPH_WIDTH[family])));
+  const perLine = charsPerLine(fontSize, frameWidth, family);
   const lines: string[] = [];
   for (const paragraph of text.split("\n")) {
     const words = paragraph.split(/\s+/).filter(Boolean);
@@ -24,18 +29,32 @@ export function wrapLines(text: string, fontSize: number, frameWidth: number, fa
     // each line to the edge left a two-word orphan at the bottom.
     const count = Math.max(1, Math.ceil(paragraph.trim().length / perLine));
     const target = Math.min(perLine, Math.ceil(paragraph.trim().length / count));
-    let line = "";
-    for (const word of words) {
-      if (!line) line = word;
-      else if (line.length + 1 + word.length <= target || (line.length < target * 0.6 && line.length + 1 + word.length <= perLine)) {
-        line += ` ${word}`;
-      } else {
-        lines.push(line);
-        line = word;
-      }
+    // Words that do not split evenly could cost the even break a line more
+    // than the width needs: then the lines are let run a little longer, up to
+    // the edge, until the text is back to that many lines.
+    let broken: string[] = [];
+    for (let reach = target; reach <= perLine; reach++) {
+      broken = fill(words, (line, word) => line.length + 1 + word.length <= reach || (line.length < reach * 0.6 && line.length + 1 + word.length <= perLine));
+      if (broken.length <= count) break;
     }
-    lines.push(line);
+    lines.push(...broken);
   }
+  return lines;
+}
+
+/** Words into lines, each word joining the current line while `fits` says so. */
+function fill(words: string[], fits: (line: string, word: string) => boolean): string[] {
+  const lines: string[] = [];
+  let line = "";
+  for (const word of words) {
+    if (!line) line = word;
+    else if (fits(line, word)) line += ` ${word}`;
+    else {
+      lines.push(line);
+      line = word;
+    }
+  }
+  lines.push(line);
   return lines;
 }
 
