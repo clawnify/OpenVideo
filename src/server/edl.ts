@@ -416,11 +416,11 @@ export function substituteAssetSrcs(edl: Edl, resolve: (assetId: string) => stri
   return out;
 }
 
-/** A fresh project's document: empty 720p timeline. */
+/** A fresh project's document: empty 1080p timeline, as the clips made from it are. */
 export function starterEdl(): Edl {
   return {
     version: 1,
-    output: { width: 1280, height: 720, fps: 30, background: "#000000" },
+    output: { width: 1920, height: 1080, fps: 30, background: "#000000" },
     main: { elements: [] },
     overlays: [],
     audio: [],
