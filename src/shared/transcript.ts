@@ -40,6 +40,31 @@ export function parseVtt(vtt: string): Cue[] {
   return cues.sort((x, y) => x.start - y.start);
 }
 
+/** Seconds → "00:01:02.450", the form WebVTT cue times take. */
+function vttTime(t: number): string {
+  const ms = Math.round(t * 1000);
+  const p = (n: number, w = 2) => String(n).padStart(w, "0");
+  return `${p(Math.floor(ms / 3_600_000))}:${p(Math.floor(ms / 60_000) % 60)}:${p(Math.floor(ms / 1000) % 60)}.${p(ms % 1000, 3)}`;
+}
+
+/** Cues back to WebVTT, the form a transcript is kept in. */
+export function toVtt(cues: Cue[]): string {
+  return ["WEBVTT", ...cues.map((c) => `${vttTime(c.start)} --> ${vttTime(c.end)}\n${c.text}`)].join("\n\n") + "\n";
+}
+
+/** A transcript to read or hand to someone: one line per cue, each with the time it is said. */
+export function transcriptText(cues: Cue[]): string {
+  return cues
+    .map((c) => {
+      const s = Math.floor(c.start);
+      const h = Math.floor(s / 3600);
+      const mm = Math.floor(s / 60) % 60;
+      const ss = String(s % 60).padStart(2, "0");
+      return `[${h ? `${h}:${String(mm).padStart(2, "0")}` : mm}:${ss}] ${c.text}`;
+    })
+    .join("\n");
+}
+
 export interface Window {
   start: number;
   end: number;
