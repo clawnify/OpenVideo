@@ -22,6 +22,10 @@ import {
   mediaState,
   mediaTranscript,
   openMediaUpload,
+  openOriginal,
+  originalPartLinks,
+  finishOriginal,
+  abandonOriginal,
   prepareMedia,
 } from "./media";
 import {
@@ -240,6 +244,67 @@ app.post("/api/assets/uploads", async (c) => {
     duration,
   ]);
   return c.json({ uid: opened.id, upload_url: opened.uploadUrl }, 201);
+});
+
+// A video above 1080p uploads in parts to the media service's own storage,
+// which keeps the file as sent (src/server/media.ts). 409 `originals_full`
+// tells the browser to upload it the usual way instead.
+const ORIGINAL_ID = /^(eu|us)-[0-9a-f-]{36}$/;
+
+app.post("/api/assets/originals", async (c) => {
+  type Body = { name?: string; size?: number; width?: number; height?: number };
+  const b = await c.req.json<Body>().catch(() => ({}) as Body);
+  if (!b.name || !b.size || !Number.isInteger(b.size) || b.size <= 0 || !b.width || !b.height) {
+    return c.json({ error: "invalid_request", detail: "name, size, width and height are required" }, 400);
+  }
+  const opened = await openOriginal(mediaCfg(c.env), { size: b.size, width: b.width, height: b.height, name: b.name.slice(0, 200) });
+  if ("failure" in opened) {
+    const e = opened.failure.error;
+    return c.json(opened.failure, e === "media_unavailable" ? 503 : e === "originals_full" ? 409 : 422);
+  }
+  return c.json(opened.upload, 201);
+});
+
+app.post("/api/assets/originals/:oid/parts", async (c) => {
+  const oid = c.req.param("oid");
+  type Body = { upload_id?: string; part_numbers?: number[] };
+  const b = await c.req.json<Body>().catch(() => ({}) as Body);
+  if (!ORIGINAL_ID.test(oid) || !b.upload_id || !Array.isArray(b.part_numbers)) {
+    return c.json({ error: "invalid_request", detail: "upload_id and part_numbers are required" }, 400);
+  }
+  const links = await originalPartLinks(mediaCfg(c.env), oid, b.upload_id, b.part_numbers);
+  return "failure" in links ? c.json(links.failure, 422) : c.json(links);
+});
+
+// Every part is in: the service joins them and the video joins the library.
+app.post("/api/assets/originals/:oid/complete", async (c) => {
+  const oid = c.req.param("oid");
+  type Body = { upload_id?: string; parts?: { part_number: number; etag: string }[]; name?: string; type?: string; size?: number; duration?: number };
+  const b = await c.req.json<Body>().catch(() => ({}) as Body);
+  if (!ORIGINAL_ID.test(oid) || !b.upload_id || !Array.isArray(b.parts) || !b.name || !b.size) {
+    return c.json({ error: "invalid_request", detail: "upload_id, parts, name and size are required" }, 400);
+  }
+  const name = b.name.slice(0, 200);
+  const done = await finishOriginal(mediaCfg(c.env), oid, b.upload_id, b.parts, name);
+  if ("failure" in done) return c.json(done.failure, 422);
+  const duration = typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0 ? b.duration : null;
+  await run("INSERT OR IGNORE INTO media_uploads (uid, name, content_type, size, duration) VALUES (?, ?, ?, ?, ?)", [
+    done.media.id,
+    name,
+    b.type?.startsWith("video/") ? b.type : "video/mp4",
+    b.size,
+    duration,
+  ]);
+  const asset = await promoteUpload(done.media.id);
+  return asset ? c.json(asset, 201) : c.json({ error: "not_found", detail: "the video did not join the library" }, 500);
+});
+
+app.delete("/api/assets/originals/:oid", async (c) => {
+  const oid = c.req.param("oid");
+  const uploadId = c.req.query("upload_id");
+  if (!ORIGINAL_ID.test(oid) || !uploadId) return c.json({ error: "invalid_request", detail: "upload_id is required" }, 400);
+  await abandonOriginal(mediaCfg(c.env), oid, uploadId).catch(() => {});
+  return c.json({ ok: true });
 });
 
 // The bytes are in: the upload joins the library.

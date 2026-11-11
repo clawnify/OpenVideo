@@ -338,6 +338,10 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | POST | `/api/assets` | Upload one file into app storage (multipart, field `file`) → the asset |
 | POST | `/api/assets/uploads` | `{ name, size, type?, duration? }` opens a resumable upload of a video on the media service → `{ uid, upload_url }` (503 `media_unavailable` in local dev) |
 | POST | `/api/assets/media` | `{ uid }` adds a finished upload to the library → the asset |
+| POST | `/api/assets/originals` | `{ name, size, width, height }` for a video above 1080p: opens an upload in parts that keeps the file as sent → `{ id, upload_id, part_size, parts }` (409 `originals_full`: use `/api/assets/uploads`) |
+| POST | `/api/assets/originals/{id}/parts` | `{ upload_id, part_numbers }` → `{ urls }`, a link to PUT each part to; keep the `ETag` each answers |
+| POST | `/api/assets/originals/{id}/complete` | `{ upload_id, parts: [{ part_number, etag }], name, size, type?, duration? }` joins the parts → the asset |
+| DELETE | `/api/assets/originals/{id}?upload_id=` | Gives up an unfinished upload |
 | DELETE | `/api/assets/uploads/{uid}` | Cancels or discards an upload that has not joined the library |
 | POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
 | GET  | `/api/drive` | Whether Google Drive is connected: `{ connected }` |

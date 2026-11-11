@@ -155,6 +155,59 @@ export async function openMediaUpload(
   return "failure" in res ? res : { id: res.data.id, uploadUrl: res.data.upload_url, expiresAt: res.data.expires_at ?? null };
 }
 
+// ── Originals: footage above 1080p ──────────────────────────────────────────
+// Every copy the service makes of a video stops at 1080p, so a larger source
+// is sent in parts to the service's own storage, which keeps it as sent for
+// exports above 1080p, and the service makes its playable copy from there.
+
+export interface OriginalUpload {
+  id: string;
+  upload_id: string;
+  part_size: number;
+  parts: number;
+}
+
+export async function openOriginal(
+  cfg: MediaConfig,
+  file: { size: number; width: number; height: number; name: string },
+): Promise<{ upload: OriginalUpload } | { failure: MediaFailure }> {
+  const res = await call<OriginalUpload>(cfg, "/originals", { method: "POST", body: JSON.stringify(file) });
+  return "failure" in res ? res : { upload: res.data };
+}
+
+/** A link to PUT each of these parts to. */
+export async function originalPartLinks(
+  cfg: MediaConfig,
+  id: string,
+  uploadId: string,
+  partNumbers: number[],
+): Promise<{ urls: Record<string, string> } | { failure: MediaFailure }> {
+  const res = await call<{ urls: Record<string, string> }>(cfg, `/originals/${id}/parts`, {
+    method: "POST",
+    body: JSON.stringify({ upload_id: uploadId, part_numbers: partNumbers }),
+  });
+  return "failure" in res ? res : { urls: res.data.urls };
+}
+
+/** Join the parts. The answer is the video the service now makes from the original. */
+export async function finishOriginal(
+  cfg: MediaConfig,
+  id: string,
+  uploadId: string,
+  parts: { part_number: number; etag: string }[],
+  name: string,
+): Promise<{ media: MediaState } | { failure: MediaFailure }> {
+  const res = await call<MediaState>(cfg, `/originals/${id}/complete`, {
+    method: "POST",
+    body: JSON.stringify({ upload_id: uploadId, parts, name }),
+  });
+  return "failure" in res ? res : { media: res.data };
+}
+
+export async function abandonOriginal(cfg: MediaConfig, id: string, uploadId: string): Promise<void> {
+  await call(cfg, `/originals/${id}?upload_id=${encodeURIComponent(uploadId)}`, { method: "DELETE" });
+}
+
 export async function mediaState(cfg: MediaConfig, uid: string): Promise<{ media: MediaState } | { failure: MediaFailure }> {
   const res = await call<MediaState>(cfg, `/${uid}`);
   return "failure" in res ? res : { media: res.data };
