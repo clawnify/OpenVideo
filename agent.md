@@ -357,7 +357,7 @@ in line, and asks Drive again now for the clips waiting on it. `DELETE /api/proj
 | PUT  | `/api/drive/folder` | `{ folderId }` limits browsing to one folder, `null` clears it |
 | GET  | `/api/projects` | List projects |
 | GET  | `/api/projects/{id}` | Get one (includes the `edl` document and `brief`) |
-| POST | `/api/projects` | Create `{ name, brief?, edl? }` (empty 720p timeline if omitted), or `{ folder, name?, brief?, language? }` from a Drive folder |
+| POST | `/api/projects` | Create `{ name, brief?, edl? }` (empty 1080p timeline if omitted), or `{ folder, name?, brief?, language? }` from a Drive folder |
 | GET  | `/api/projects/{id}/footage` | The project's footage from Drive and each clip's log; moves the import and logging on → `{ counts, items, next_offset, imports_paused, logging_paused }` |
 | GET  | `/api/projects/{id}/footage/{clipId}` | One clip with its full log |
 | POST | `/api/projects/{id}/footage/folders` | `{ url, language? }` adds a Drive folder shared with the link |
@@ -508,9 +508,9 @@ export takes a while: at High quality about as long as the video itself, half
 that at Standard. Keep reading `GET /api/exports/{id}` until it settles.
 
 **Format** (the video's shape) is `output.width` x `output.height`: even
-numbers, at most 3840x2160. At the default resolution the presets are 1280x720
-(16:9), 720x1280 (9:16, Reels, TikTok, Shorts), 1280x1280 (1:1), 1024x1280
-(4:5, Instagram feed) and 1280x960 (4:3). To reshape a finished edit, ask for
+numbers, at most 3840x2160. At the default resolution the presets are 1920x1080
+(16:9), 1080x1920 (9:16, Reels, TikTok, Shorts), 1920x1920 (1:1), 1536x1920
+(4:5, Instagram feed) and 1920x1440 (4:3). To reshape a finished edit, ask for
 it through `/instruct` ("make it vertical"): it applies the editor's own rule,
 which keeps the long side, scales `fontSize` (and a text `stroke`) by the change in the short side
 and keeps each logo's size on screen and the side of the frame it sits on.
