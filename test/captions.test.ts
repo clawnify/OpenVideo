@@ -57,6 +57,12 @@ describe("captionText", () => {
     expect(captionText(line, { ...DEFAULT_CAPTION_STYLE, position: "top" }, frame, "c1").y).toBeCloseTo(0.08, 3);
   });
 
+  it("sits lower with a smaller distance from the edge", () => {
+    const at = (margin: number) => captionText({ ...line, text: "we try" }, { ...DEFAULT_CAPTION_STYLE, margin }, { width: 1080, height: 1920 }, "c1").y;
+    expect(at(0.03)).toBeGreaterThan(at(0.08));
+    expect(at(0.08)).toBeGreaterThan(at(0.2));
+  });
+
   it("sizes by the frame's shorter side, so a vertical video's captions are no larger than a wide one's", () => {
     const vertical = captionText(line, DEFAULT_CAPTION_STYLE, { width: 720, height: 1280 }, "c1");
     expect(vertical.fontSize).toBe(Math.round(0.055 * 720));

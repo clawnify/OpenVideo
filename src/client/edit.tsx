@@ -2877,12 +2877,25 @@ function CaptionsPanel({
           options={[["bottom", "Bottom"], ["top", "Top"]]}
           onChange={(position) => setStyle({ position })}
         />
-        <Choice
-          label="Size"
-          value={cfg.style.size}
-          options={[[0.035, "XS"], [0.045, "S"], [0.055, "M"], [0.07, "L"]]}
-          onChange={(size) => setStyle({ size })}
-        />
+        {/* 0.08 is the default and 0.2 what clips made for social use, clear of the apps' own buttons. */}
+        <div className="text-fine text-muted">
+          <div className="mb-1">Distance from edge</div>
+          <Choice
+            label="Distance from edge"
+            value={cfg.style.margin}
+            options={[[0.03, "XS"], [0.08, "S"], [0.14, "M"], [0.2, "L"]]}
+            onChange={(margin) => setStyle({ margin })}
+          />
+        </div>
+        <div className="text-fine text-muted">
+          <div className="mb-1">Size</div>
+          <Choice
+            label="Size"
+            value={cfg.style.size}
+            options={[[0.035, "XS"], [0.045, "S"], [0.055, "M"], [0.07, "L"]]}
+            onChange={(size) => setStyle({ size })}
+          />
+        </div>
         <Choice
           label="Line length"
           value={cfg.style.maxChars}
