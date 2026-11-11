@@ -181,6 +181,33 @@ globalThis.fetch = async (input, init = {}) => {
       world.uploads.set(id, { size: body.size, at: 0, name: body.name, patches: [] });
       return json(201, { id, upload_url: `https://upload.test/tus/${id}?tusv2=true`, expires_at: new Date(Date.now() + 6 * 3600_000).toISOString() });
     }
+    // A video above 1080p: parts go to the service's own storage, then it
+    // makes the playable copy. Refused at or below 1080p, and when full.
+    if (u.pathname === "/media/originals" && method === "POST") {
+      const body = JSON.parse(init.body);
+      if (Math.min(body.width, body.height) <= 1080) return json(422, { error: "invalid_request", detail: "an original is kept only for a video above 1080p" });
+      if (world.originalsFull) return json(409, { error: "originals_full", detail: "this workspace keeps 200 of 200 GB of originals" });
+      const id = `eu-00000000-0000-4000-8000-${(++uidN).toString(16).padStart(12, "0")}`;
+      (world.originals ??= new Map()).set(id, { name: body.name, size: body.size, asked: [] });
+      return json(201, { id, upload_id: `up-${id}`, part_size: 64 * 2 ** 20, parts: Math.ceil(body.size / (64 * 2 ** 20)) });
+    }
+    const orig = /^\/media\/originals\/((?:eu|us)-[0-9a-f-]{36})(?:\/(parts|complete))?$/.exec(u.pathname);
+    if (orig) {
+      const o = world.originals?.get(orig[1]);
+      if (!o) return json(404, { error: "not_found" });
+      if (method === "DELETE") { o.abandoned = u.searchParams.get("upload_id"); return new Response(null, { status: 204 }); }
+      const body = JSON.parse(init.body);
+      if (body.upload_id !== `up-${orig[1]}`) return json(422, { error: "upload_incomplete", detail: "no such upload" });
+      if (orig[2] === "parts") {
+        o.asked.push(...body.part_numbers);
+        return json(200, { urls: Object.fromEntries(body.part_numbers.map((n) => [n, `https://r2.test/${orig[1]}?partNumber=${n}`])) });
+      }
+      const n = Math.ceil(o.size / (64 * 2 ** 20));
+      if (body.parts.length !== n) return json(422, { error: "upload_incomplete", detail: "parts are missing" });
+      const id = (++uidN).toString(16).padStart(32, "0");
+      world.media.set(id, { polls: 0, name: body.name, original: orig[1] });
+      return json(201, { id, state: "downloading", ready: false, original: true });
+    }
     if (u.pathname === "/media/import") {
       if (world.importRefusal) return json(409, world.importRefusal);
       const id = (++uidN).toString(16).padStart(32, "0");
@@ -1798,4 +1825,36 @@ console.log("ALL OK");
   assert.equal(world.beforeMediaDelete,null);
   assert.equal((await call('POST','/api/highlights/projects',{ids,request_id:crypto.randomUUID()})).status,409);
   console.log('15 ok: shared catalog migration, range deduplication, two-format projects started on request, retry identity and source lifetime');
+}
+
+{
+  // A video above 1080p uploads as its original: parts, then it joins the library.
+  const GB = 2 ** 30;
+  let r = await call("POST", "/api/assets/originals", { name: "A7_4K.MP4", size: 3 * GB, width: 1920, height: 1080 });
+  assert.equal(r.status, 422, "1080p footage has no original");
+  world.originalsFull = true;
+  r = await call("POST", "/api/assets/originals", { name: "A7_4K.MP4", size: 3 * GB, width: 3840, height: 2160 });
+  assert.equal(r.status, 409, "no room: the browser uploads it the usual way");
+  world.originalsFull = false;
+  r = await call("POST", "/api/assets/originals", { name: "A7_4K.MP4", size: 3 * GB, width: 3840, height: 2160 });
+  assert.equal(r.status, 201);
+  const { id, upload_id, parts } = r.data;
+  assert.equal(parts, 48);
+  r = await call("POST", `/api/assets/originals/${id}/parts`, { upload_id, part_numbers: [1, 2] });
+  assert.deepEqual(Object.keys(r.data.urls), ["1", "2"]);
+  assert.equal((await call("POST", "/api/assets/originals/..%2Fx/parts", { upload_id, part_numbers: [1] })).status, 400);
+  const done = Array.from({ length: parts }, (_, i) => ({ part_number: i + 1, etag: `e${i + 1}` }));
+  r = await call("POST", `/api/assets/originals/${id}/complete`, { upload_id, parts: done.slice(1), name: "A7_4K.MP4", size: 3 * GB });
+  assert.equal(r.status, 422, "a missing part is the service's refusal, passed on");
+  r = await call("POST", `/api/assets/originals/${id}/complete`, { upload_id, parts: done, name: "A7_4K.MP4", type: "video/quicktime", size: 3 * GB, duration: 61.5 });
+  assert.equal(r.status, 201);
+  assert.equal(r.data.name, "A7_4K.MP4");
+  assert.equal(world.media.get(r.data.media_uid).original, id, "the library's video is the one made from the original");
+  assert.deepEqual([r.data.content_type, r.data.size, r.data.duration], ["video/quicktime", 3 * GB, 61.5]);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM media_uploads WHERE uid = ?").get(r.data.media_uid).n, 0, "nothing left waiting");
+  // Giving up an upload tells the service, so its parts are not kept.
+  r = await call("POST", "/api/assets/originals", { name: "B_4K.MP4", size: GB, width: 2160, height: 3840 });
+  await call("DELETE", `/api/assets/originals/${r.data.id}?upload_id=${r.data.upload_id}`);
+  assert.equal(world.originals.get(r.data.id).abandoned, r.data.upload_id);
+  console.log("17 ok: a video above 1080p uploads as its original and joins the library");
 }
