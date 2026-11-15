@@ -3562,7 +3562,13 @@ function Player({
       // A paused or starved element is not a clock: let the wall clock carry
       // on rather than freezing the playhead while the buffer fills.
       if (!v || v.paused || v.readyState < 2) return null;
-      return seg.start + (v.currentTime - (seg.el.trimStart ?? 0));
+      // Never before the clip's own start. The clip coming in can sit a little
+      // short of its trim at the cut (a transition's incoming side is only
+      // nudged into step, and a browser may report a frame early for a trim
+      // that falls between frames). Read as is, that put the playhead back on
+      // the previous clip, which played on past the cut and handed back, and
+      // the preview bounced between the two clips at that one cut.
+      return Math.max(seg.start, seg.start + (v.currentTime - (seg.el.trimStart ?? 0)));
     };
     return () => {
       mediaClock.current = null;
