@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { ArrowLeft, Film } from "lucide-react";
-import { AppNav, embedded, reportLocation, useHostNavigate } from "@clawnify/app/client";
+import { AppNav, reportLocation, useHostNavigate } from "@clawnify/app/client";
 import { EditRoute, ProjectsHome, type EditProject } from "./edit";
 import { SharedHighlightsRoute } from "./library-highlights";
 import { HighlightsRoute } from "./highlights";
@@ -26,9 +26,9 @@ function useRouter() {
 /**
  * Inside the Clawnify dashboard the projects are listed in the dashboard
  * sidebar, and the open screen is kept in the host URL so a reload returns to
- * it.
+ * it. Anywhere else the app's own header (`standalone`) is drawn instead.
  */
-function HostNav({ active, path, navigate }: { active: string; path: string; navigate: (to: string) => void }) {
+function HostNav({ active, path, navigate, standalone }: { active: string; path: string; navigate: (to: string) => void; standalone: () => ReactNode }) {
   const [projects, setProjects] = useState<(Omit<EditProject, "edl"> & { video_ids?: string[] })[]>([]);
   useEffect(() => {
     fetch("/api/projects")
@@ -53,6 +53,7 @@ function HostNav({ active, path, navigate }: { active: string; path: string; nav
         },
       ]}
       onNavigate={(item) => item.href && navigate(item.href)}
+      standalone={standalone}
     />
   );
 }
@@ -68,11 +69,10 @@ export function App() {
 
   return (
     <div className="h-dvh flex flex-col text-foreground">
-      {embedded && <HostNav active={editId ? `edits/${editId}` : id} path={path} navigate={navigate} />}
       {/* Brand row: the app icon is the identity object, and the accent hue
           lives here (plus count badges and the focus ring) and nowhere else.
           The dashboard draws its own, so it is standalone-only. */}
-      {!embedded && (
+      <HostNav active={editId ? `edits/${editId}` : id} path={path} navigate={navigate} standalone={() => (
       <header className="flex items-center gap-2 px-5 h-14 border-b border-border bg-surface shrink-0">
         {editId && (
           <button onClick={() => navigate("/")} className={`${btnGhost} -ml-2`}>
@@ -85,7 +85,7 @@ export function App() {
         <span className="text-heading-3">OpenVideo</span>
         <button className={`${btnGhost} ml-auto`} onClick={() => navigate("/highlights")}>Highlights</button>
       </header>
-      )}
+      )} />
 
       {id === "highlights" ? <SharedHighlightsRoute navigate={navigate} /> : editId && highlights ? (
         <HighlightsRoute id={editId} navigate={navigate} />
