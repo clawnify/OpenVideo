@@ -18,6 +18,7 @@ import { SharedHighlights, highlightAsset } from "./library-highlights";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { blockHeight, fitTop, lineStep, wrapLines } from "../shared/textLayout";
 import { keepEdgeFades, splitClip } from "../shared/split";
+import { edgeScroll } from "./edge-scroll";
 import { drawnStroke, maxStrokeWidth, outlineShadow } from "../shared/outline";
 import {
   DEFAULT_CAPTIONS,
@@ -621,45 +622,87 @@ function useSourceDurations(edl: Edl, assets: Asset[]) {
   return { srcDur, resolveAsset: resolve };
 }
 
+/** Width of one filmstrip frame. Fixed at every clip length and during a trim: a trim shows more or fewer frames, never wider ones. */
+const STRIP_TILE = 64;
+/** Frames one strip draws at most; past that the rest of a very long clip stays dark. Raise it, or draw only the frames in view, if long masters at high zoom need them. */
+const STRIP_MAX = 400;
+
+/**
+ * The frames a clip's filmstrip shows. They sit on a grid in the source's own
+ * time, one frame per STRIP_TILE px at this zoom, so trimming either edge
+ * uncovers or hides frames without moving or resampling the ones that stay.
+ * `left` is from the clip's left edge; `t` is the source second to show,
+ * never past `end` (the source's length, when known).
+ */
+function stripTiles(from: number, to: number, zoom: number, end = Infinity) {
+  const step = STRIP_TILE / zoom;
+  const first = Math.floor(from / step + 1e-9);
+  const last = Math.min(first + STRIP_MAX - 1, Math.max(first, Math.ceil(to / step - 1e-9) - 1));
+  const out: { k: number; left: number; t: number }[] = [];
+  for (let k = first; k <= last; k++) out.push({ k, left: (k * step - from) * zoom, t: Math.min((k + 0.5) * step, end) });
+  return out;
+}
+
+/** Decoded frames of browser-decoded footage, by url and tenth of a second, so a trim redraws without decoding again. */
+const stripFrames = new Map<string, ImageBitmap>();
+const stripKey = (url: string, t: number) => `${url}#${t.toFixed(1)}`;
+
 /** Draw a strip of frames from a video source into a canvas. */
-function FilmStrip({ url, from, to, width, height }: { url: string; from: number; to: number; width: number; height: number }) {
+function FilmStrip({ url, from, to, zoom, end, width, height }: {
+  url: string; from: number; to: number; zoom: number; end?: number; width: number; height: number;
+}) {
   const ref = useRef<HTMLCanvasElement>(null);
+  // Bumped as frames decode, to draw them.
+  const [decoded, setDecoded] = useState(0);
+  const tiles = useMemo(() => stripTiles(from, to, zoom, end), [from, to, zoom, end]);
+
   useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas || width < 24) return;
+    const ctx = ref.current?.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, width, height);
+    for (const tile of tiles) {
+      const frame = stripFrames.get(stripKey(url, tile.t));
+      if (!frame) continue;
+      // Fill the cell without distorting the frame: scale to cover, then take the middle of what does not fit.
+      const scale = Math.max(STRIP_TILE / frame.width, height / frame.height);
+      const sw = Math.min(frame.width, STRIP_TILE / scale);
+      const sh = Math.min(frame.height, height / scale);
+      ctx.drawImage(frame, (frame.width - sw) / 2, (frame.height - sh) / 2, sw, sh, tile.left, 0, STRIP_TILE, height);
+    }
+  }, [url, tiles, width, height, decoded]);
+
+  // Decode only what is missing, and only once the clip stops changing, so a
+  // trim in progress does not restart the decoder on every pointer move.
+  useEffect(() => {
+    const missing = tiles.filter((tile) => !stripFrames.has(stripKey(url, tile.t)));
+    if (!missing.length || width < 24) return;
     let dead = false;
     const v = document.createElement("video");
-    v.muted = true;
-    v.preload = "auto";
-    v.src = url;
-    const n = Math.max(1, Math.min(10, Math.floor(width / 56)));
-    const ctx = canvas.getContext("2d")!;
-    v.onloadedmetadata = async () => {
-      const span = Math.max(0.01, to - from);
-      const fw = width / n;
-      for (let i = 0; i < n && !dead; i++) {
-        v.currentTime = Math.min(v.duration - 0.05, from + ((i + 0.5) * span) / n);
-        await new Promise<void>((res) => {
-          const done = () => (v.removeEventListener("seeked", done), res());
-          v.addEventListener("seeked", done);
-        });
-        if (dead) return;
-        // Fill the cell without distorting the frame: scale to cover, then
-        // take the middle of what does not fit. A 16:9 clip in a narrow cell
-        // was being squeezed sideways.
-        const vw = v.videoWidth || fw;
-        const vh = v.videoHeight || height;
-        const scale = Math.max(fw / vw, height / vh);
-        const sw = Math.min(vw, fw / scale);
-        const sh = Math.min(vh, height / scale);
-        ctx.drawImage(v, (vw - sw) / 2, (vh - sh) / 2, sw, sh, i * fw, 0, fw, height);
-      }
-    };
+    const timer = setTimeout(() => {
+      v.muted = true;
+      v.preload = "auto";
+      v.src = url;
+      v.onloadedmetadata = async () => {
+        for (const tile of missing) {
+          if (dead) return;
+          v.currentTime = Math.min(v.duration - 0.05, tile.t);
+          await new Promise<void>((res) => {
+            const done = () => (v.removeEventListener("seeked", done), res());
+            v.addEventListener("seeked", done);
+          });
+          if (dead) return;
+          stripFrames.set(stripKey(url, tile.t), await createImageBitmap(v));
+          setDecoded((n) => n + 1);
+        }
+      };
+    }, 150);
     return () => {
       dead = true;
+      clearTimeout(timer);
       v.src = "";
     };
-  }, [url, from, to, width, height]);
+  }, [url, tiles, width]);
+
   return <canvas ref={ref} width={Math.max(1, width)} height={height} className="w-full h-full rounded-[3px]" />;
 }
 
@@ -668,19 +711,17 @@ function FilmStrip({ url, from, to, width, height }: { url: string; from: number
  * Decoding a master in the browser to draw ten thumbnails competed with
  * playback for the same bytes, which is part of what made it stutter.
  */
-function FrameStrip({ asset, from, to, width }: { asset: Asset; from: number; to: number; width: number }) {
-  const n = Math.max(1, Math.min(10, Math.floor(width / 56)));
-  const span = Math.max(0.01, to - from);
+function FrameStrip({ asset, from, to, zoom, end }: { asset: Asset; from: number; to: number; zoom: number; end?: number }) {
   return (
-    <div className="flex w-full h-full">
-      {Array.from({ length: n }, (_, i) => (
+    <div className="relative w-full h-full">
+      {stripTiles(from, to, zoom, end).map((tile) => (
         <img
-          key={i}
-          src={frameUrl(asset, from + ((i + 0.5) * span) / n)}
+          key={tile.k}
+          src={frameUrl(asset, tile.t)}
           alt=""
           loading="lazy"
-          className="h-full object-cover"
-          style={{ width: `${100 / n}%` }}
+          className="absolute top-0 h-full object-cover"
+          style={{ left: tile.left, width: STRIP_TILE }}
         />
       ))}
     </div>
@@ -6390,6 +6431,8 @@ const MAIN_H = 40;
 const CLIP_GAP = 4;
 const ROW_H = 30;
 const HEAD_W = 96;
+/** After a trim, the playhead waits this many seconds before the cut, so play runs straight into it. */
+const LISTEN_BEFORE_CUT = 5;
 
 function TimelinePanel({
   pane,
@@ -6462,8 +6505,13 @@ function TimelinePanel({
   const scrub = (e: React.PointerEvent) => {
     setPlaying(false);
     seek(timeAt(e.clientX));
-    const move = (ev: PointerEvent) => seek(timeAt(ev.clientX));
+    const auto = edgeScroll(scrollRef.current!, HEAD_W, (x) => seek(timeAt(x)));
+    const move = (ev: PointerEvent) => {
+      seek(timeAt(ev.clientX));
+      auto.move(ev.clientX);
+    };
     const up = () => {
+      auto.stop();
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
     };
@@ -6477,11 +6525,17 @@ function TimelinePanel({
     e.preventDefault();
     setSel({ area: "main", i });
     const startX = e.clientX;
+    const scroller = scrollRef.current!;
+    const scroll0 = scroller.scrollLeft;
     const el = edl.main.elements[i];
     const orig = structuredClone(el);
     const src = el.type === "video" ? srcDur(el.src) : undefined;
-    const move = (ev: PointerEvent) => {
-      const ds = (ev.clientX - startX) / zoom;
+    // Where the trimmed edge now sits on the timeline: the clip's end for the
+    // right handle, its start for the left (where the new in-point now plays).
+    let cut: number | null = null;
+    // Seconds dragged: the pointer's travel plus however far the timeline scrolled under it.
+    const apply = (clientX: number) => {
+      const ds = (clientX - startX + scroller.scrollLeft - scroll0) / zoom;
       update((d) => {
         const t = d.main.elements[i];
         if (t.type === "image") {
@@ -6509,9 +6563,22 @@ function TimelinePanel({
             (t as MainVideo).trimEnd = Math.round(ne * 100) / 100;
           }
         }
+        const seg = mainSegments(d, srcDur)[i];
+        if (seg) cut = side === "r" ? seg.start + seg.dur : seg.start;
       }, true);
     };
+    const auto = edgeScroll(scroller, HEAD_W, apply);
+    const move = (ev: PointerEvent) => {
+      apply(ev.clientX);
+      auto.move(ev.clientX);
+    };
     const up = () => {
+      auto.stop();
+      // Ready to hear the new cut: play starts a few seconds before it.
+      if (cut !== null) {
+        setPlaying(false);
+        seek(Math.max(0, cut - LISTEN_BEFORE_CUT));
+      }
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
     };
@@ -6525,20 +6592,28 @@ function TimelinePanel({
     e.preventDefault();
     setSel({ area, ti, i } as Sel);
     const startX = e.clientX;
+    const scroller = scrollRef.current!;
+    const scroll0 = scroller.scrollLeft;
     const get = (d: Edl) => (area === "ovl" ? d.overlays![ti].elements[i] : d.audio![ti].elements[i]);
     const orig = structuredClone(area === "ovl" ? edl.overlays![ti].elements[i] : edl.audio![ti].elements[i]) as {
       startTime: number;
       duration?: number;
     };
-    const move = (ev: PointerEvent) => {
-      const ds = (ev.clientX - startX) / zoom;
+    const apply = (clientX: number) => {
+      const ds = (clientX - startX + scroller.scrollLeft - scroll0) / zoom;
       update((d) => {
         const t = get(d) as { startTime: number; duration?: number };
         if (mode === "move") t.startTime = Math.max(0, Math.round((orig.startTime + ds) * 100) / 100);
         else t.duration = Math.max(0.2, Math.round(((orig.duration ?? 1) + ds) * 100) / 100);
       }, true);
     };
+    const auto = edgeScroll(scroller, HEAD_W, apply);
+    const move = (ev: PointerEvent) => {
+      apply(ev.clientX);
+      auto.move(ev.clientX);
+    };
     const up = () => {
+      auto.stop();
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
     };
@@ -6677,13 +6752,16 @@ function TimelinePanel({
                         asset={a}
                         from={(seg.el as MainVideo).trimStart ?? 0}
                         to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
-                        width={Math.round(w)}
+                        zoom={zoom}
+                        end={srcDur(seg.el.src)}
                       />
                     ) : (
                       <FilmStrip
                         url={assetUrl(a)}
                         from={(seg.el as MainVideo).trimStart ?? 0}
                         to={((seg.el as MainVideo).trimStart ?? 0) + seg.dur}
+                        zoom={zoom}
+                        end={srcDur(seg.el.src)}
                         width={Math.round(w)}
                         height={MAIN_H - 8}
                       />
